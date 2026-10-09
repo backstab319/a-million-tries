@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+# training outputs and rendered media are reproducible and large
+runs/
+out/
+*.mp4
+*.wav
+!assets/**/*.wav
+
+# secrets
+.env
+.youtube-token.json
