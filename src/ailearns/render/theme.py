@@ -43,6 +43,27 @@ def init(headless: bool = True) -> None:
     pygame.init()
 
 
+class Window:
+    """A game window that fits the screen (and can be resized). Draw on `canvas`, always
+    full size, then `show()` scales it into the window."""
+
+    def __init__(self, size: tuple[int, int], caption: str):
+        w, h = size
+        dw, dh = pygame.display.get_desktop_sizes()[0]
+        fit = min(1.0, dw * 0.95 / w, dh * 0.85 / h)  # leave room for the title bar and the taskbar
+        self.window = pygame.display.set_mode((int(w * fit), int(h * fit)), pygame.RESIZABLE)
+        pygame.display.set_caption(caption)
+        self.canvas = pygame.Surface(size)
+
+    def show(self) -> None:
+        (w, h), (ww, wh) = self.canvas.get_size(), self.window.get_size()
+        k = min(ww / w, wh / h)
+        size = (int(w * k), int(h * k))
+        self.window.fill(BG)
+        self.window.blit(pygame.transform.smoothscale(self.canvas, size), ((ww - size[0]) // 2, (wh - size[1]) // 2))
+        pygame.display.flip()
+
+
 @cache
 def font(kind: str, size: int) -> pygame.font.Font:
     if not pygame.font.get_init():

@@ -20,8 +20,8 @@ def relative_action(current: int, wanted: int | None) -> int:
 
 def run(size: int = 10, moves_per_second: float = 8.0, record: str | None = None) -> None:
     T.init(headless=False)
-    screen = pygame.display.set_mode((900, 1000))
-    pygame.display.set_caption("ai-learns — Snake")
+    window = T.Window((900, 1000), "ai-learns — Snake")
+    screen = window.canvas
     clock = pygame.time.Clock()
     game = SnakeGames(1, SnakeConfig(size=size))
     writer = None
@@ -64,6 +64,6 @@ def run(size: int = 10, moves_per_second: float = 8.0, record: str | None = None
         if dead or won:
             T.text(screen, "YOU WIN!" if won else "space to restart", (450, 965),
                    "bold", 28, T.GREEN if won else T.MUTED, anchor="center")
-        pygame.display.flip()
+        window.show()
         if writer:
             writer.write(screen)

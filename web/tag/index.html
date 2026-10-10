@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Tag vs my AI · A Million Tries</title>
+<meta name="description" content="Play tag against AIs that practised for millions of rounds: chase as the robot or run as the blob.">
+<style>
+  html, body { margin: 0; height: 100%; background: #0d0f16; color: #e8eaf0; overflow: hidden;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; touch-action: none; user-select: none; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #menu { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  #menu[hidden] { display: none; }
+  .card { background: #161923; border: 2px solid #262b3a; border-radius: 22px; padding: 26px 28px; max-width: 560px;
+    width: calc(100vw - 80px); }
+  h1 { margin: 0 0 4px; font-size: 30px; }
+  p { color: #b6bccb; line-height: 1.45; margin: 8px 0 16px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; margin: 8px 0 14px; }
+  .label { color: #787f94; font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  button { font: inherit; font-weight: 700; font-size: 17px; color: #e8eaf0; background: #0d0f16; border: 2px solid #262b3a;
+    border-radius: 14px; padding: 10px 16px; cursor: pointer; }
+  button.on { border-color: #e8eaf0; }
+  button[data-side="robot"].on { border-color: #4ade80; color: #4ade80; }
+  button[data-side="blob"].on { border-color: #fbbf24; color: #fbbf24; }
+  #play { background: #4ade80; color: #0d0f16; border-color: #4ade80; font-size: 20px; padding: 12px 30px; }
+  #info b { color: #e8eaf0; }
+  a { color: #4ade80; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="menu" hidden>
+  <div class="card">
+    <h1>Tag vs my AI</h1>
+    <p>The green robot chases, the yellow blob runs. Both AIs taught themselves, over millions of rounds,
+       in arenas like these (never these ones). You only see what your character can see.</p>
+    <div class="label">You play</div>
+    <div class="row"><button data-side="robot">Robot (chase)</button><button data-side="blob">Blob (run)</button></div>
+    <div class="label">Against</div>
+    <div class="row"><button data-gen="1"></button><button data-gen="2"></button><button data-gen="3"></button><button data-gen="4"></button></div>
+    <p id="goal"></p>
+    <p id="info"></p>
+    <button id="play">Play</button>
+    <p style="font-size:14px;margin-bottom:0">From the YouTube channel <a href="https://www.youtube.com/@amilliontries" target="_blank">A Million Tries</a>.</p>
+  </div>
+</div>
+<script type="module" src="app.js"></script>
+</body>
+</html>

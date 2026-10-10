@@ -41,8 +41,8 @@ def run(track_seed: int = 100_000) -> None:
     track = make_track(track_seed, cfg)
     step = jax.jit(game.step)
     T.init(headless=False)
-    screen = pygame.display.set_mode((W, H))
-    pygame.display.set_caption("ai-learns — drive")
+    window = T.Window((W, H), "ai-learns — drive")
+    screen = window.canvas
     clock = pygame.time.Clock()
     view = TrackView(track, pygame.Rect(0, 0, W, H))
     mini = TrackView(track, pygame.Rect(W - 330, H - 330, 310, 310))
@@ -117,4 +117,4 @@ def run(track_seed: int = 100_000) -> None:
         if crashed_at is not None:
             T.text(screen, "CRASHED", (W / 2, H / 2 - 150), "display", 120, T.RED, anchor="center")
             T.text(screen, "press R to go again", (W / 2, H / 2 - 50), "semibold", 36, T.TEXT, anchor="center")
-        pygame.display.flip()
+        window.show()
