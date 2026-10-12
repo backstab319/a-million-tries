@@ -7,7 +7,8 @@ reinforcement learning (PPO) are built from scratch.
 **Play against the AIs in your browser:**
 [race car](https://huggingface.co/spaces/amilliontries/beat-my-ai) ·
 [Snake](https://huggingface.co/spaces/amilliontries/beat-my-ai-snake) ·
-[tag](https://huggingface.co/spaces/amilliontries/beat-my-ai-tag).
+[tag](https://huggingface.co/spaces/amilliontries/beat-my-ai-tag) ·
+[the kill house](https://huggingface.co/spaces/amilliontries/beat-my-ai-cqb).
 **Trained models:** [huggingface.co/amilliontries](https://huggingface.co/amilliontries).
 
 ## What's in here

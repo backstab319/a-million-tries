@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>The Kill House vs my AI · A Million Tries</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E🔦%3C/text%3E%3C/svg%3E">
+<meta name="description" content="Clear a dark house against the AI defender from episode 9, or hold the room against the AI attacker.">
+<style>
+  html, body { margin: 0; height: 100%; background: #0d0f16; color: #e8eaf0; overflow: hidden;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; user-select: none; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: crosshair; }
+  #menu { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; overflow: auto; }
+  #menu[hidden] { display: none; }
+  .card { background: #161923; border: 2px solid #262b3a; border-radius: 22px; padding: 24px 28px; max-width: 600px;
+    width: calc(100vw - 80px); margin: 16px; }
+  h1 { margin: 0 0 4px; font-size: 30px; }
+  p { color: #b6bccb; line-height: 1.45; margin: 8px 0 14px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; margin: 8px 0 12px; }
+  .label { color: #787f94; font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  button { font: inherit; font-weight: 700; font-size: 17px; color: #e8eaf0; background: #0d0f16; border: 2px solid #262b3a;
+    border-radius: 14px; padding: 10px 16px; cursor: pointer; }
+  button[data-mode="attack"].on { border-color: #60a5fa; color: #60a5fa; }
+  button[data-mode="defend"].on { border-color: #f43f5e; color: #f43f5e; }
+  button[data-steer].on { border-color: #e8eaf0; }
+  #play { background: #fbbf24; color: #0d0f16; border-color: #fbbf24; font-size: 20px; padding: 12px 30px; }
+  #info b, #keys b { color: #e8eaf0; }
+  #keys { font-size: 14px; color: #9aa1b2; line-height: 1.6; margin: 6px 0 14px; }
+  #phone { display: none; color: #fbbf24; }
+  @media (pointer: coarse) { #phone { display: block; } }
+  a { color: #fbbf24; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="menu" hidden>
+  <div class="card">
+    <h1>The Kill House vs my AI</h1>
+    <p>One attacker, one defender, a dark house you've never seen. You see only what your weapon light shows and hear
+       the rest through the walls. The AIs from episode 9 play by exactly the same rules, from their real trained
+       brains, in your browser.</p>
+    <div class="label">You play</div>
+    <div class="row"><button data-mode="attack">Attacker: clear the house</button><button data-mode="defend">Defender: hold the room</button></div>
+    <div class="label">W A S D move</div>
+    <div class="row"><button data-steer="screen">On the screen (W is up)</button><button data-steer="face">Where I aim (W is forward)</button></div>
+    <p id="goal"></p>
+    <p id="info"></p>
+    <div id="keys"><b>W A S D</b> move (moving backwards or sideways is slower, as for the AI) · <b>mouse</b> aim (or <b>Q / E</b>) ·
+      <b>click</b> or <b>Space</b> fire · <b>F</b> open / close a door · <b>Shift</b> run (loud, can't shoot) ·
+      <b>G</b> throw a flashbang · <b>R</b> reload · <b>Esc</b> menu</div>
+    <p id="phone">This one needs a keyboard and a mouse.</p>
+    <button id="play">Play</button>
+    <p style="font-size:14px;margin-bottom:0">From the YouTube channel <a href="https://www.youtube.com/@amilliontries" target="_blank">A Million Tries</a>
+      · <a href="https://github.com/backstab319/a-million-tries/tree/episode-9" target="_blank">the code, as in the video</a>.</p>
+  </div>
+</div>
+<script type="module" src="app.js"></script>
+</body>
+</html>
