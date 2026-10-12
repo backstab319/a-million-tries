@@ -9,6 +9,9 @@
     uv run --group jax games eval-car runs/car-1
     uv run --group jax games train-tag runs/tag-1 --steps 50e6
     uv run --group jax games eval-tag runs/tag-1
+    uv run --group jax games train-cqb runs/cqb-1 --steps 200e6      # CQB: Assault vs the camper
+    uv run --group jax games eval-cqb runs/cqb-1
+    uv run --group jax games watch-cqb runs/cqb-1 camper 100064      # one round as a video (needs ffmpeg)
 """
 
 import argparse
@@ -76,6 +79,52 @@ def main() -> None:
     sp.add_argument("--resume", action="store_true")
     sp.add_argument("--max-hours", type=float)
 
+    sp = sub.add_parser("train-cqb", help="train a CQB AI (Assault, by default) with PPO (needs --group jax)")
+    sp.add_argument("run", help="run directory, e.g. runs/cqb-1")
+    sp.add_argument("--steps", type=float, default=200e6)
+    sp.add_argument("--envs", type=int, default=2048)
+    sp.add_argument("--seed", type=int, default=0)
+    sp.add_argument("--hidden", type=int, default=256, help="neurons per layer")
+    sp.add_argument("--side", choices=["assault", "defense"], default="assault", help="who learns")
+    sp.add_argument("--opponent", default="camper",
+                    help="who it plays against: camper | wanderer | walker | dummy | random, a brain runs/a:175, "
+                         "or a pool of them: camper,runs/a:175 (round i plays member i %% K)")
+    sp.add_argument("--explore-reward", type=float, default=0.0, help="per new map cell seen (0: the round result only)")
+    sp.add_argument("--time-cost", type=float, default=0.0, help="Assault pays this per second (0: the round result only)")
+    sp.add_argument("--init-from", default="", help="start from another run's brain, e.g. runs/cqb-v3-dummy:38")
+    sp.add_argument("--ent-coef", type=float, default=0.0, help="bonus for keeping its options open (0: none)")
+    sp.add_argument("--reset-std", action="store_true", help="with --init-from: experiment again (fresh move noise)")
+    sp.add_argument("--buildings", type=int, default=1024, help="how many training buildings")
+    sp.add_argument("--flashbangs", default="0,0", help="per round, Assault,Defense (e.g. 2,0)")
+    sp.add_argument("--memory", type=int, default=0, help="a memory (GRU) of this size (0: none)")
+    sp.add_argument("--magazine", type=int, default=0, help="rounds per magazine (0: no magazines or reloading)")
+    sp.add_argument("--health", type=float, default=0.0, help="health per operator (0: one hit and you're down)")
+    sp.add_argument("--react", type=float, default=0.0, help="seconds in sight before your aim settles (0: none)")
+    sp.add_argument("--plateau", type=int, default=0, help="stop after this many updates without a new best (0: never)")
+    sp.add_argument("--stacked", type=float, default=0.0, help="share of rounds that are entry drills (start beside "
+                                                                 "Defense's door)")
+    sp.add_argument("--resume", action="store_true")
+    sp.add_argument("--max-hours", type=float)
+
+    sp = sub.add_parser("eval-cqb", help="CQB: one best-guess round in each unseen test building")
+    sp.add_argument("run")
+    sp.add_argument("--checkpoint", default="last")
+    sp.add_argument("--first", type=int, default=0, help="first test building (choose on 0-63, report 64-255)")
+    sp.add_argument("--n", type=int, default=64)
+    sp.add_argument("--seed", type=int, default=5000)
+    sp.add_argument("--opponent", help="play someone else than the one it trained against")
+
+    sp = sub.add_parser("watch-cqb", help="CQB: one round as a top-down video, drawn as in the videos (needs ffmpeg)")
+    sp.add_argument("assault", help="a brain runs/x:update, or a script: walker | walker_flash | wanderer | dummy ...")
+    sp.add_argument("defense", help="a brain runs/x:update, or a script: camper | dummy ...")
+    sp.add_argument("building", type=int, help="a building seed: 0-1023 to practise in, 100000-100255 for tests")
+    sp.add_argument("--seed", type=int, default=5000)
+    sp.add_argument("--batch", default="", help="first,n: the round exactly as played in a batch over test buildings "
+                                                 "(the videos use 64,64 with seed 5000)")
+    sp.add_argument("--eyes", choices=["assault", "defense", "all"], default="all", help="whose view (all: no fog)")
+    sp.add_argument("--slow", type=float, default=1.0, help="playback speed (below 1: slow motion)")
+    sp.add_argument("--out", default="", help="default: out/cqb-<building>.mp4")
+
     sp = sub.add_parser("eval", help="Snake: best-move games from a checkpoint")
     sp.add_argument("run")
     sp.add_argument("--checkpoint", default="last", help="first | last | <update> | <path>")
@@ -139,6 +188,32 @@ def main() -> None:
                            init_from=args.init_from, remember_heading=args.remember_heading,
                            reset_std=args.reset_std),
               args.run, resume=args.resume, max_hours=args.max_hours)
+    elif args.cmd == "train-cqb":
+        from ailearns.agents.ppo_cqb import CQBPPOConfig, train
+        train(CQBPPOConfig(total_steps=int(args.steps), n_envs=args.envs, seed=args.seed, hidden=args.hidden,
+                           side=args.side, opponent=args.opponent, explore_reward=args.explore_reward,
+                           time_cost=args.time_cost, init_from=args.init_from, reset_std=args.reset_std,
+                           ent_coef=args.ent_coef, buildings=args.buildings,
+                           flashbangs=tuple(int(x) for x in args.flashbangs.split(",")), stacked=args.stacked,
+                           memory=args.memory, plateau=args.plateau, magazine=args.magazine, health=args.health,
+                           react=args.react),
+              args.run, resume=args.resume, max_hours=args.max_hours)
+    elif args.cmd == "eval-cqb":
+        from ailearns.agents.ppo_cqb import evaluate
+        r = evaluate(args.run, args.checkpoint, first=args.first, n=args.n, seed=args.seed, opponent=args.opponent)
+        print(f"{r['run']} update {r['update']} ({r['moves']:,} moves): won {r['win_rate']:.0%}, trades "
+              f"{r['trade_rate']:.0%}, time-outs {r['timeout_rate']:.0%}, saw the enemy in {r['met_rate']:.0%} "
+              f"of {r['rounds']} rounds (test buildings {args.first}-{args.first + args.n - 1})")
+    elif args.cmd == "watch-cqb":
+        from ailearns import record_cqb as R
+        from ailearns.render import theme as T
+        T.init()
+        out = args.out or f"out/cqb-{args.building}.mp4"
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        tr = R.rollout(args.assault, args.defense, args.building, seed=args.seed,
+                       batch=tuple(int(x) for x in args.batch.split(",")) if args.batch else None)
+        R.render_played(tr, out, eyes=args.eyes, slow=args.slow)
+        print(f"wrote {out} ({tr['steps'] * tr['cfg'].dt:.1f} s round)")
     elif args.cmd == "eval-tag":
         from ailearns.agents.ppo_tag import evaluate
         r = evaluate(args.run, args.checkpoint, args.rounds, args.first, opponent=args.opponent)
