@@ -60,12 +60,17 @@ def _matchup(game: cqb.CQBGame, me: int, template: dict, opponent: str, n: int, 
     return play
 
 
-def _summary(r: dict, me: int, flashbangs: int) -> dict:
+def _summary(r: dict, me: int, flashbangs: int, game: cqb.CQBGame | None = None) -> dict:
+    """Won, trades (both sides out), time-outs (neither), flashbangs thrown a round (by the whole side). Without a
+    game: 1v1."""
     o, alive = np.asarray(r["outcome"]), np.asarray(r["alive"])
     won = o == (1 if me == cqb.ASSAULT else -1)
-    return {"won": float(won.mean()), "trades": float(((o == 0) & ~alive.any(1)).mean()),
-            "timeouts": float(alive.all(1).mean()),
-            "flashbangs_used": float((flashbangs - np.asarray(r["bangs"])[:, me]).mean()) if flashbangs else 0.0}
+    n_a, mine = (game.nA, game.side_ops(me)) if game is not None else (1, [me])
+    a_out, d_out = ~alive[:, :n_a].any(1), ~alive[:, n_a:].any(1)
+    return {"won": float(won.mean()), "trades": float((a_out & d_out).mean()),
+            "timeouts": float((~a_out & ~d_out).mean()),
+            "flashbangs_used": float((flashbangs * len(mine) - np.asarray(r["bangs"])[:, mine].sum(1)).mean())
+            if flashbangs else 0.0}
 
 
 def report(run: str | Path, against: str | None = None, every: int = 50) -> dict:
@@ -90,7 +95,7 @@ def report(run: str | Path, against: str | None = None, every: int = 50) -> dict
     for m in trained:
         play = _matchup(g_choose, me, params[last], m, CHOOSE[1] - CHOOSE[0], SEED_CHOOSE)
         for u in pick:
-            choose[u][m] = _summary(jax.device_get(play(params[u])), me, bangs)["won"]
+            choose[u][m] = _summary(jax.device_get(play(params[u])), me, bangs, g_choose)["won"]
     score = {u: float(np.mean(list(v.values()))) for u, v in choose.items()}
     best = max(pick, key=lambda u: (score[u], u))
     print(f"chose update {best} (mean win on test {CHOOSE[0]}-{CHOOSE[1] - 1} vs {', '.join(trained)}: "
@@ -102,7 +107,8 @@ def report(run: str | Path, against: str | None = None, every: int = 50) -> dict
     for m in (x.strip() for x in (against or STANDARD[cfg["side"]]).split(",") if x.strip()):
         for stacked in starts:
             play = _matchup(g_report, me, params[best], m, REPORT[1] - REPORT[0], SEED_REPORT, stacked)
-            table[f"{m}{' (drill starts)' if stacked else ''}"] = _summary(jax.device_get(play(params[best])), me, bangs)
+            table[f"{m}{' (drill starts)' if stacked else ''}"] = _summary(jax.device_get(play(params[best])), me, bangs,
+                                                                           g_report)
     out = {"run": run.name, "side": cfg["side"], "chosen_update": best, "last_update": last,
            "choose": {"buildings": list(CHOOSE), "seed": SEED_CHOOSE, "opponents": trained,
                       "mean_win_by_update": score},

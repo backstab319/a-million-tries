@@ -44,6 +44,10 @@ class CQBPPOConfig:
     magazine: int = 0            # rounds per magazine: the game's CQBConfig.magazine (0: no magazines; ep9 3am)
     health: float = 0.0          # the game's CQBConfig.health (0: one hit and you're down; ep9 3ar)
     react: float = 0.0           # the game's CQBConfig.react (0: no reaction time; ep9 3aw)
+    teams: tuple = (1, 1)        # the game's CQBConfig.team_sizes (ep10): one brain plays every operator of its side
+    bump: float = 0.0            # the game's CQBConfig.bump (loud collisions; ep10 step 9)
+    ready: float = 0.0           # the game's CQBConfig.ready (rifle up after running; ep10 step 9)
+    stun: float = 0.0            # the game's CQBConfig.stun (a hard collision stuns; ep10 9f)
     stacked: float = 0.0         # this share of training rounds are entry drills (CQBGame.init_stacked; ep9 3y)
     memory: int = 0              # a memory (GRU) of this size between the two layers (0: none; ep9 3ad)
     plateau: int = 0             # stop once the 25-update average win rate hasn't set a new best (by 0.5 points) for
@@ -205,14 +209,15 @@ def switches_for(game_cfg: CQBConfig, me: int) -> int:
     return N_SWITCH + int(game_cfg.flashbangs[me] > 0 or guns) + int(guns)
 
 
-def live_switches(game: CQBGame, st, me: int, n_switch: int):
-    """(rounds, n_switch) 0/1 for log_prob: fire, interact and run always count; throw only with a flashbang in
-    hand and none in the air; reload only when the magazine isn't full, there are rounds to load and no reload on."""
+def live_switches(game: CQBGame, st, op: int, n_switch: int):
+    """(rounds, n_switch) 0/1 for log_prob, for operator `op`: fire, interact and run always count; throw only with a
+    flashbang in hand and none in the air; reload only when the magazine isn't full, there are rounds to load and no
+    reload on."""
     live = jnp.ones(st.alive.shape[:1] + (n_switch,))
     if n_switch > N_SWITCH:
-        live = live.at[:, N_SWITCH].set(((st.bangs[:, me] > 0) & (st.bang_timer[:, me] == 0)).astype(jnp.float32))
+        live = live.at[:, N_SWITCH].set(((st.bangs[:, op] > 0) & (st.bang_timer[:, op] == 0)).astype(jnp.float32))
     if n_switch > N_SWITCH + 1:
-        can = (st.mag[:, me] < game.cfg.magazine) & (st.reserve[:, me] > 0) & (st.reload_timer[:, me] == 0)
+        can = (st.mag[:, op] < game.cfg.magazine) & (st.reserve[:, op] > 0) & (st.reload_timer[:, op] == 0)
         live = live.at[:, N_SWITCH + 1].set(can.astype(jnp.float32))
     return live
 
@@ -228,13 +233,14 @@ def best_guess(params: dict, obs):
 
 
 def brain(params: dict, who: int, sample_moves: bool = False):
-    """A brain as a player (game, state, who, key) -> action, like the scripts: its best guess, or
+    """A brain as a player (game, state, who, key) -> action, like the scripts (`who` defaults to the one given here;
+    with teams, one brain plays every operator of its side): its best guess, or
     (sample_moves) a try around it like in training. A brain with memory is a player with a `memory` size that takes
     and returns its state: (game, state, who, key, h) -> (action, h); play_rounds keeps it, from zeros each round."""
     n_in = params["body.0.weight"].shape[1]
     if has_memory(params):
         def remember(game: CQBGame, st, _who=who, key=None, h=None):
-            obs = game.observe(st, who)[None, :n_in]
+            obs = game.observe(st, _who)[None, :n_in]
             mean, logits, log_std, _, h = forward_mem(params, obs, h[None])
             if sample_moves:
                 act = to_action(*sample(key, mean, logits, log_std))
@@ -245,7 +251,7 @@ def brain(params: dict, who: int, sample_moves: bool = False):
         return remember
 
     def play(game: CQBGame, st, _who=who, key=None):
-        obs = game.observe(st, who)[None, :n_in]   # a brain from before flashbangs reads the first 107 (the same ones)
+        obs = game.observe(st, _who)[None, :n_in]  # a brain from before flashbangs reads the first 107 (the same ones)
         if not sample_moves:
             return cqb.full_action(best_guess(params, obs)[0])
         mean, logits, log_std, _ = forward(params, obs)
@@ -331,12 +337,16 @@ def drill_slots(cfg: CQBPPOConfig, n_local: int) -> int:
 
 def make_update(cfg: CQBPPOConfig, game: CQBGame, n_local: int, n_dev: int):
     T = cfg.n_steps
-    mb = cfg.minibatch // n_dev
-    n_mb = (T * n_local) // mb
     me = ASSAULT if cfg.side == "assault" else DEFENSE
+    mine, theirs_ops = game.side_ops(me), game.side_ops(1 - me)   # operators: mine share the brain
+    K = len(mine)
+    rows = n_local * K                             # samples per decision: each of my operators in each round
+    mb = cfg.minibatch // n_dev
+    n_mb = (T * rows) // mb
     sign = 1.0 if me == ASSAULT else -1.0          # the game's rewards are Assault's
     members = pool_members(cfg.opponent, 1 - me)
-    vobs = jax.vmap(lambda s: game.observe(s, me))
+    vobs = jax.vmap(lambda s: jnp.stack([game.observe(s, op) for op in mine]))   # (rounds, K, obs)
+    flat = lambda x: x.reshape(rows, *x.shape[2:])                                 # noqa: E731
     n_drill = drill_slots(cfg, n_local)
     vreset = jax.vmap(game.reset_if)
     vreset_drill = jax.vmap(lambda st, k: jax.tree.map(lambda a, b: jnp.where(st.done, a, b), game.init_stacked(k), st))
@@ -352,11 +362,16 @@ def make_update(cfg: CQBPPOConfig, game: CQBGame, n_local: int, n_dev: int):
         head, tail = vreset_drill(cut(0, n_drill), keys[:n_drill]), vreset(cut(n_drill, None), keys[n_drill:])
         return jax.tree.map(lambda a, b: jnp.concatenate([a, b]), head, tail)
 
-    def play(st, mine, theirs):
-        mine = cqb.full_action(mine)
-        acts = jnp.stack([mine, theirs]) if me == ASSAULT else jnp.stack([theirs, mine])
-        new, reward = game.step(st, acts)
-        new_cells = (new.cleared[me] & ~st.cleared[me]).sum()
+    def play(st, mine_acts, theirs_acts):
+        """mine_acts (K, 8), theirs_acts (K', 8) -> the next state and each of my operators' reward (K,): the team's
+        result, plus (a hint) the cells it saw for the first time."""
+        acts = [None] * game.N
+        for k, op in enumerate(mine):
+            acts[op] = cqb.full_action(mine_acts[k])
+        for k, op in enumerate(theirs_ops):
+            acts[op] = theirs_acts[k]
+        new, reward = game.step(st, jnp.stack(acts))
+        new_cells = jnp.stack([(new.cleared[op] & ~st.cleared[op]).sum() for op in mine])
         return new, sign * reward + cfg.explore_reward * new_cells * ~st.done
     vplay = jax.vmap(play)
 
@@ -372,7 +387,11 @@ def make_update(cfg: CQBPPOConfig, game: CQBGame, n_local: int, n_dev: int):
         ratio = jnp.exp(logp - b["logp"])
         a = b["adv"]
         a = (a - a.mean()) / (a.std(ddof=1) + 1e-8)
-        pg = jnp.maximum(-a * ratio, -a * jnp.clip(ratio, 1 - cfg.clip, 1 + cfg.clip)).mean()
+        pg = jnp.maximum(-a * ratio, -a * jnp.clip(ratio, 1 - cfg.clip, 1 + cfg.clip))
+        if game.teams_on:   # a teammate who's down decides nothing: its samples don't teach the moves
+            pg = (pg * b["acting"]).sum() / jnp.maximum(b["acting"].sum(), 1.0)
+        else:
+            pg = pg.mean()
         vl = 0.5 * ((value - b["ret"]) ** 2).mean()
         ent = entropy(logits, log_std, b["live"])
         loss = pg + cfg.vf_coef * vl - cfg.ent_coef * ent
@@ -391,40 +410,47 @@ def make_update(cfg: CQBPPOConfig, game: CQBGame, n_local: int, n_dev: int):
             mean, logits, log_std, value, h_next = forward_mem(params, obs, h)
             ka, ko, kr = jax.random.split(k, 3)
             moves, switches = sample(ka, mean, logits, log_std)
-            live = live_switches(game, env, me, logits.shape[-1])
+            live = flat(jnp.stack([live_switches(game, env, op, logits.shape[-1]) for op in mine], 1))
             logp = log_prob(mean, logits, log_std, moves, switches, live)
-            theirs = pool_actions(members, game, env, 1 - me, jax.random.split(ko, n_local))
-            env, reward = vplay(env, to_action(moves, switches), theirs)
+            acting = flat(env.alive[:, jnp.asarray(mine)]).astype(jnp.float32)
+            theirs = jnp.stack([pool_actions(members, game, env, op, jax.random.split(
+                ko if n == 0 else jax.random.fold_in(ko, n), n_local)) for n, op in enumerate(theirs_ops)], 1)
+            env, reward = vplay(env, to_action(moves, switches).reshape(n_local, K, -1), theirs)
             # read before the reset
+            a_out, d_out = game.sides_out(env.alive)
             out = {"done": env.done, "won": env.done & (env.outcome == (1 if me == ASSAULT else -1)),
-                   "trade": env.done & (env.outcome == 0) & ~env.alive.any(1),
-                   "timeout": env.done & env.alive.all(1), "seconds": env.t * game.cfg.dt,
-                   "met": env.done & (env.since[:, me] < game.T),
-                   "cells": jnp.where(env.done, env.cleared[:, me].mean(1), 0.0)}
+                   "trade": env.done & a_out & d_out,
+                   "timeout": env.done & ~a_out & ~d_out, "seconds": env.t * game.cfg.dt,
+                   "met": env.done & (env.since[:, mine[0]] < game.T).any(-1),
+                   "cells": jnp.where(env.done, jnp.stack([env.cleared[:, op].mean(1) for op in mine]).mean(0), 0.0)}
+            term = jnp.repeat(env.done, K)                                # each of my operators' samples
             if memory:
-                h_next = jnp.where(env.done[:, None], 0.0, h_next)      # a new round: nothing remembered
+                h_next = jnp.where(term[:, None], 0.0, h_next)          # a new round: nothing remembered
             env = reset(env, jax.random.split(kr, n_local))
-            return (env, vobs(env), h_next), {"obs": obs, "moves": moves, "switches": switches, "live": live,
-                                              "logp": logp, "val": value, "rew": reward, "h": h, **out}
+            return (env, flat(vobs(env)), h_next), {"obs": obs, "moves": moves, "switches": switches, "live": live,
+                                                    "logp": logp, "val": value, "rew": flat(reward), "h": h,
+                                                    "term": term, "acting": acting, **out}
         (env, obs_next, h_end), tr = lax.scan(tick, (env, obs, h), jax.random.split(k_roll, T))
 
         next_value = forward_mem(params, obs_next, h_end)[3]
 
         def gae(carry, x):
             last, nv = carry
-            nonterminal = 1.0 - x["done"].astype(jnp.float32)
+            nonterminal = 1.0 - x["term"].astype(jnp.float32)
             delta = x["rew"] + cfg.gamma * nv * nonterminal - x["val"]
             last = delta + cfg.gamma * cfg.lam * nonterminal * last
             return (last, x["val"]), last
         _, adv = lax.scan(gae, (jnp.zeros_like(next_value), next_value), tr, reverse=True)
         batch = {"obs": tr["obs"], "moves": tr["moves"], "switches": tr["switches"], "live": tr["live"],
                  "logp": tr["logp"], "adv": adv, "ret": adv + tr["val"]}
+        if game.teams_on:
+            batch["acting"] = tr["acting"]
         if memory:   # pieces of mem_chunk decisions, each replayed in order from the memory it had in play
             L = cfg.mem_chunk
-            batch = {k: to_chunks(v, L) for k, v in {**batch, "done": tr["done"]}.items()}
+            batch = {k: to_chunks(v, L) for k, v in {**batch, "done": tr["term"]}.items()}
             batch["h0"] = tr["h"][::L].reshape(-1, tr["h"].shape[-1])
         else:
-            batch = jax.tree.map(lambda x: x.reshape(T * n_local, *x.shape[2:]), batch)
+            batch = jax.tree.map(lambda x: x.reshape(T * rows, *x.shape[2:]), batch)
 
         def epoch(carry, k):
             def step(carry, idx, mb_batch):
@@ -444,7 +470,7 @@ def make_update(cfg: CQBPPOConfig, game: CQBGame, n_local: int, n_dev: int):
                 perm = jax.random.permutation(k, S)[: (S // n_seq) * n_seq].reshape(-1, n_seq)
                 pick = lambda idx: {k: (v[idx] if k == "h0" else v[:, idx]) for k, v in batch.items()}  # noqa: E731
                 return lax.scan(lambda c, idx: step(c, None, pick(idx)), carry, perm)
-            perm = jax.random.permutation(k, T * n_local)[: n_mb * mb].reshape(n_mb, mb)
+            perm = jax.random.permutation(k, T * rows)[: n_mb * mb].reshape(n_mb, mb)
             return lax.scan(lambda c, idx: step(c, idx, None), carry, perm)
         (params, opt), aux = lax.scan(epoch, (params, opt), jax.random.split(k_learn, cfg.epochs))
 
@@ -467,7 +493,8 @@ def train(cfg: CQBPPOConfig, run_dir: str | Path, resume: bool = False, max_hour
           game_cfg: CQBConfig = CQBConfig()) -> None:
     import torch
     game_cfg = replace(game_cfg, time_cost=cfg.time_cost, flashbangs=tuple(cfg.flashbangs), magazine=cfg.magazine,
-                       health=cfg.health, react=cfg.react)
+                       health=cfg.health, react=cfg.react, team_sizes=tuple(cfg.teams), bump=cfg.bump,
+                       ready=cfg.ready, stun=cfg.stun)
     run_dir = Path(run_dir)
     (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
     devices = jax.devices()
@@ -526,9 +553,12 @@ def train(cfg: CQBPPOConfig, run_dir: str | Path, resume: bool = False, max_hour
     key, k_env = jax.random.split(key)
     n_local = N // n_dev
     env = jax.jit(lambda k: start_rounds(game, k, N, n_local, drill_slots(cfg, n_local)), out_shardings=shard)(k_env)
-    obs = jax.jit(jax.vmap(lambda s: game.observe(s, me)), out_shardings=shard)(env)
-    # each round's memory travels with it (zeros: nothing remembered; also after a resume)
-    env = (env, jax.jit(lambda: jnp.zeros((N, memory_size(params))), out_shardings=shard)())
+    mine = game.side_ops(me)                     # with teams the brain plays each of these: K samples per round
+    K = len(mine)
+    obs = jax.jit(lambda e: jax.vmap(lambda s: jnp.stack([game.observe(s, op) for op in mine]))(e).reshape(N * K, -1),
+                  out_shardings=shard)(env)
+    # each operator's memory travels with it (zeros: nothing remembered; also after a resume)
+    env = (env, jax.jit(lambda: jnp.zeros((N * K, memory_size(params))), out_shardings=shard)())
     params, opt, key = jax.device_put((params, opt, key), rep)
 
     n_updates = cfg.total_steps // (T * N)
@@ -625,7 +655,9 @@ def evaluate(run: str, checkpoint: str = "last", first: int = 0, n: int = 64, se
     a, d = (mine, theirs) if me == ASSAULT else (theirs, mine)
     r = S.play_rounds(game, a, d, np.arange(n), seed=seed)
     won = r["outcome"] == (1 if me == ASSAULT else -1)
+    a_out, d_out = (np.asarray(x) for x in game.sides_out(jnp.asarray(r["alive"])))
+    mine = game.side_ops(me)
     return {"run": str(run), "update": ck["update"], "moves": ck["steps"], "rounds": n,
-            "win_rate": float(won.mean()), "trade_rate": float(((r["outcome"] == 0) & ~r["alive"].any(1)).mean()),
-            "timeout_rate": float(r["alive"].all(1).mean()), "met_rate": float((r["first_seen"][:, me] >= 0).mean()),
-            "result": r}
+            "win_rate": float(won.mean()), "trade_rate": float((a_out & d_out).mean()),
+            "timeout_rate": float((~a_out & ~d_out).mean()),
+            "met_rate": float((r["first_seen"][:, mine] >= 0).any(1).mean()), "result": r}

@@ -18,7 +18,8 @@ is, unless they see or hear it. The AI gets less than this: only its 107 numbers
   room it hasn't looked at, it stands beside the doorway (out of line with the room), opens the door from
   there, throws one in through the opening (about 2 m in: in front of whoever covers the door), steps further
   along the wall until it goes off, and goes in. One per room, while it has them; if no
-  throw from beside the door lands in the room, it goes in like the walker.
+  throw from beside the door lands in the room, it goes in like the walker. In a team, number two follows as the
+  walker and holds back while number one gets ready or its flashbang is in the air.
 
 Moving around uses the building's waypoint graph (cqb.nav_graph): each decision a script walks
 towards the waypoint in plain view that makes its route shortest, and opens shut doors in its way.
@@ -27,6 +28,7 @@ towards the waypoint in plain view that makes its route shortest, and opens shut
 import jax
 import jax.numpy as jnp
 
+from ailearns.games import cqb
 from ailearns.games.cqb import (ACTION_SIZE, FAR, FIRE, FWD, INTERACT, RELOAD, RUN, SIDE, THROW, TURN, CQBGame, State,
                                 _cast, _clear, _rot, _slab, _wrap, full_action)
 
@@ -46,11 +48,27 @@ def _act(fwd=0.0, side=0.0, turn=0.0, fire=False, interact=False, throw=False):
             .at[INTERACT].set(on(interact)).at[RUN].set(-1.0).at[THROW].set(on(throw)).at[RELOAD].set(-1.0))
 
 
+def contact(game: CQBGame, st: State, who: int):
+    """What `who` knows of its enemies, as one contact: does it see any; the nearest one it sees; decisions since its
+    team last saw any (enemies it knows are down don't count); where the most recently seen one was. 1v1: the other
+    one. -> (seen, its position, since, last seen at)"""
+    en = game.enemies[who]
+    if len(en) == 1:
+        j = en[0]
+        return st.seen[who, j], st.pos[j], st.since[who, j], st.mem[who, j]
+    en = jnp.asarray(en)
+    seen = st.seen[who, en]
+    near = en[jnp.argmin(jnp.where(seen, jnp.linalg.norm(st.pos[en] - st.pos[who], axis=1), jnp.inf))]
+    since = jnp.where(st.known_down[who, en], game.T, st.since[who, en])
+    return seen.any(), st.pos[near], since.min(), st.mem[who, en[jnp.argmin(since)]]
+
+
 def _reloading(game: CQBGame, st: State, who: int, act):
     """With magazines: reload in a quiet moment (half empty, nothing seen for 3 s); empty ones reload by themselves."""
     if not game.guns_on:
         return act
-    quiet = ~st.seen[who] & (st.since[who] > 30) & (st.mag[who] <= game.cfg.magazine // 2)
+    seen, _, since, _ = contact(game, st, who)
+    quiet = ~seen & (since > 30) & (st.mag[who] <= game.cfg.magazine // 2)
     return act.at[RELOAD].set(jnp.where(quiet, 1.0, -1.0))
 
 
@@ -62,9 +80,21 @@ def room_of(game: CQBGame, st: State, p):
 
 
 def _shoot_on_sight(game: CQBGame, st: State, who: int):
-    """Stand still, turn onto it, fire once it's in the sights."""
-    turn, diff = _aim(game, st, who, st.pos[1 - who])
-    return _act(turn=turn, fire=jnp.abs(diff) < jnp.deg2rad(game.cfg.aim) * 0.8)
+    """Stand still, turn onto the nearest enemy in sight, fire once it's in the sights (not with a teammate in the
+    way, nearer and inside the aim angle: then step sideways, away from it, to clear the line)."""
+    _, target, _, _ = contact(game, st, who)
+    turn, diff = _aim(game, st, who, target)
+    fire = jnp.abs(diff) < jnp.deg2rad(game.cfg.aim) * 0.8
+    if not game.mates[who]:
+        return _act(turn=turn, fire=fire)
+    side = jnp.asarray(0.0)
+    for j in game.mates[who]:
+        closer = jnp.linalg.norm(st.pos[j] - st.pos[who]) < jnp.linalg.norm(target - st.pos[who])
+        blocked = st.alive[j] & closer & game.on_aim(st, who, j)
+        fire = fire & ~blocked
+        left = _rot(st.pos[j] - st.pos[who], -st.face[who])[1] > 0              # the teammate is to my left
+        side = jnp.where(blocked, jnp.where(left, -1.0, 1.0), side)           # step the other way to clear the line
+    return _act(side=side, turn=turn, fire=fire)
 
 
 def _walk(game: CQBGame, st: State, who: int, target, interact=False, look=None):
@@ -133,16 +163,18 @@ def camper(game: CQBGame, st: State, who: int, key=None):
     snd = st.sound[who]
     loud = jnp.argmax(snd[:, 2])
     heard = snd[loud, 2] > 0
-    target = jnp.where(st.since[who] < 30, st.mem[who],                    # just saw it (or its flash): there
+    seen, _, since, mem = contact(game, st, who)
+    target = jnp.where(since < 30, mem,                                    # just saw it (or its flash): there
                        jnp.where(heard, p + snd[loud, :2], watch))         # heard it: that way; else the door
     turn, _ = _aim(game, st, who, target)
-    return _reloading(game, st, who, jnp.where(st.seen[who], _shoot_on_sight(game, st, who), _act(turn=turn)))
+    return _reloading(game, st, who, jnp.where(seen, _shoot_on_sight(game, st, who), _act(turn=turn)))
 
 
 def wanderer(game: CQBGame, st: State, who: int, key=None):
     cells = game.cfg.seen_grid[0] * game.cfg.seen_grid[1]
     goal = (st.building * 7 + (st.t // 120) * 13) % cells                    # somewhere new every 12 s
-    return _reloading(game, st, who, jnp.where(st.seen[who], _shoot_on_sight(game, st, who), _nav(game, st, who, goal)))
+    seen = contact(game, st, who)[0]
+    return _reloading(game, st, who, jnp.where(seen, _shoot_on_sight(game, st, who), _nav(game, st, who, goal)))
 
 
 def _goal(game: CQBGame, st: State, who: int):
@@ -155,10 +187,11 @@ def _goal(game: CQBGame, st: State, who: int):
 
 
 def walker(game: CQBGame, st: State, who: int, key=None):
-    lost = (st.since[who] < 30) & ~st.seen[who]                              # saw (or heard a shot) a moment ago
-    turn_mem, _ = _aim(game, st, who, st.mem[who])
+    seen, _, since, mem = contact(game, st, who)
+    lost = (since < 30) & ~seen                                              # saw (or heard a shot) a moment ago
+    turn_mem, _ = _aim(game, st, who, mem)
     act = jnp.where(lost, _act(turn=turn_mem), _nav(game, st, who, _goal(game, st, who)))
-    return _reloading(game, st, who, jnp.where(st.seen[who], _shoot_on_sight(game, st, who), act))
+    return _reloading(game, st, who, jnp.where(seen, _shoot_on_sight(game, st, who), act))
 
 
 def _rooms_of(game: CQBGame, st: State, q):
@@ -186,7 +219,7 @@ def walker_flash(game: CQBGame, st: State, who: int, key=None):
     into = jnp.zeros(2).at[axis].set(s)                                    # from the doorway into that room
     across = jnp.stack([-into[1], into[0]])
     unseen = ((b.cell_room[bi] == beyond) & ~st.cleared[who]).any()
-    flashed = (st.bangs[who] < cfg.flashbangs[who]) & (room_of(game, st, st.bang_pos[who]) == beyond)
+    flashed = (st.bangs[who] < cfg.flashbangs[int(game.team[who])]) & (room_of(game, st, st.bang_pos[who]) == beyond)
     heading = (goal_room >= 0) & (goal_room != here)
     near = jnp.linalg.norm(p - jnp.clip(p, dlo, dhi)) <= 2.0
     want = heading & near & unseen & ~flashed & (beyond < R) & (st.bangs[who] > 0)
@@ -246,7 +279,21 @@ def walker_flash(game: CQBGame, st: State, who: int, key=None):
     hold = _walk(game, st, who, wmid - wn * 0.5 + wa * jnp.minimum(1.6, wfree - cfg.radius - 0.05), look=wmid)
     act = jnp.where(live, hold, walker(game, st, who, key))
     act = jnp.where(want & ~live & can & (~there | door_shut | jnp.isfinite(here_sc).any()), ready, act)
-    return _reloading(game, st, who, jnp.where(st.seen[who], _shoot_on_sight(game, st, who), act))
+    act = _reloading(game, st, who, jnp.where(contact(game, st, who)[0], _shoot_on_sight(game, st, who), act))
+    ops = game.side_ops(int(game.team[who]))
+    if who == ops[0]:
+        return act
+    # number two of a stack (teams): the walker, never throwing; it holds 1.5 m back while number one stands
+    # (getting ready to throw) or has a flashbang in the air. With number one down, it does the whole routine itself
+    lead = ops[0]
+    near = jnp.linalg.norm(st.pos[lead] - p) < 1.5
+    busy = (jnp.linalg.norm(st.vel[lead]) < 0.3) | (st.bang_timer[lead] > 0)
+    ahead = st.pos[lead] + jnp.stack([jnp.cos(st.face[lead]), jnp.sin(st.face[lead])])
+    seen = contact(game, st, who)[0]
+    hold = _act(turn=_aim(game, st, who, ahead)[0])
+    wait = _reloading(game, st, who, jnp.where(seen, _shoot_on_sight(game, st, who), hold))
+    follow = jnp.where(near & busy, wait, walker(game, st, who, key))
+    return jnp.where(st.alive[lead], follow, act)
 
 
 SCRIPTS = {"dummy": dummy, "random": random, "camper": camper, "wanderer": wanderer, "walker": walker,
@@ -256,8 +303,8 @@ SCRIPTS = {"dummy": dummy, "random": random, "camper": camper, "wanderer": wande
 def play_rounds(game: CQBGame, assault, defense, buildings, seed: int = 0, record: bool = False,
                 stacked: bool = False) -> dict:
     """One round per building index in `buildings` (all at once). Players are SCRIPTS names or
-    functions. Returns outcomes, round lengths, final positions, when each side first saw the
-    other (decision, -1 never) and (record) every state. stacked: drill starts (CQBGame.init_stacked)."""
+    functions (with teams, every operator of a side plays its side's player). Returns outcomes, round lengths, final
+    positions, when each operator first saw an enemy (decision, -1 never) and (record) every state. stacked: drill starts (CQBGame.init_stacked)."""
     A = SCRIPTS.get(assault, assault)
     D = SCRIPTS.get(defense, defense)
     last, first, hist = jax.jit(lambda b: rounds(game, A, D, b, seed, record, stacked))(jnp.asarray(buildings))
@@ -281,21 +328,24 @@ def rounds(game: CQBGame, A, D, buildings, seed: int = 0, record: bool = False, 
             return full_action(a), h
         return full_action(P(game, st, who, k)), h
 
+    players = [A if s == cqb.ASSAULT else D for s in game.team]          # each operator plays its side's player
+    sees_enemy = lambda st: (st.seen & game.is_enemy).any(1)             # noqa: E731
+
     def one(key, bi):
         st = (game.init_stacked if stacked else game.init)(key, bi)
 
         def tick(carry, k):
-            st, first, ha, hd = carry
-            ka, kd = jax.random.split(k)
-            (aa, ha), (ad, hd) = act(A, st, 0, ka, ha), act(D, st, 1, kd, hd)
-            st, _ = game.step(st, jnp.stack([aa, ad]))
-            first = jnp.where((first < 0) & st.seen, st.t, first)        # when each first saw the other
-            return (st, first, ha, hd), (st if record else None)
+            st, first, hs = carry
+            ks = jax.random.split(k, game.N)
+            acts, hs = zip(*[act(P, st, i, ks[i], h) for i, (P, h) in enumerate(zip(players, hs))])
+            st, _ = game.step(st, jnp.stack(acts))
+            first = jnp.where((first < 0) & sees_enemy(st), st.t, first)   # when each first saw an enemy
+            return (st, first, tuple(hs)), (st if record else None)
 
-        first0 = jnp.where(st.seen, 0, -1)
-        h0 = (jnp.zeros(getattr(A, "memory", 0)), jnp.zeros(getattr(D, "memory", 0)))   # each round from nothing
-        (last, first, _, _), hist = jax.lax.scan(tick, (st, first0, *h0),
-                                                 jax.random.split(jax.random.fold_in(key, 1), game.T))
+        first0 = jnp.where(sees_enemy(st), 0, -1)
+        hs = tuple(jnp.zeros(getattr(P, "memory", 0)) for P in players)    # each round from nothing
+        (last, first, _), hist = jax.lax.scan(tick, (st, first0, hs),
+                                              jax.random.split(jax.random.fold_in(key, 1), game.T))
         if record:
             hist = jax.tree.map(lambda a, b: jnp.concatenate([a[None], b]), st, hist)
         return last, first, hist

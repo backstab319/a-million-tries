@@ -376,20 +376,20 @@ def test_walls_doors_and_cover_block_sight():
 def test_seeing_is_not_mutual():
     g = _plain_game()
     st = _step(g, _pose(g, (12, 10), 0.0, (17, 10), d_face=np.pi / 2), jnp.zeros((2, 6)))
-    assert bool(st.seen[ASSAULT]) and not bool(st.seen[DEFENSE])
+    assert bool(st.seen[ASSAULT, DEFENSE]) and not bool(st.seen[DEFENSE, ASSAULT])
 
 
 def test_memory_of_the_other():
     g = _plain_game(WALLS, DOOR, CRATE)
     st = g.init(jax.random.PRNGKey(0), 0)
-    assert int(st.since[ASSAULT]) == g.T                                            # never seen yet
+    assert int(st.since[ASSAULT, DEFENSE]) == g.T                                            # never seen yet
     st = _step(g, _pose(g, (15, 15), 0.0, (25, 15), open_door=True), jnp.zeros((2, 6)))
-    assert bool(st.seen[ASSAULT]) and int(st.since[ASSAULT]) == 0
+    assert bool(st.seen[ASSAULT, DEFENSE]) and int(st.since[ASSAULT, DEFENSE]) == 0
     st = st._replace(pos=st.pos.at[DEFENSE].set(jnp.asarray([25.0, 10.0])))          # it steps behind the wall
     st = _step(g, st, jnp.zeros((2, 6)))
     st = _step(g, st, jnp.zeros((2, 6)))
-    assert not bool(st.seen[ASSAULT]) and int(st.since[ASSAULT]) == 2
-    assert np.allclose(st.mem[ASSAULT], [25.0, 15.0], atol=1e-5)                    # where it was last seen
+    assert not bool(st.seen[ASSAULT, DEFENSE]) and int(st.since[ASSAULT, DEFENSE]) == 2
+    assert np.allclose(st.mem[ASSAULT, DEFENSE], [25.0, 15.0], atol=1e-5)                    # where it was last seen
 
 
 def test_seen_map():
@@ -492,15 +492,15 @@ def test_muzzle_flash_gives_the_shooter_away():
     # Defense faces away from Assault (it can't see it); Assault fires into the dark
     st = _pose(g, (12, 10), np.pi / 2, (16, 10), d_face=0.0)
     st, _ = g.step(st, _both(_fire()))
-    assert bool(st.fired[ASSAULT]) and bool(st.flash_seen[DEFENSE]) and not bool(st.seen[DEFENSE])
-    assert np.allclose(st.mem[DEFENSE], st.pos[ASSAULT]) and int(st.since[DEFENSE]) == 0
+    assert bool(st.fired[ASSAULT]) and bool(st.flash_seen[DEFENSE, ASSAULT]) and not bool(st.seen[DEFENSE, ASSAULT])
+    assert np.allclose(st.mem[DEFENSE, ASSAULT], st.pos[ASSAULT]) and int(st.since[DEFENSE, ASSAULT]) == 0
     st, _ = g.step(st, _both(_act()))
-    assert bool(st.flash_seen[DEFENSE])                                             # 0.2 s = 2 decisions
+    assert bool(st.flash_seen[DEFENSE, ASSAULT])                                             # 0.2 s = 2 decisions
     st, _ = g.step(st, _both(_act()))
-    assert not bool(st.flash_seen[DEFENSE])
+    assert not bool(st.flash_seen[DEFENSE, ASSAULT])
     # behind a wall, the flash isn't seen (it will be heard: 1g)
     st, _ = g.step(_pose(g, (15, 10), np.pi / 2, (25, 10)), _both(_fire()))
-    assert not bool(st.flash_seen[DEFENSE])
+    assert not bool(st.flash_seen[DEFENSE, ASSAULT])
 
 
 # ── Hearing ──────────────────────────────────────────────────────────────────
@@ -593,7 +593,7 @@ def test_the_fog_is_real():
     obs = []
     for d in [(25, 10), (25, 20), (28, 7)]:
         st = _step(g, _pose(g, (15, 10), np.pi, d, d_face=np.pi), jnp.zeros((2, 6)))
-        assert not bool(st.seen[ASSAULT]) and float(st.sound[ASSAULT, :, 2].max()) == 0
+        assert not bool(st.seen[ASSAULT, DEFENSE]) and float(st.sound[ASSAULT, :, 2].max()) == 0
         obs.append(np.asarray(g.observe(st, ASSAULT)))
     assert np.array_equal(obs[0], obs[1]) and np.array_equal(obs[0], obs[2])
     # once it's in the light, it shows
@@ -752,10 +752,10 @@ def test_blind_means_blind():
     g = CQBGame(g.b, _replace(g.cfg, flashbangs=(2, 0)))
     st = _pose(g, (12, 10), 0.0, (15, 10), d_face=np.pi)                          # face to face, 3 m
     st = _step(g, st, _both(_act()))
-    assert bool(st.seen[ASSAULT]) and bool(st.seen[DEFENSE])
+    assert bool(st.seen[ASSAULT, DEFENSE]) and bool(st.seen[DEFENSE, ASSAULT])
     st = st._replace(blind=jnp.asarray([0, 5], jnp.int32), cleared=jnp.zeros_like(st.cleared))
     st2 = _step(g, st, _both(_act()))
-    assert bool(st2.seen[ASSAULT]) and not bool(st2.seen[DEFENSE])                 # can't see...
+    assert bool(st2.seen[ASSAULT, DEFENSE]) and not bool(st2.seen[DEFENSE, ASSAULT])                 # can't see...
     assert not np.asarray(st2.cleared[DEFENSE]).any() and np.asarray(st2.cleared[ASSAULT]).any()  # ...or look...
     assert float(g.hit_chance(st2, DEFENSE)) == 0.0 and float(g.hit_chance(st2, ASSAULT)) > 0.9  # ...or hit
     st3, _ = g.step(st, _both(_act(), _fire()))
@@ -764,14 +764,14 @@ def test_blind_means_blind():
     assert not bool(st3.alive[DEFENSE])                                            # Assault can
     # Assault's muzzle flash isn't seen by a blinded Defense
     st4 = _step(g, st._replace(face=st.face.at[DEFENSE].set(0.0)), _both(_fire(turn=1)))
-    assert not bool(st4.flash_seen[DEFENSE])
+    assert not bool(st4.flash_seen[DEFENSE, ASSAULT])
     # it wears off: 5 decisions
     step = jax.jit(g.step)
     st5 = st._replace(blind=jnp.asarray([0, 5], jnp.int32))
     seen = []
     for _ in range(6):
         st5, _ = step(st5, _both(_act()))
-        seen.append(bool(st5.seen[DEFENSE]))
+        seen.append(bool(st5.seen[DEFENSE, ASSAULT]))
     assert seen == [False] * 4 + [True] * 2
 
 
@@ -975,7 +975,7 @@ def test_drill_start_is_beside_defenses_door(test_game):
         cells = np.asarray(g.b.cell_room[bi])
         seen = np.asarray(s.cleared[ASSAULT])
         assert seen[cells != r].all() and not seen[cells == r].all()     # (its light may already reach in a cell)
-        hidden += not bool(s.seen[DEFENSE]) and not bool(s.seen[ASSAULT])
+        hidden += not bool(s.seen[DEFENSE, ASSAULT]) and not bool(s.seen[ASSAULT, DEFENSE])
         opened += bool(s.door_open[k])
     assert hidden >= 0.85 * 256 and 0.35 * 256 < opened < 0.65 * 256
 
@@ -1184,29 +1184,29 @@ def test_aim_settles_over_the_reaction_time():
     assert g.react_steps == 3
     st = _pose(g, (12, 10), 0.0, (15, 10), d_face=np.pi / 2)              # Defense 3 m ahead, facing away
     for before, want in ((0, 0.3), (1, 0.6), (2, 0.9), (3, 0.9)):         # aim before this decision -> hit rate
-        assert abs(_hit_rate(g, st._replace(aim=st.aim.at[ASSAULT].set(before)), _both(_fire())) - want) < 0.03
-    assert float(g.hit_chance(st._replace(aim=st.aim.at[ASSAULT].set(0)), ASSAULT)) == 0.0
+        assert abs(_hit_rate(g, st._replace(aim=st.aim.at[ASSAULT, DEFENSE].set(before)), _both(_fire())) - want) < 0.03
+    assert float(g.hit_chance(st._replace(aim=st.aim.at[ASSAULT, DEFENSE].set(0)), ASSAULT)) == 0.0
     s = st._replace(aim=jnp.zeros(2, jnp.int32))
     got = []
     for _ in range(5):                                                    # looking, not shooting: 1, 2, 3, 3, 3
         s = _step(g, s, _both(_act()))
-        got.append(int(s.aim[ASSAULT]))
-    assert got == [1, 2, 3, 3, 3] and int(s.aim[DEFENSE]) == 0           # Defense faces away: never in its sight
+        got.append(int(s.aim[ASSAULT, DEFENSE]))
+    assert got == [1, 2, 3, 3, 3] and int(s.aim[DEFENSE, ASSAULT]) == 0           # Defense faces away: never in its sight
 
 
 def test_aim_unsettles_out_of_sight_and_is_off_by_default():
     g = CQBGame(_plain_game().b, RT)
     st = _pose(g, (12, 10), np.pi, (15, 10), d_face=np.pi / 2)            # Defense behind Assault: out of sight
-    s = st._replace(aim=jnp.asarray([3, 0], jnp.int32))
+    s = st._replace(aim=jnp.asarray([[0, 3], [0, 0]], jnp.int32))
     got = []
     for _ in range(4):
         s = _step(g, s, _both(_act()))
-        got.append(int(s.aim[ASSAULT]))
+        got.append(int(s.aim[ASSAULT, DEFENSE]))
     assert got == [2, 1, 0, 0]
     # without a reaction time: no aim counter, and the first shot in sight hits fully
     g0 = CQBGame(_plain_game().b, _replace(RT, react=0.0))
     s0 = _pose(g0, (12, 10), 0.0, (15, 10), d_face=np.pi / 2)
-    assert abs(_hit_rate(g0, s0._replace(aim=jnp.zeros(2, jnp.int32)), _both(_fire())) - 0.9) < 0.03
+    assert abs(_hit_rate(g0, s0._replace(aim=jnp.zeros((2, 2), jnp.int32)), _both(_fire())) - 0.9) < 0.03
     assert int(_step(g0, s0, _both(_act())).aim.max()) == 0
 
 
@@ -1216,12 +1216,12 @@ def test_observation_with_reaction_time():
     g0 = _plain_game(WALLS, DOOR, CRATE)
     g = CQBGame(g0.b, _replace(CFG, react=0.3))
     s = _step(g, _pose(g, (12, 10), 0.3, (25, 20), d_face=np.pi), _both(_act(fwd=1)))
-    s = s._replace(aim=jnp.asarray([2, 1], jnp.int32))
+    s = s._replace(aim=jnp.asarray([[0, 2], [1, 0]], jnp.int32))
     for w in (ASSAULT, DEFENSE):
         o, o0 = np.asarray(g.observe(s, w)), np.asarray(g0.observe(s, w))
         assert o.shape == (108,) and np.array_equal(o[:107], o0)
     assert abs(float(np.asarray(g.observe(s, ASSAULT))[107]) - 2 / 3) < 1e-6
-    a = [np.asarray(g.observe(s._replace(aim=s.aim.at[DEFENSE].set(v)), ASSAULT)) for v in (0, 2, 3)]
+    a = [np.asarray(g.observe(s._replace(aim=s.aim.at[DEFENSE, ASSAULT].set(v)), ASSAULT)) for v in (0, 2, 3)]
     assert np.array_equal(a[0], a[1]) and np.array_equal(a[0], a[2])
     full = _replace(CFG, flashbangs=(2, 0), magazine=30, health=100.0, react=0.3)
     assert full.obs_size == 107 + 8 + 7 + 2 + 1

@@ -35,6 +35,10 @@ BANG_OBS = 8  # extra observation numbers when the game has flashbangs (see CQBG
 GUN_OBS = 7   # and when it has magazines
 HEALTH_OBS = 2  # and when it has health
 REACT_OBS = 1   # and when it has a reaction time
+ENEMY_OBS = 10  # numbers about one enemy (with teams: one slot per enemy, nearest known first)
+MATE_OBS = 6    # numbers about one teammate
+READY_OBS = 1   # and, last, how far my rifle is up (with `ready`)
+STUN_OBS = 1    # and, after it, how long I'm still stunned (with `stun`)
 
 
 def full_action(a):
@@ -133,6 +137,18 @@ class CQBConfig:
     # reaction time (ep9 3aw): a shooter who has just spotted the enemy isn't on target yet. The aim settles over
     # `react` seconds of seeing them (a shot hits x 1/3, 2/3, then fully at 0.3 s) and unsettles as fast out of sight
     react: float = 0.0            # seconds; 0 = no reaction time: the game before 3aw
+    # teams (ep10): operators per side, (Assault, Defense). Operators are numbered Assault first, then Defense.
+    # (1, 1) = the game before ep10, exactly. Assault pairs start stacked at one door, `stack_gap` apart
+    team_sizes: tuple = (1, 1)
+    stack_gap: float = 0.8
+    # habits (ep10 step 9, owner OK): sprinting into walls was free and silent; real operators keep off walls and slow
+    # down to shoot. Both off by default (the game before, exactly)
+    bump: float = 0.0             # metres a collision is heard: hitting a wall, door or crate faster than walking
+                                  # (speed straight into it), heard like footsteps (a third less per wall); 0 = off
+    ready: float = 0.0            # seconds to bring the rifle up after running or a collision: shots hit x 1/3,
+                                  # 2/3, then fully (at 0.3); 0 = off
+    stun: float = 0.0             # seconds a hard collision (the same as a loud one) leaves you unable to move, turn or
+                                  # fire (ep10 9f, owner OK: slamming into a wall with your kit on hurts); 0 = off
     # a round
     dt: float = 0.1               # seconds per decision
     time_limit: float = 45.0
@@ -146,7 +162,17 @@ class CQBConfig:
         # and with flashbangs 8 more at the end (so brains from before can be given the first 107)
         base = self.n_rays + 10 + 9 + 7 + 8 + self.seen_grid[0] * self.seen_grid[1] + 1
         return (base + (BANG_OBS if any(self.flashbangs) else 0) + (GUN_OBS if self.magazine else 0)
-                + (HEALTH_OBS if self.health else 0) + (REACT_OBS if self.react else 0))
+                + (HEALTH_OBS if self.health else 0) + (REACT_OBS if self.react else 0) + self.team_obs
+                + (READY_OBS if self.ready else 0) + (STUN_OBS if self.stun else 0))
+
+    @property
+    def team_obs(self) -> int:
+        """With teams: one more enemy slot per extra enemy and a slot per teammate (the biggest team decides, so both
+        sides read the same size), and which operator of my team I am. Last, so earlier brains read theirs."""
+        if tuple(self.team_sizes) == (1, 1):
+            return 0
+        extra = max(self.team_sizes) - 1
+        return extra * (ENEMY_OBS + MATE_OBS) + 1
 
 
 # ── Buildings (numpy: generated once, then handed to JAX as arrays) ──────────
@@ -661,46 +687,53 @@ def _wrap(a):
 
 
 # ── The game (JAX) ───────────────────────────────────────────────────────────
+# N operators, Assault first (operators 0..nA-1), then Defense. Tables "i, j" are about operator j as operator i
+# knows it (sight, memory, aim); with teams, memory is the team's (a sighting by anyone on it is called out).
 
 class State(NamedTuple):
     building: jax.Array   # which building
-    pos: jax.Array        # (2, 2) metres; row 0 Assault, row 1 Defense
-    vel: jax.Array        # (2, 2) m/s
-    face: jax.Array       # (2,) radians, where the weapon (and its light) points
-    turn: jax.Array       # (2,) last turn, -1..1
+    pos: jax.Array        # (N, 2) metres
+    vel: jax.Array        # (N, 2) m/s
+    face: jax.Array       # (N,) radians, where the weapon (and its light) points
+    turn: jax.Array       # (N,) last turn, -1..1
     door_open: jax.Array  # (D,)
     door_timer: jax.Array  # (D,) decisions until a door being moved finishes (0 = still)
-    door_event: jax.Array  # (2,) did this operator start moving a door this decision (a sound)
-    door_at: jax.Array    # (2, 2) the middle of the door it started moving (where that sound comes from)
-    seen: jax.Array       # (2,) does this operator see the other one right now
-    mem: jax.Array        # (2, 2) where each last saw the other
-    mem_vel: jax.Array    # (2, 2) and how it was moving then
-    since: jax.Array      # (2,) decisions since then (T = never)
-    cleared: jax.Array    # (2, cells) the "seen" map: which cells of the building each has looked at
-    sound: jax.Array      # (2, 3, 3) per listener, per kind (steps, door, shot): direction (x, y) and loudness 0..1
-    sound_age: jax.Array  # (2, 3) decisions since that sound was heard
-    alive: jax.Array      # (2,)
-    fired: jax.Array      # (2,) fired this decision (a sound)
-    flash: jax.Array      # (2,) decisions left of this operator's muzzle flash
-    flash_seen: jax.Array  # (2,) this operator sees the other's muzzle flash right now
-    bangs: jax.Array      # (2,) flashbangs left
-    bang_pos: jax.Array   # (2, 2) where each one's live flashbang lies
-    bang_timer: jax.Array  # (2,) decisions until it goes off (0 = none live)
-    bang_now: jax.Array   # (2,) this one's flashbang went off this decision
-    blind: jax.Array      # (2,) decisions left that this operator can't see
-    bang_heard: jax.Array  # (2, 3) the other's last bang: direction (x, y) and loudness 0..1
-    bang_age: jax.Array   # (2,) decisions since it was heard
-    mag: jax.Array        # (2,) rounds in the magazine
-    reserve: jax.Array    # (2,) rounds carried besides it
-    reload_timer: jax.Array  # (2,) decisions until the reload is done (0 = not reloading)
-    reload_now: jax.Array  # (2,) started reloading this decision (a sound)
-    kick: jax.Array       # (2,) recoil left from the last shot, 1 -> 0
-    reload_heard: jax.Array  # (2, 3) the other's last reload: direction (x, y) and loudness 0..1
-    reload_age: jax.Array  # (2,) decisions since it was heard
-    hp: jax.Array         # (2,) health left
-    landed: jax.Array     # (2,) decisions since this operator's last shot hit (sound_steps or more: not lately)
-    aim: jax.Array        # (2,) how settled this operator's aim on the other is: +1 per decision in sight, -1 out of
-                          # it, 0..react_steps (always 0 without a reaction time)
+    door_event: jax.Array  # (N,) did this operator start moving a door this decision (a sound)
+    door_at: jax.Array    # (N, 2) the middle of the door it started moving (where that sound comes from)
+    seen: jax.Array       # (N, N) does i see j right now (j alive, i not blinded)
+    mem: jax.Array        # (N, N, 2) where i's team last saw enemy j
+    mem_vel: jax.Array    # (N, N, 2) and how it was moving then
+    since: jax.Array      # (N, N) decisions since then (T = never)
+    cleared: jax.Array    # (N, cells) the "seen" map: which cells of the building each has looked at
+    sound: jax.Array      # (N, 3, 3) per listener, per kind (steps, door, shot): direction (x, y) and loudness 0..1
+    sound_age: jax.Array  # (N, 3) decisions since that sound was heard
+    alive: jax.Array      # (N,)
+    fired: jax.Array      # (N,) fired this decision (a sound)
+    flash: jax.Array      # (N,) decisions left of this operator's muzzle flash
+    flash_seen: jax.Array  # (N, N) i sees enemy j's muzzle flash right now
+    bangs: jax.Array      # (N,) flashbangs left
+    bang_pos: jax.Array   # (N, 2) where each one's live flashbang lies
+    bang_timer: jax.Array  # (N,) decisions until it goes off (0 = none live)
+    bang_now: jax.Array   # (N,) this one's flashbang went off this decision
+    blind: jax.Array      # (N,) decisions left that this operator can't see
+    bang_heard: jax.Array  # (N, 3) an enemy's last bang: direction (x, y) and loudness 0..1
+    bang_age: jax.Array   # (N,) decisions since it was heard
+    mag: jax.Array        # (N,) rounds in the magazine
+    reserve: jax.Array    # (N,) rounds carried besides it
+    reload_timer: jax.Array  # (N,) decisions until the reload is done (0 = not reloading)
+    reload_now: jax.Array  # (N,) started reloading this decision (a sound)
+    kick: jax.Array       # (N,) recoil left from the last shot, 1 -> 0
+    reload_heard: jax.Array  # (N, 3) an enemy's last reload: direction (x, y) and loudness 0..1
+    reload_age: jax.Array  # (N,) decisions since it was heard
+    hp: jax.Array         # (N,) health left
+    landed: jax.Array     # (N,) decisions since this operator's last shot hit (sound_steps or more: not lately)
+    aim: jax.Array        # (N, N) how settled i's aim on j is: +1 per decision in sight, -1 out of it,
+                          # 0..react_steps (always 0 without a reaction time)
+    known_down: jax.Array  # (N, N) i's team knows enemy j is down (saw it go down, or hit it)
+    hit_by: jax.Array     # (N,) who last hit this operator (-1: nobody yet); for counting and footage, not observed
+    bumped: jax.Array     # (N,) ran into a wall, door or crate this decision (with `bump`: a sound)
+    ready_t: jax.Array    # (N,) decisions since this operator last ran or bumped, up to ready_steps (with `ready`)
+    stun_t: jax.Array     # (N,) decisions of stun left (with `stun`)
     key: jax.Array        # randomness for hits (in the state, so a recorded round replays exactly)
     t: jax.Array          # decisions taken
     done: jax.Array
@@ -729,48 +762,84 @@ class CQBGame:
         self.health_on = cfg.health > 0         # likewise health, damage and wounds
         self.react_on = cfg.react > 0           # likewise the reaction time
         self.react_steps = max(int(round(cfg.react / cfg.dt)), 1)
+        self.bump_on = cfg.bump > 0             # likewise loud collisions...
+        self.ready_on = cfg.ready > 0           # ...and the rifle coming up after running
+        self.ready_steps = max(int(round(cfg.ready / cfg.dt)), 1)
+        self.stun_on = cfg.stun > 0
+        self.stun_steps = max(int(round(cfg.stun / cfg.dt)), 1)
+        # teams (ep10): who's who, all static
+        self.nA, self.nD = (int(n) for n in cfg.team_sizes)
+        self.N = self.nA + self.nD
+        self.teams_on = (self.nA, self.nD) != (1, 1)
+        self.team = np.array([ASSAULT] * self.nA + [DEFENSE] * self.nD)     # each operator's side
+        self.enemies = [[j for j in range(self.N) if self.team[j] != self.team[i]] for i in range(self.N)]
+        self.mates = [[j for j in range(self.N) if self.team[j] == self.team[i] and j != i] for i in range(self.N)]
+        self.is_enemy = jnp.asarray(self.team[:, None] != self.team[None, :])
+        self.same_team = jnp.asarray(self.team[:, None] == self.team[None, :])
+        self.slots = max(self.nA, self.nD)                                   # enemy (and teammate + 1) slots
+
+    def side_ops(self, side: int) -> list:
+        """The operators on a side (ASSAULT or DEFENSE)."""
+        return list(range(self.nA)) if side == ASSAULT else list(range(self.nA, self.N))
+
+    def sides_out(self, alive):
+        """alive (..., N) -> is Assault out, is Defense out (...): all of a side down."""
+        return ~alive[..., :self.nA].any(-1), ~alive[..., self.nA:].any(-1)
 
     def init(self, key, building=None) -> State:
-        """Assault outside a random outside door, facing it; Defense on a random spot inside,
-        facing a random way. Outside doors closed; inside doors open or closed at random."""
+        """Assault outside a random outside door, facing it (a team stacked one behind the other); Defense on random
+        spots inside, facing random ways. Outside doors closed; inside doors open or closed at random."""
         kb, ke, ks, kf, kd, key = jax.random.split(key, 6)
-        cfg, b = self.cfg, self.b
+        cfg, b, N = self.cfg, self.b, self.N
         bi = jax.random.randint(kb, (), 0, b.wall_lo.shape[0]) if building is None else jnp.asarray(building)
         e = jax.random.randint(ke, (), 0, b.n_entries[bi])
-        d = b.spawn[bi, jax.random.randint(ks, (), 0, cfg.spawn_points)]
-        pos = jnp.stack([b.entry[bi, e], d])
-        face = jnp.stack([b.entry_face[bi, e], jax.random.uniform(kf, (), minval=-jnp.pi, maxval=jnp.pi)])
+        face_a = b.entry_face[bi, e]
+        back = -jnp.stack([jnp.cos(face_a), jnp.sin(face_a)]) * cfg.stack_gap
+        a_pos = [b.entry[bi, e] + back * k if k else b.entry[bi, e] for k in range(self.nA)]
+        if self.nD == 1:                                                     # the draws of the game before teams
+            d_pos = [b.spawn[bi, jax.random.randint(ks, (), 0, cfg.spawn_points)]]
+            d_face = [jax.random.uniform(kf, (), minval=-jnp.pi, maxval=jnp.pi)]
+        else:
+            d_pos = list(b.spawn[bi, jax.random.choice(ks, cfg.spawn_points, (self.nD,), replace=False)])
+            d_face = list(jax.random.uniform(kf, (self.nD,), minval=-jnp.pi, maxval=jnp.pi))
+        pos = jnp.stack(a_pos + d_pos)
+        if self.nA > 1:                                                      # the stack stays in the yard
+            pos = jnp.clip(pos, cfg.radius, jnp.array([cfg.yard_w, cfg.yard_h]) - cfg.radius)
+        face = jnp.stack([face_a] * self.nA + d_face)
         D = b.door_lo.shape[1]
         door_open = (jax.random.uniform(kd, (D,)) < cfg.inside_open) & ~b.door_outside[bi] & b.door_valid[bi]
         z = jnp.asarray(0)
         cells = self.cell_frac.shape[0]
-        n2 = jnp.zeros(2, jnp.int32)
-        st = State(building=bi, pos=pos, vel=jnp.zeros((2, 2)), face=face, turn=jnp.zeros(2), door_open=door_open,
-                   door_timer=jnp.zeros(D, jnp.int32), door_event=jnp.zeros(2, bool), door_at=pos,
-                   seen=jnp.zeros(2, bool), mem=jnp.zeros((2, 2)), mem_vel=jnp.zeros((2, 2)), since=jnp.full(2, self.T),
-                   cleared=jnp.zeros((2, cells), bool), sound=jnp.zeros((2, 3, 3)),
-                   sound_age=jnp.full((2, 3), self.sound_steps, jnp.int32), alive=jnp.ones(2, bool),
-                   fired=jnp.zeros(2, bool), flash=n2, flash_seen=jnp.zeros(2, bool),
-                   bangs=jnp.asarray(cfg.flashbangs, jnp.int32), bang_pos=pos, bang_timer=n2,
-                   bang_now=jnp.zeros(2, bool), blind=n2, bang_heard=jnp.zeros((2, 3)),
-                   bang_age=jnp.full(2, self.sound_steps, jnp.int32),
-                   mag=jnp.full(2, cfg.magazine, jnp.int32), reserve=jnp.full(2, cfg.magazine * cfg.spare_mags, jnp.int32),
-                   reload_timer=n2, reload_now=jnp.zeros(2, bool), kick=jnp.zeros(2), reload_heard=jnp.zeros((2, 3)),
-                   reload_age=jnp.full(2, self.sound_steps, jnp.int32), hp=jnp.full(2, cfg.health),
-                   landed=jnp.full(2, self.sound_steps, jnp.int32), aim=n2, key=key, t=z, done=jnp.asarray(False),
-                   outcome=z)
+        n1 = jnp.zeros(N, jnp.int32)
+        st = State(building=bi, pos=pos, vel=jnp.zeros((N, 2)), face=face, turn=jnp.zeros(N), door_open=door_open,
+                   door_timer=jnp.zeros(D, jnp.int32), door_event=jnp.zeros(N, bool), door_at=pos,
+                   seen=jnp.zeros((N, N), bool), mem=jnp.zeros((N, N, 2)), mem_vel=jnp.zeros((N, N, 2)),
+                   since=jnp.full((N, N), self.T), cleared=jnp.zeros((N, cells), bool), sound=jnp.zeros((N, 3, 3)),
+                   sound_age=jnp.full((N, 3), self.sound_steps, jnp.int32), alive=jnp.ones(N, bool),
+                   fired=jnp.zeros(N, bool), flash=n1, flash_seen=jnp.zeros((N, N), bool),
+                   bangs=jnp.asarray([cfg.flashbangs[s] for s in self.team], jnp.int32), bang_pos=pos, bang_timer=n1,
+                   bang_now=jnp.zeros(N, bool), blind=n1, bang_heard=jnp.zeros((N, 3)),
+                   bang_age=jnp.full(N, self.sound_steps, jnp.int32),
+                   mag=jnp.full(N, cfg.magazine, jnp.int32), reserve=jnp.full(N, cfg.magazine * cfg.spare_mags, jnp.int32),
+                   reload_timer=n1, reload_now=jnp.zeros(N, bool), kick=jnp.zeros(N), reload_heard=jnp.zeros((N, 3)),
+                   reload_age=jnp.full(N, self.sound_steps, jnp.int32), hp=jnp.full(N, cfg.health),
+                   landed=jnp.full(N, self.sound_steps, jnp.int32), aim=jnp.zeros((N, N), jnp.int32),
+                   known_down=jnp.zeros((N, N), bool), hit_by=jnp.full(N, -1, jnp.int32), bumped=jnp.zeros(N, bool),
+                   ready_t=jnp.full(N, self.ready_steps, jnp.int32), stun_t=jnp.zeros(N, jnp.int32), key=key, t=z,
+                   done=jnp.asarray(False), outcome=z)
         return self._look(st)
 
     def init_stacked(self, key, building=None) -> State:
         """A drill start (ep9 3y, training only): a normal start, then Assault is moved to beside the doorway of
         Defense's room (the first door on the way out of it, the one a camper watches), on the side with room to
-        stand, 0.5 m out from the wall and 0.9 m along it (out of line with most of the room), facing the doorway;
-        that door open half the time; the rest of the house counted as already looked at. Assault's job from here:
-        the entry. Uses the floor plan (like the scripts); the game itself never calls it."""
+        stand, 0.5 m out from the wall and 0.9 m along it (out of line with most of the room), facing the doorway
+        (a team: stacked behind the first, away from the doorway); that door open half the time; the rest of the
+        house counted as already looked at. Assault's job from here: the entry. Uses the floor plan (like the
+        scripts); the game itself never calls it."""
         k_init, k_door = jax.random.split(key)
         st = self.init(k_init, building)
         cfg, b, bi, R = self.cfg, self.b, st.building, self.cfg.max_rooms
-        d = st.pos[DEFENSE]
+        d = st.pos[self.nA]                                                     # (the first) Defense
         inside = (d > b.room_lo[bi]).all(1) & (d < b.room_hi[bi]).all(1)
         r = jnp.argmax(inside)                                                  # Defense's room
         k = jnp.maximum(b.next_door[bi, r, R], 0)
@@ -787,12 +856,19 @@ class CQBGame:
         spot, _ = _push_out(spot, jnp.zeros(2), lo, hi, cfg.radius)            # tight corners: out of the walls
         to_door = mid - spot
         open_ = jax.random.uniform(k_door) < 0.5
-        st = st._replace(pos=st.pos.at[ASSAULT].set(spot), door_at=st.door_at.at[ASSAULT].set(spot),
-                         face=st.face.at[ASSAULT].set(jnp.arctan2(to_door[1], to_door[0])),
-                         door_open=st.door_open.at[k].set(open_),
-                         cleared=st.cleared.at[ASSAULT].set(b.cell_room[bi] != r) if b.cell_room is not None
-                         else st.cleared)
-        return self._look(st._replace(seen=jnp.zeros(2, bool), since=jnp.full(2, self.T), aim=jnp.zeros(2, jnp.int32)))
+        pos, door_at, face, cleared = st.pos, st.door_at, st.face, st.cleared
+        away = -to_door / jnp.maximum(jnp.linalg.norm(to_door), 1e-6)
+        for n in range(self.nA):
+            s = spot if n == 0 else _push_out(spot + away * cfg.stack_gap * n, jnp.zeros(2), lo, hi, cfg.radius)[0]
+            to = mid - s
+            pos, door_at = pos.at[n].set(s), door_at.at[n].set(s)
+            face = face.at[n].set(jnp.arctan2(to[1], to[0]))
+            if b.cell_room is not None:
+                cleared = cleared.at[n].set(b.cell_room[bi] != r)
+        N = self.N
+        st = st._replace(pos=pos, door_at=door_at, face=face, door_open=st.door_open.at[k].set(open_), cleared=cleared)
+        return self._look(st._replace(seen=jnp.zeros((N, N), bool), since=jnp.full((N, N), self.T),
+                                      aim=jnp.zeros((N, N), jnp.int32)))
 
     def boxes(self, st: State, door_open=None):
         """Everything solid right now: walls, cover and closed doors (open doors parked far away)."""
@@ -815,25 +891,46 @@ class CQBGame:
         n = jnp.stack([-d[1], d[0]]) / jnp.maximum(jnp.linalg.norm(d), 1e-6) * self.cfg.radius
         return jnp.stack([q, q + n, q - n])
 
-    def sees(self, st: State, who: int, lo=None, hi=None):
-        """Does `who` see the other one: any of 3 points across its body in the cone and in the clear
+    def _other(self, who: int, target):
+        if target is not None:
+            return target
+        assert self.N == 2, "with teams, say which operator"
+        return 1 - who
+
+    def sees(self, st: State, who: int, lo=None, hi=None, target=None):
+        """Does `who` see `target` (1v1: the other one): any of 3 points across its body in the cone and in the clear
         (and `who` isn't blinded by a flashbang)."""
         if lo is None:
             lo, hi = self.boxes(st)
-        p, pts = st.pos[who], self.body(st.pos[who], st.pos[1 - who])
+        j = self._other(who, target)
+        p, pts = st.pos[who], self.body(st.pos[who], st.pos[j])
         return (self.in_cone(p, st.face[who], pts) & _clear(p, pts, lo, hi)).any() & (st.blind[who] == 0)
 
     def cells(self, building):
         """The points of the "seen" map's cells that must be lit (cell centres, moved out of walls and cover)."""
         return self.b.cell_point[building]
 
+    def _team_any(self, x):
+        """(N, N) bools -> (N, N): does anyone on i's team have it about j."""
+        return (self.same_team[:, :, None] & x[None, :, :]).any(1) if self.teams_on else x
+
+    def _sight(self, st: State, lo, hi):
+        """(N, N): who sees whom (only the living see, and are seen; nobody sees themselves)."""
+        rows = []
+        for i in range(self.N):
+            row = [self.sees(st, i, lo, hi, j) if j != i else jnp.asarray(False) for j in range(self.N)]
+            rows.append(jnp.stack(row))
+        seen = jnp.stack(rows)
+        return seen & st.alive[:, None] & st.alive[None, :] if self.teams_on else seen
+
     def _look(self, st: State) -> State:
-        """Who sees whom, memory of the other, and the cells each has now looked at."""
+        """Who sees whom, the team's memory of each enemy, and the cells each has now looked at."""
         lo, hi = self.boxes(st)
-        seen = jnp.stack([self.sees(st, w, lo, hi) for w in (ASSAULT, DEFENSE)])
-        mem = jnp.where(seen[:, None], st.pos[::-1], st.mem)
-        mem_vel = jnp.where(seen[:, None], st.vel[::-1], st.mem_vel)
-        since = jnp.where(seen, 0, jnp.minimum(st.since + 1, self.T))
+        seen = self._sight(st, lo, hi)
+        spotted = self._team_any(seen) & self.is_enemy                          # (N, N) someone on my team sees j
+        mem = jnp.where(spotted[..., None], st.pos[None], st.mem)
+        mem_vel = jnp.where(spotted[..., None], st.vel[None], st.mem_vel)
+        since = jnp.where(spotted, 0, jnp.minimum(st.since + 1, self.T))
         c = self.cells(st.building)
         look = jax.vmap(lambda p, f: self.lit(p, f, c, lo, hi))(st.pos, st.face) & (st.blind == 0)[:, None]
         st = st._replace(seen=seen, mem=mem, mem_vel=mem_vel, since=since, cleared=st.cleared | look)
@@ -858,12 +955,13 @@ class CQBGame:
         return (jnp.abs(rel) <= self.cone_angles[-1] + 1e-6) & (dist <= reach[k])
 
     def _move(self, st: State, a):
-        """Turn, accelerate towards the asked-for velocity, collide."""
-        cfg = self.cfg
+        """Turn, accelerate towards the asked-for velocity, collide. -> position, velocity, facing, and how hard each
+        hit a wall, door or crate (m/s)."""
+        cfg, N = self.cfg, self.N
         face = _wrap(st.face + jnp.clip(a[:, TURN], -1, 1) * jnp.deg2rad(cfg.turn_rate) * cfg.dt)
         m = jnp.clip(a[:, :2], -1, 1)
         m = m / jnp.maximum(jnp.linalg.norm(m, axis=1, keepdims=True), 1.0)
-        m = m * jnp.stack([jnp.where(m[:, 0] > 0, 1.0, cfg.sideways), jnp.full(2, cfg.sideways)], 1)
+        m = m * jnp.stack([jnp.where(m[:, 0] > 0, 1.0, cfg.sideways), jnp.full(N, cfg.sideways)], 1)
         speed = jnp.where(a[:, RUN] > 0, cfg.run, cfg.walk)
         if self.health_on:
             speed = speed * jnp.where(st.hp < cfg.wounded_below, cfg.wounded_speed, 1.0)
@@ -873,45 +971,61 @@ class CQBGame:
         vel = st.vel + dv
         pos = st.pos + vel * cfg.dt
 
-        # the two operators can't overlap
-        gap = pos[1] - pos[0]
-        dist = jnp.linalg.norm(gap)
-        overlap = jnp.maximum(2 * cfg.radius - dist, 0.0)
-        push = gap / jnp.maximum(dist, 1e-6) * overlap / 2
-        pos = pos + jnp.stack([-push, push])
+        # operators can't overlap: each overlapping pair is pushed apart, half each (the fallen don't count)
+        moves = [[] for _ in range(N)]
+        for i in range(N):
+            for j in range(i + 1, N):
+                gap = pos[j] - pos[i]
+                dist = jnp.linalg.norm(gap)
+                overlap = jnp.maximum(2 * cfg.radius - dist, 0.0)
+                if self.teams_on:
+                    overlap = jnp.where(st.alive[i] & st.alive[j], overlap, 0.0)
+                push = gap / jnp.maximum(dist, 1e-6) * overlap / 2
+                moves[i].append(-push)
+                moves[j].append(push)
+        pos = pos + jnp.stack([sum(m[1:], m[0]) for m in moves])
 
         r = cfg.radius
         yard = jnp.array([cfg.yard_w, cfg.yard_h])
         clipped = jnp.clip(pos, r, yard - r)
         vel = jnp.where(clipped != pos, 0.0, vel)
         lo, hi = self.boxes(st)
+        before = vel
         pos, vel = jax.vmap(_push_out, in_axes=(0, 0, None, None, None))(clipped, vel, lo, hi, r)
-        return pos, vel, face
+        impact = jnp.linalg.norm(before - vel, axis=1)   # the speed walls took away (straight into them, not along)
+        return pos, vel, face, impact
 
     def _doors(self, st: State, a, pos):
         """Interact: start opening (or closing) the nearest door within reach. A door finishes
         moving door_time later; a door can't close on someone standing in the doorway."""
         cfg, b, bi = self.cfg, self.b, st.building
         dlo, dhi = b.door_lo[bi], b.door_hi[bi]                                 # (D, 2)
-        dist = jnp.linalg.norm(pos[:, None] - jnp.clip(pos[:, None], dlo[None], dhi[None]), axis=-1)  # (2, D)
+        dist = jnp.linalg.norm(pos[:, None] - jnp.clip(pos[:, None], dlo[None], dhi[None]), axis=-1)  # (N, D)
         dist = jnp.where(b.door_valid[bi][None], dist, jnp.inf)
         near = jnp.argmin(dist, axis=1)
-        wants = (a[:, INTERACT] > 0) & (dist[jnp.arange(2), near] <= cfg.reach)
+        wants = (a[:, INTERACT] > 0) & (dist[jnp.arange(self.N), near] <= cfg.reach)
         free = st.door_timer[near] == 0
-        start = wants & free                                                    # (2,)
-        hit = jax.nn.one_hot(near, dlo.shape[0], dtype=bool) & start[:, None]   # (2, D)
+        start = wants & free                                                    # (N,)
+        hit = jax.nn.one_hot(near, dlo.shape[0], dtype=bool) & start[:, None]   # (N, D)
         timer = jnp.where(hit.any(0), self.door_steps, st.door_timer)
         timer = jnp.maximum(timer - 1, 0)
         finishing = (st.door_timer == 1) | (hit.any(0) & (self.door_steps == 1))
-        blocked = (jnp.linalg.norm(pos[:, None] - jnp.clip(pos[:, None], dlo[None], dhi[None]), axis=-1)
-                   < cfg.radius).any(0)                                         # someone in the doorway
+        inway = jnp.linalg.norm(pos[:, None] - jnp.clip(pos[:, None], dlo[None], dhi[None]), axis=-1) < cfg.radius
+        blocked = (inway & st.alive[:, None]).any(0) if self.teams_on else inway.any(0)   # someone in the doorway
         flip = finishing & ~(st.door_open & blocked)
         return st.door_open ^ flip, timer, start, (dlo[near] + dhi[near]) / 2
 
-    def hit_chance(self, st: State, who: int, lo=None, hi=None):
-        """The chance a shot from `who` right now takes the other one down (0 if it can't hit)."""
+    def on_aim(self, st: State, who: int, target):
+        """Is `target` within the aim angle of where `who` points (ignoring walls)?"""
+        d = st.pos[target] - st.pos[who]
+        dist = jnp.linalg.norm(d)
+        return d @ jnp.stack([jnp.cos(st.face[who]), jnp.sin(st.face[who])]) >= self.cos_aim * dist
+
+    def hit_chance(self, st: State, who: int, lo=None, hi=None, target=None):
+        """The chance a shot from `who` right now hits `target` (1v1: the other one; 0 if it can't hit)."""
         cfg = self.cfg
-        d = st.pos[1 - who] - st.pos[who]
+        j = self._other(who, target)
+        d = st.pos[j] - st.pos[who]
         dist = jnp.linalg.norm(d)
         on_aim = d @ jnp.stack([jnp.cos(st.face[who]), jnp.sin(st.face[who])]) >= self.cos_aim * dist
         p = jnp.clip(cfg.hit_close - cfg.hit_falloff * dist, 0.05, 1.0)
@@ -920,8 +1034,29 @@ class CQBGame:
         if self.health_on:
             p = p * jnp.where(st.hp[who] < cfg.wounded_below, cfg.wounded_aim, 1.0)
         if self.react_on:
-            p = p * st.aim[who] / self.react_steps
-        return jnp.where(on_aim & self.sees(st, who, lo, hi), p, 0.0)
+            p = p * st.aim[who, j] / self.react_steps
+        if self.ready_on:
+            p = p * st.ready_t[who] / self.ready_steps
+        return jnp.where(on_aim & self.sees(st, who, lo, hi, j), p, 0.0)
+
+    def targets(self, st: State, lo=None, hi=None):
+        """Where each operator's shot would go: the first body on its aim line, the nearest living operator within the
+        aim angle that it sees, teammates included (friendly fire). -> (target (N,), hit chance (N,)); with nobody
+        there the chance is 0. 1v1: always the other one."""
+        if lo is None:
+            lo, hi = self.boxes(st)
+        if not self.teams_on:
+            return jnp.asarray([1, 0]), jnp.stack([self.hit_chance(st, w, lo, hi) for w in (ASSAULT, DEFENSE)])
+        tgt, chance = [], []
+        for i in range(self.N):
+            others = [j for j in range(self.N) if j != i]
+            dist = jnp.stack([jnp.linalg.norm(st.pos[j] - st.pos[i]) for j in others])
+            line = jnp.stack([self.on_aim(st, i, j) & st.seen[i, j] for j in others])
+            k = jnp.argmin(jnp.where(line, dist, jnp.inf))
+            p = jnp.stack([self.hit_chance(st, i, lo, hi, j) for j in others])
+            tgt.append(jnp.asarray(others)[k])
+            chance.append(jnp.where(line.any(), p[k], 0.0))
+        return jnp.stack(tgt), jnp.stack(chance)
 
     def _reload(self, st: State, a) -> State:
         """A reload in progress ticks down and refills the magazine from the rounds carried when it's done; a new one
@@ -932,42 +1067,56 @@ class CQBGame:
         done = st.reload_timer == 1
         take = jnp.where(done, jnp.minimum(cfg.magazine - st.mag, st.reserve), 0)
         mag, reserve = st.mag + take, st.reserve - take
-        want = a[:, RELOAD] > 0 if a.shape[-1] > RELOAD else jnp.zeros(2, bool)
+        want = a[:, RELOAD] > 0 if a.shape[-1] > RELOAD else jnp.zeros(self.N, bool)
         start = (want | (mag == 0)) & (mag < cfg.magazine) & (reserve > 0) & (timer == 0) & st.alive & ~st.done
         return st._replace(mag=mag, reserve=reserve, reload_timer=jnp.where(start, self.reload_steps, timer),
                            reload_now=start,
                            kick=jnp.maximum(st.kick - cfg.dt / cfg.recoil_recover, 0.0))
 
     def _shoot(self, st: State, a) -> State:
-        """Both may fire in the same decision (both can go down). A shot lights up the shooter. With magazines: only
-        with a round loaded and not reloading; each shot uses one and kicks (the next shot soon after hits less)."""
+        """Everyone may fire in the same decision (several can go down). A shot lights up the shooter. With magazines:
+        only with a round loaded and not reloading; each shot uses one and kicks (the next shot soon after hits less).
+        A shot goes to the first body on the aim line (targets), teammates included."""
+        N = self.N
         lo, hi = self.boxes(st)
         fire = (a[:, FIRE] > 0) & (a[:, RUN] <= 0) & st.alive & ~st.done
         if self.guns_on:
             fire = fire & (st.mag > 0) & (st.reload_timer == 0)
         key, k = jax.random.split(st.key)
-        p = jnp.stack([self.hit_chance(st, w, lo, hi) for w in (ASSAULT, DEFENSE)])
+        tgt, p = self.targets(st, lo, hi)
         if self.guns_on:
             p = p * (1 - self.cfg.recoil * st.kick)
-        hits = fire & (jax.random.uniform(k, (2,)) < p)                 # hits[i]: i hit the other one
+        hits = fire & (jax.random.uniform(k, (N,)) < p)                 # hits[i]: i hit its target
+        H = jax.nn.one_hot(tgt, N, dtype=bool) & hits[:, None]          # (N shooter, N hit)
         if self.health_on:   # where each hit lands, and what it takes
             cfg = self.cfg
             key, kw = jax.random.split(key)
-            where = jax.random.uniform(kw, (2,))
+            where = jax.random.uniform(kw, (N,))
             damage = jnp.where(where < cfg.head_share, cfg.head_damage,
                                jnp.where(where < cfg.head_share + cfg.torso_share, cfg.torso_damage, cfg.limb_damage))
-            hp = st.hp - jnp.where(hits, damage, 0.0)[::-1]
+            hp = st.hp - jnp.where(H, damage[:, None], 0.0).sum(0)
             alive = st.alive & (hp > 0)
             st = st._replace(hp=jnp.maximum(hp, 0.0), landed=jnp.where(hits, 0, jnp.minimum(st.landed + 1, self.sound_steps)))
         else:
-            alive = st.alive & ~hits[::-1]
+            alive = st.alive & ~H.any(0)
         flash = jnp.where(fire, self.flash_steps, jnp.maximum(st.flash - 1, 0))
-        # who sees the other's flash: a clear line to it, light cone or not
-        sees_flash = jnp.stack([(flash[1 - w] > 0) & _clear(st.pos[w], st.pos[1 - w][None], lo, hi)[0]
-                                & (st.blind[w] == 0) for w in (ASSAULT, DEFENSE)])
-        mem = jnp.where(sees_flash[:, None], st.pos[::-1], st.mem)
-        since = jnp.where(sees_flash, 0, st.since)
-        st = st._replace(alive=alive, fired=fire, flash=flash, flash_seen=sees_flash, mem=mem, since=since, key=key)
+        # who sees an enemy's flash: a clear line to it, light cone or not
+        rows = []
+        for w in range(N):
+            rows.append(jnp.stack([(flash[j] > 0) & _clear(st.pos[w], st.pos[j][None], lo, hi)[0] & (st.blind[w] == 0)
+                                   & (st.alive[w] if self.teams_on else True)
+                                   if j in self.enemies[w] else jnp.asarray(False) for j in range(N)]))
+        sees_flash = jnp.stack(rows)
+        spotted = self._team_any(sees_flash)
+        mem = jnp.where(spotted[..., None], st.pos[None], st.mem)
+        since = jnp.where(spotted, 0, st.since)
+        if self.teams_on:   # who's down, as each team knows it: it went down in sight of the team, or to its shot
+            fell = st.alive & ~alive
+            news = (self._team_any(st.seen) | self._team_any(H)) & fell[None, :] & self.is_enemy
+            st = st._replace(known_down=st.known_down | news)
+        hit_by = jnp.where(H.any(0), jnp.argmax(H, axis=0), st.hit_by)
+        st = st._replace(alive=alive, fired=fire, flash=flash, flash_seen=sees_flash, mem=mem, since=since, key=key,
+                         hit_by=hit_by)
         if self.guns_on:
             st = st._replace(mag=st.mag - fire, kick=jnp.where(fire, 1.0, st.kick))
         return st
@@ -979,24 +1128,46 @@ class CQBGame:
             lo, hi = self.boxes(st)
         return _cast(st.pos[who], _rot(self.ray_dirs, st.face[who]), lo, hi, self.cfg)
 
+    def _enemy_obs(self, st: State, me: int, j, own, p):
+        """The 10 numbers about enemy j as `me` knows it: seen?, where and how it moves (if seen), where the team last
+        saw it, how long ago, the direction of its muzzle flash (if seen)."""
+        cfg = self.cfg
+        seen = st.seen[me, j]
+        never = st.since[me, j] >= self.T
+        return jnp.concatenate([
+            seen[None].astype(jnp.float32),
+            jnp.where(seen, own(st.pos[j] - p) / cfg.sight, 0.0),
+            jnp.where(seen, own(st.vel[j]) / cfg.run, 0.0),
+            jnp.where(never, 0.0, own(st.mem[me, j] - p) / cfg.sight),
+            jnp.minimum(st.since[me, j] / self.T, 1.0)[None],
+            jnp.where(st.flash_seen[me, j], own((st.pos[j] - p) / jnp.maximum(jnp.linalg.norm(st.pos[j] - p),
+                                                                              1e-6)), 0.0),
+        ])
+
+    def enemy_order(self, st: State, me: int):
+        """`me`'s enemies, nearest known first: seen now (by distance), then remembered (by distance to where they were
+        last seen), then never seen; those the team knows are down go last. -> (enemies,) operator numbers."""
+        en = jnp.asarray(self.enemies[me])
+        p = st.pos[me]
+        dist = jnp.linalg.norm(st.mem[me, en] - p, axis=1)
+        key = jnp.where(st.seen[me, en], jnp.linalg.norm(st.pos[en] - p, axis=1),
+                        jnp.where(st.since[me, en] < self.T, 1e3 + dist, 1e6))
+        key = key + jnp.where(st.known_down[me, en], 1e7, 0.0) + jnp.arange(len(self.enemies[me])) * 1e-3
+        return en[jnp.argsort(key)]
+
     def observe(self, st: State, who: int) -> jax.Array:
         """What operator `who` knows, about -1..1, positions and directions in its own frame
         (x straight ahead, y to its left). Nothing here comes from what it can't see or hear."""
         cfg, b, bi = self.cfg, self.b, st.building
-        me, other = who, 1 - who
+        me = who
         p, face = st.pos[me], st.face[me]
         own = lambda v: _rot(v, -face)                                          # world -> my frame
-        seen = st.seen[me]
-        never = st.since[me] >= self.T
-        enemy = jnp.concatenate([
-            seen[None].astype(jnp.float32),
-            jnp.where(seen, own(st.pos[other] - p) / cfg.sight, 0.0),
-            jnp.where(seen, own(st.vel[other]) / cfg.run, 0.0),
-            jnp.where(never, 0.0, own(st.mem[me] - p) / cfg.sight),
-            jnp.minimum(st.since[me] / self.T, 1.0)[None],
-            jnp.where(st.flash_seen[me], own((st.pos[other] - p) / jnp.maximum(jnp.linalg.norm(st.pos[other] - p),
-                                                                             1e-6)), 0.0),
-        ])
+        if self.teams_on:
+            order = self.enemy_order(st, me)
+            down = st.known_down[me, order]
+            enemy = jnp.where(down[0], 0.0, self._enemy_obs(st, me, order[0], own, p))
+        else:
+            enemy = self._enemy_obs(st, me, 1 - who, own, p)
         snd = st.sound[me]
         sounds = jnp.concatenate([own(snd[:, :2]) * (snd[:, 2:] > 0), snd[:, 2:]], 1).reshape(-1)
         flo, fhi = b.foot_lo[bi], b.foot_hi[bi]
@@ -1020,14 +1191,15 @@ class CQBGame:
         ], 1).reshape(-1)
         obs = [self.lasers(st, me) / cfg.sight, enemy, sounds, mine, doors,
                st.cleared[me].astype(jnp.float32), (1 - st.t / self.T)[None]]
-        if self.bangs_on:   # flashbangs left, how blind I am, my live flashbang (where, fuse left), the other's bang
+        mine_side = int(self.team[me])
+        if self.bangs_on:   # flashbangs left, how blind I am, my live flashbang (where, fuse left), an enemy's bang
             live = st.bang_timer[me] > 0
             hb = st.bang_heard[me]
             obs.append(jnp.concatenate([
-                (st.bangs[me] / max(cfg.flashbangs[me], 1))[None], (st.blind[me] / self.blind_steps)[None],
+                (st.bangs[me] / max(cfg.flashbangs[mine_side], 1))[None], (st.blind[me] / self.blind_steps)[None],
                 jnp.where(live, own(st.bang_pos[me] - p) / cfg.sight, 0.0), (st.bang_timer[me] / self.fuse_steps)[None],
                 own(hb[:2]) * (hb[2] > 0), hb[2:]]))
-        if self.guns_on:    # rounds loaded, rounds carried, reloading, recoil, the other's reload heard
+        if self.guns_on:    # rounds loaded, rounds carried, reloading, recoil, an enemy's reload heard
             rh = st.reload_heard[me]
             obs.append(jnp.concatenate([
                 (st.mag[me] / cfg.magazine)[None], (st.reserve[me] / max(cfg.magazine * cfg.spare_mags, 1))[None],
@@ -1035,8 +1207,27 @@ class CQBGame:
                 own(rh[:2]) * (rh[2] > 0), rh[2:]]))
         if self.health_on:  # (last: older brains read the numbers before) my health; did my shot just hit (you can tell when you hit someone)
             obs.append(jnp.stack([st.hp[me] / cfg.health, (st.landed[me] < self.sound_steps).astype(jnp.float32)]))
-        if self.react_on:   # (last) how settled my aim is
-            obs.append((st.aim[me] / self.react_steps)[None].astype(jnp.float32))
+        if self.react_on:   # how settled my aim is (on the nearest enemy I know of)
+            j = order[0] if self.teams_on else 1 - who
+            obs.append((st.aim[me, j] / self.react_steps)[None].astype(jnp.float32))
+        if self.teams_on:   # (last) the other enemies, my teammates, which one of my team I am
+            extra = self.slots - 1
+            more = [jnp.where(down[k], 0.0, self._enemy_obs(st, me, order[k], own, p)) for k in range(1, len(order))]
+            more += [jnp.zeros(ENEMY_OBS)] * (extra - len(more))
+            mates = []
+            for j in self.mates[me]:
+                rel = st.face[j] - face
+                mates.append(jnp.concatenate([
+                    own(st.pos[j] - p) / cfg.sight, jnp.stack([jnp.sin(rel), jnp.cos(rel)]),
+                    (st.hp[j] / cfg.health if self.health_on else st.alive[j].astype(jnp.float32))[None],
+                    st.alive[j][None].astype(jnp.float32)]))
+            mates += [jnp.zeros(MATE_OBS)] * (extra - len(mates))
+            k = (self.side_ops(mine_side)).index(me)
+            obs += more + mates + [jnp.asarray([k / extra], jnp.float32)]
+        if self.ready_on:   # (last of all) how far my rifle is up
+            obs.append((st.ready_t[me] / self.ready_steps)[None].astype(jnp.float32))
+        if self.stun_on:    # (after it) how long I'm still stunned
+            obs.append((st.stun_t[me] / self.stun_steps)[None].astype(jnp.float32))
         return jnp.concatenate(obs)
 
     def reset_if(self, st: State, key) -> State:
@@ -1066,48 +1257,59 @@ class CQBGame:
         cfg = self.cfg
         lo, hi = self.walls(st)
         timer = jnp.maximum(st.bang_timer - 1, 0)
-        now = st.bang_timer == 1                                                # (2,) whose went off
+        now = st.bang_timer == 1                                                # (N,) whose went off
         blind = jnp.maximum(st.blind - 1, 0)
-        for src in (ASSAULT, DEFENSE):
+        for src in range(self.N):
             q = st.bang_pos[src]
-            d = jnp.linalg.norm(st.pos - q, axis=1)                             # (2,) each operator to it
+            d = jnp.linalg.norm(st.pos - q, axis=1)                             # (N,) each operator to it
             clear = _clear(q, st.pos, lo, hi)
             facing = jax.vmap(lambda p, f: self.in_cone(p, f, q[None])[0])(st.pos, st.face)
             steps = jnp.where(facing, self.blind_steps, int(round(self.blind_steps * cfg.blind_away)))
             hit = now[src] & (d <= cfg.bang_range) & clear & st.alive
             blind = jnp.where(hit, jnp.maximum(blind, steps), blind)
-        want = a[:, THROW] > 0 if a.shape[-1] > THROW else jnp.zeros(2, bool)
+        want = a[:, THROW] > 0 if a.shape[-1] > THROW else jnp.zeros(self.N, bool)
         throw = want & (st.bangs > 0) & (timer == 0) & st.alive & ~st.done
-        ahead = jnp.stack([jnp.cos(st.face), jnp.sin(st.face)], 1)              # (2, 2)
+        ahead = jnp.stack([jnp.cos(st.face), jnp.sin(st.face)], 1)              # (N, 2)
         room = jax.vmap(lambda p, d: _cast(p, d[None], lo, hi, cfg)[0])(st.pos, ahead)
         land = st.pos + ahead * jnp.clip(jnp.minimum(cfg.throw, room - 0.3), 0.0, None)[:, None]
         return st._replace(bangs=st.bangs - throw, bang_pos=jnp.where(throw[:, None], land, st.bang_pos),
                            bang_timer=jnp.where(throw, self.fuse_steps, timer), bang_now=now, blind=blind)
 
+    @staticmethod
+    def _loudest(heard: list):
+        """Several enemies' sounds of one kind, each (..., 3) (direction, loudness) -> the loudest of them."""
+        if len(heard) == 1:
+            return heard[0]
+        x = jnp.stack(heard)                                                    # (enemies, ..., 3)
+        k = jnp.argmax(x[..., 2], axis=0)
+        return jnp.take_along_axis(x, k[None, ..., None], axis=0)[0]
+
     def _hear(self, st: State) -> State:
-        """Each operator hears the other's footsteps, doors and shots made this decision."""
+        """Each operator hears its enemies' footsteps, doors and shots made this decision (the loudest of each kind)."""
         cfg = self.cfg
         speed = jnp.linalg.norm(st.vel, axis=1)
         steps = jnp.where(speed > cfg.walk + 0.1, cfg.hear_run, jnp.where(speed > cfg.still, cfg.hear_walk, 0.0))
+        if self.bump_on:
+            steps = jnp.where(st.bumped, jnp.maximum(steps, cfg.bump), steps)
         made = jnp.stack([steps, jnp.where(st.door_event, cfg.hear_door, 0.0),
-                          jnp.where(st.fired, cfg.hear_shot, 0.0)], 1)           # (2 makers, 3 kinds) ranges
+                          jnp.where(st.fired, cfg.hear_shot, 0.0)], 1)           # (N makers, 3 kinds) ranges
         made = made * st.alive[:, None]
         k = 2 * jnp.pi / cfg.sound_dirs
 
-        def listen(w):
+        def listen(w, o):
             me = st.pos[w]
-            door = st.door_at[1 - w]
+            door = st.door_at[o]
             door = door + (me - door) / jnp.maximum(jnp.linalg.norm(me - door), 1e-6) * cfg.wall  # its face on my side
-            src = jnp.stack([st.pos[1 - w], door, st.pos[1 - w]])                # footsteps, door, shot
+            src = jnp.stack([st.pos[o], door, st.pos[o]])                        # footsteps, door, shot
             d = src - me
             dist = jnp.linalg.norm(d, axis=1)
             walls = jax.vmap(lambda q: self.walls_between(st, me, q))(src)
-            reach = made[1 - w] * cfg.through_wall ** walls
+            reach = made[o] * cfg.through_wall ** walls
             loud = jnp.where(reach > 0, jnp.clip(1 - dist / jnp.maximum(reach, 1e-6), 0, 1), 0.0)   # (3,)
             ang = jnp.round(jnp.arctan2(d[:, 1], d[:, 0]) / k) * k               # roughly where from
             return jnp.concatenate([jnp.stack([jnp.cos(ang), jnp.sin(ang)], 1), loud[:, None]], 1)
 
-        new = jnp.stack([listen(ASSAULT), listen(DEFENSE)])                     # (2, 3, 3)
+        new = jnp.stack([self._loudest([listen(w, o) for o in self.enemies[w]]) for w in range(self.N)])  # (N, 3, 3)
         age = jnp.minimum(st.sound_age + 1, self.sound_steps)
         old = jnp.where((age < self.sound_steps)[..., None], st.sound, 0.0)
         take = (new[..., 2] > 0) & (new[..., 2] >= old[..., 2])                  # louder than what's in mind
@@ -1115,53 +1317,64 @@ class CQBGame:
         if not self.bangs_on:
             return st
 
-        def bang(w):                                                             # the other's flashbang
-            me, q = st.pos[w], st.bang_pos[1 - w]
+        def bang(w, o):                                                          # an enemy's flashbang
+            me, q = st.pos[w], st.bang_pos[o]
             d = q - me
-            reach = jnp.where(st.bang_now[1 - w], cfg.hear_bang, 0.0) * cfg.through_wall ** self.walls_between(st, me, q)
+            reach = jnp.where(st.bang_now[o], cfg.hear_bang, 0.0) * cfg.through_wall ** self.walls_between(st, me, q)
             loud = jnp.where(reach > 0, jnp.clip(1 - jnp.linalg.norm(d) / jnp.maximum(reach, 1e-6), 0, 1), 0.0)
             ang = jnp.round(jnp.arctan2(d[1], d[0]) / k) * k
             return jnp.stack([jnp.cos(ang), jnp.sin(ang), loud])
 
-        heard = jnp.stack([bang(ASSAULT), bang(DEFENSE)])                       # (2, 3)
+        heard = jnp.stack([self._loudest([bang(w, o) for o in self.enemies[w]]) for w in range(self.N)])   # (N, 3)
         age = jnp.minimum(st.bang_age + 1, self.sound_steps)
         old = jnp.where((age < self.sound_steps)[:, None], st.bang_heard, 0.0)
         take = heard[:, 2] > 0
         return st._replace(bang_heard=jnp.where(take[:, None], heard, old), bang_age=jnp.where(take, 0, age))
 
     def _hear_reload(self, st: State) -> State:
-        """A magazine change (the other's, starting this decision) is heard like footsteps: hear_reload metres,
+        """A magazine change (an enemy's, starting this decision) is heard like footsteps: hear_reload metres,
         a third less per wall or shut door."""
         cfg = self.cfg
         k = 2 * jnp.pi / cfg.sound_dirs
 
-        def listen(w):
-            me, q = st.pos[w], st.pos[1 - w]
+        def listen(w, o):
+            me, q = st.pos[w], st.pos[o]
             d = q - me
-            reach = jnp.where(st.reload_now[1 - w] & st.alive[1 - w], cfg.hear_reload, 0.0) \
+            reach = jnp.where(st.reload_now[o] & st.alive[o], cfg.hear_reload, 0.0) \
                 * cfg.through_wall ** self.walls_between(st, me, q)
             loud = jnp.where(reach > 0, jnp.clip(1 - jnp.linalg.norm(d) / jnp.maximum(reach, 1e-6), 0, 1), 0.0)
             ang = jnp.round(jnp.arctan2(d[1], d[0]) / k) * k
             return jnp.stack([jnp.cos(ang), jnp.sin(ang), loud])
 
-        heard = jnp.stack([listen(ASSAULT), listen(DEFENSE)])
+        heard = jnp.stack([self._loudest([listen(w, o) for o in self.enemies[w]]) for w in range(self.N)])
         age = jnp.minimum(st.reload_age + 1, self.sound_steps)
         old = jnp.where((age < self.sound_steps)[:, None], st.reload_heard, 0.0)
         take = heard[:, 2] > 0
         return st._replace(reload_heard=jnp.where(take[:, None], heard, old), reload_age=jnp.where(take, 0, age))
 
     def step(self, st: State, actions) -> tuple[State, jax.Array]:
-        """actions: (2, 8) per operator (see FWD..RELOAD; 6 or 7 = the rest off). Returns the new state and Assault's reward
-        (Defense's is its negative). Once a round is over, nothing changes."""
+        """actions: (N, 8) per operator (see FWD..RELOAD; 6 or 7 = the rest off). Returns the new state and Assault's
+        reward (Defense's is its negative). A side is out when all of it is down. Once a round is over, nothing
+        changes."""
         cfg = self.cfg
-        pos, vel, face = self._move(st, actions)
+        if self.stun_on:   # stunned: no moving, turning, firing or anything else this decision
+            off = jnp.concatenate([jnp.zeros(3), -jnp.ones(actions.shape[-1] - 3)])
+            actions = jnp.where((st.stun_t > 0)[:, None], off, actions)
+        pos, vel, face, impact = self._move(st, actions)
         alive = st.alive[:, None]
         pos, vel = jnp.where(alive, pos, st.pos), jnp.where(alive, vel, 0.0)
+        hard = (impact > cfg.walk + 0.1) & st.alive               # a collision harder than walking into a wall
+        bumped = hard if self.bump_on else st.bumped
         door_open, door_timer, door_event, door_at = self._doors(st, actions * alive, pos)
         new = st._replace(pos=pos, vel=vel, face=jnp.where(st.alive, face, st.face),
                           turn=jnp.clip(actions[:, TURN], -1, 1) * st.alive, door_open=door_open,
                           door_timer=door_timer, door_event=door_event,
-                          door_at=jnp.where(door_event[:, None], door_at, st.door_at), t=st.t + 1)
+                          door_at=jnp.where(door_event[:, None], door_at, st.door_at), t=st.t + 1, bumped=bumped)
+        if self.stun_on:
+            new = new._replace(stun_t=jnp.where(hard, self.stun_steps, jnp.maximum(st.stun_t - 1, 0)))
+        if self.ready_on:   # running (the switch on and going faster than a walk) or a collision: the rifle drops
+            ran = (actions[:, RUN] > 0) & (jnp.linalg.norm(vel, axis=1) > cfg.walk + 0.1)
+            new = new._replace(ready_t=jnp.where(ran | hard, 0, jnp.minimum(st.ready_t + 1, self.ready_steps)))
         if self.bangs_on:
             new = self._flashbangs(new, actions)
         new = self._look(new)
@@ -1170,7 +1383,7 @@ class CQBGame:
         new = self._hear(self._shoot(new, actions))
         if self.guns_on:
             new = self._hear_reload(new)
-        a_down, d_down = ~new.alive[ASSAULT], ~new.alive[DEFENSE]
+        a_down, d_down = ~new.alive[:self.nA].any(), ~new.alive[self.nA:].any()
         timeout = (new.t >= self.T) & ~a_down & ~d_down
         outcome = jnp.where(d_down & ~a_down, 1, jnp.where(a_down & ~d_down, -1, jnp.where(timeout, -1, 0)))
         done = a_down | d_down | timeout

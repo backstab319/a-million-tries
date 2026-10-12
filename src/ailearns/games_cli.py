@@ -100,6 +100,10 @@ def main() -> None:
     sp.add_argument("--magazine", type=int, default=0, help="rounds per magazine (0: no magazines or reloading)")
     sp.add_argument("--health", type=float, default=0.0, help="health per operator (0: one hit and you're down)")
     sp.add_argument("--react", type=float, default=0.0, help="seconds in sight before your aim settles (0: none)")
+    sp.add_argument("--teams", default="1,1", help="operators per side, Assault,Defense (e.g. 2,1)")
+    sp.add_argument("--bump", type=float, default=0.0, help="metres a collision is heard (0: silent)")
+    sp.add_argument("--ready", type=float, default=0.0, help="seconds to bring the rifle up after running (0: none)")
+    sp.add_argument("--stun", type=float, default=0.0, help="seconds a hard collision stuns you (0: none)")
     sp.add_argument("--plateau", type=int, default=0, help="stop after this many updates without a new best (0: never)")
     sp.add_argument("--stacked", type=float, default=0.0, help="share of rounds that are entry drills (start beside "
                                                                  "Defense's door)")
@@ -196,7 +200,8 @@ def main() -> None:
                            ent_coef=args.ent_coef, buildings=args.buildings,
                            flashbangs=tuple(int(x) for x in args.flashbangs.split(",")), stacked=args.stacked,
                            memory=args.memory, plateau=args.plateau, magazine=args.magazine, health=args.health,
-                           react=args.react),
+                           react=args.react, teams=tuple(int(x) for x in args.teams.split(",")), bump=args.bump,
+                           ready=args.ready, stun=args.stun),
               args.run, resume=args.resume, max_hours=args.max_hours)
     elif args.cmd == "eval-cqb":
         from ailearns.agents.ppo_cqb import evaluate

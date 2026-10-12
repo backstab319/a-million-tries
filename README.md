@@ -57,10 +57,14 @@ video used them (the model pages on Hugging Face name the tag their brains run w
 | episode | tag | the game then |
 |---|---|---|
 | 9, "The Kill House" (1 vs 1) | [`episode-9`](https://github.com/backstab319/a-million-tries/tree/episode-9) | one attacker vs one defender; flashbangs, magazines, health and reaction time as options |
+| 10, "I Gave My AI a Partner. It Shot Him." (2 vs 1) | [`episode-10`](https://github.com/backstab319/a-million-tries/tree/episode-10) | teams (`--teams 2,1`: shared sightings, friendly fire); loud crashes, the rifle coming up after running and a stun on hard crashes as options (`--bump 15 --ready 0.3 --stun 0.5`); the evolution gallery (`qd_cqb.py`) |
 
 ```
 git checkout episode-9
 uv run games watch-cqb runs/<brain>:<update> camper 100064 --batch 64,64   # a round exactly as in the video
+
+git checkout episode-10                                                       # two attackers sharing one brain
+uv run games train-cqb runs/pair --teams 2,1 --init-from runs/<1v1 brain>:last --opponent camper     --flashbangs 2,0 --magazine 30 --health 100 --react 0.3 --bump 15 --ready 0.3 --stun 0.5 --time-cost 0.01
 ```
 
 ## Licence

@@ -29,6 +29,13 @@ NAMES = {cqb.ASSAULT: "Assault", cqb.DEFENSE: "Defense"}
 COLORS = {cqb.ASSAULT: V.ASSAULT, cqb.DEFENSE: V.DEFENSE}
 
 
+def op_name(game: cqb.CQBGame, w: int) -> str:
+    """An operator's name on screen: its side ("Assault"), numbered when the side has more than one ("Assault 2")."""
+    side = int(game.team[w])
+    ops = game.side_ops(side)
+    return NAMES[side] + (f" {ops.index(w) + 1}" if len(ops) > 1 else "")
+
+
 def player(spec: str, who: int, sample: bool = False):
     """A script name, or a brain "runs/x:ckpt" (its best guess; `sample`: it tries moves around it,
     like in training: an untrained brain's best guess just stands still)."""
@@ -129,82 +136,101 @@ def _bang_light(tr: dict, rays: int = 72):
 BANG_SHOW = 4   # decisions a bang's light stays on screen (fading)
 
 
+def _team(tr: dict, eyes: str) -> list:
+    """The operators whose knowledge the picture shows (eyes "assault" / "defense"), or [] for "all"."""
+    return tr["game"].side_ops(SIDES[eyes]) if eyes in SIDES else []
+
+
+def _shown(tr: dict, st_i: int, eyes: str, w: int) -> bool:
+    """Is operator w on screen for these eyes: everyone for "all", the shown side's own, and enemies it sees now."""
+    h = tr["hist"]
+    mine = _team(tr, eyes)
+    return eyes == "all" or w in mine or any(bool(h.seen[st_i][m, w]) for m in mine)
+
+
 def draw_round(surf: pygame.Surface, view: V.View, tr: dict, i: float, eyes: str = "assault", cast=None,
                bang=None) -> None:
-    """bang: _bang_light(tr) (made here if the game has flashbangs and it isn't given)."""
-    cfg, b, h = tr["cfg"], tr["building"], tr["hist"]
+    """bang: _bang_light(tr) (made here if the game has flashbangs and it isn't given). With teams, a side's picture
+    is the union of its operators' lights and "seen" maps, and an enemy shows while any of them sees it."""
+    cfg, b, h, game = tr["cfg"], tr["building"], tr["hist"], tr["game"]
     pos, face, a, k = _interp(tr, i)
     st_i = k if i - a > 0.999 else a                       # what's known: the state at the last decision reached
     doors = h.door_open[st_i]
     V.draw_building(surf, b, view, doors_open=doors[:len(b["doors"])])
-    angles = np.asarray(tr["game"].cone_angles)
-    sides = [cqb.ASSAULT, cqb.DEFENSE] if eyes == "all" else [SIDES[eyes]]   # whose light is drawn
+    angles = np.asarray(game.cone_angles)
+    everyone = range(game.N)
+    mine = _team(tr, eyes)
+    color = lambda w: COLORS[int(game.team[w])]           # noqa: E731
     polys = {}
-    for w in (cqb.ASSAULT, cqb.DEFENSE):
+    for w in everyone:
         if h.alive[st_i][w]:
             reach = np.asarray(cast(jnp.asarray(pos[w]), jnp.asarray(face[w]), jnp.asarray(doors)))
             polys[w] = V.light_polygon(view, pos[w], face[w], angles, reach)
-    if eyes in SIDES:
-        me = SIDES[eyes]
+    if mine:
         size = (b["hi"] - b["lo"]) / np.array(cfg.seen_grid)
         centres = b["lo"] + cqb.cell_fracs(cfg) * (b["hi"] - b["lo"])
-        seen_cells = [(c - size / 2, c + size / 2) for c, s in zip(centres, h.cleared[st_i][me]) if s]
-        V.draw_fog(surf, view, [polys[me]] if me in polys else [], remembered=seen_cells)
+        looked = np.any([h.cleared[st_i][m] for m in mine], axis=0)
+        seen_cells = [(c - size / 2, c + size / 2) for c, s in zip(centres, looked) if s]
+        V.draw_fog(surf, view, [polys[m] for m in mine if m in polys], remembered=seen_cells)
     for w, poly in polys.items():
-        if w in sides:
+        if not mine or w in mine:
             V.draw_light_tint(surf, poly)
     if any(cfg.flashbangs):                                   # bangs under the operators (they stay visible)
         bang = bang or _bang_light(tr)
-        for w in (cqb.ASSAULT, cqb.DEFENSE):
+        for w in everyone:
             for j in range(max(0, int(i) - BANG_SHOW + 1), int(i) + 1):     # went off a moment ago
                 if h.bang_now[j][w]:
                     area = np.asarray(bang(jnp.asarray(h.bang_pos[j][w]), jnp.asarray(h.door_open[j])))
                     V.draw_bang(surf, [view.px(q) for q in area], 1 - (i - j) / BANG_SHOW)
-    for w in (cqb.ASSAULT, cqb.DEFENSE):
-        visible = eyes == "all" or w == SIDES.get(eyes)
-        if eyes in SIDES and w != SIDES[eyes]:
-            me = SIDES[eyes]
-            visible = bool(h.seen[st_i][me] or h.flash_seen[st_i][me])
-            if not visible and h.since[st_i][me] < tr["game"].T:   # a ghost where it was last seen
-                V.draw_operator(surf, view, h.mem[st_i][me], 0.0, COLORS[w], alpha=70)
+    for w in everyone:
+        visible = not mine or w in mine
+        if mine and w not in mine:
+            visible = any(bool(h.seen[st_i][m, w] or h.flash_seen[st_i][m, w]) for m in mine)
+            since = min(int(h.since[st_i][m, w]) for m in mine)
+            if not visible and since < game.T and not h.known_down[st_i][mine[0], w]:   # a ghost: last seen there
+                V.draw_operator(surf, view, h.mem[st_i][mine[0], w], 0.0, color(w), alpha=70)
         if visible:
-            V.draw_operator(surf, view, pos[w], face[w], COLORS[w], down=not h.alive[st_i][w])
+            V.draw_operator(surf, view, pos[w], face[w], color(w), down=not h.alive[st_i][w])
+            ops = game.side_ops(int(game.team[w]))
+            if len(ops) > 1:                                  # which one of its side: "1", "2"
+                c = view.px(pos[w])
+                T.text(surf, str(ops.index(w) + 1), (c[0] + max(6, 0.45 * view.k), c[1] - max(6, 0.45 * view.k)),
+                       kind="semibold", size=max(14, int(0.5 * view.k)), color=color(w), anchor="midleft")
         if h.flash[st_i][w] > 0 and (visible or eyes == "all"):
             V.draw_flash(surf, view, pos[w], face[w], strength=h.flash[st_i][w] / 2)
-    if eyes in SIDES:                                         # what it hears
-        me = SIDES[eyes]
+    for m in mine:                                            # what each of the shown side hears
+        if not h.alive[st_i][m] or h.seen[st_i][m].any():
+            continue
         for kind in range(3):
-            loud = h.sound[st_i][me, kind, 2]
-            if loud > 0 and h.sound_age[st_i][me, kind] == 0 and not h.seen[st_i][me]:
-                V.draw_heard(surf, view, pos[me], h.sound[st_i][me, kind, :2], float(loud))
+            loud = h.sound[st_i][m, kind, 2]
+            if loud > 0 and h.sound_age[st_i][m, kind] == 0:
+                V.draw_heard(surf, view, pos[m], h.sound[st_i][m, kind, :2], float(loud))
     if any(cfg.flashbangs):
         _draw_flashbangs(surf, view, tr, i, st_i, pos, eyes)
     if cfg.health:                                            # health bars (for whoever's shown)
-        for w in (cqb.ASSAULT, cqb.DEFENSE):
-            shown = eyes == "all" or w == SIDES.get(eyes) or h.seen[st_i][SIDES.get(eyes, w)]
-            if h.alive[st_i][w] and shown:
+        for w in everyone:
+            if h.alive[st_i][w] and _shown(tr, st_i, eyes, w):
                 V.draw_health(surf, view, pos[w], float(h.hp[st_i][w]) / cfg.health)
     if cfg.magazine:                                          # who's reloading (if they're shown)
         steps = cfg.reload_time / cfg.dt
-        for w in (cqb.ASSAULT, cqb.DEFENSE):
+        for w in everyone:
             left = h.reload_timer[st_i][w]
-            shown = eyes == "all" or w == SIDES.get(eyes) or h.seen[st_i][SIDES.get(eyes, w)]
-            if left > 0 and h.alive[st_i][w] and shown:
+            if left > 0 and h.alive[st_i][w] and _shown(tr, st_i, eyes, w):
                 V.draw_reloading(surf, view, pos[w], 1 - left / steps)
 
 
 def _draw_flashbangs(surf, view, tr, i, st_i, pos, eyes) -> None:
-    """Live flashbangs (only the thrower knows where its own lies, so other eyes don't show it) and who's
+    """Live flashbangs (only the thrower's side knows where one lies, so other eyes don't show it) and who's
     blinded. (A bang's light is drawn under the operators, in draw_round: everyone sees that.)"""
-    cfg, h = tr["cfg"], tr["hist"]
-    for w in (cqb.ASSAULT, cqb.DEFENSE):
-        if h.bang_timer[st_i][w] > 0 and eyes in ("all", {cqb.ASSAULT: "assault", cqb.DEFENSE: "defense"}[w]):
+    cfg, h, game = tr["cfg"], tr["hist"], tr["game"]
+    mine = _team(tr, eyes)
+    for w in range(game.N):
+        if h.bang_timer[st_i][w] > 0 and (not mine or w in mine):
             V.draw_flashbang(surf, view, h.bang_pos[st_i][w], blink=int(i * 3) % 2 == 0)
     blind_steps = cfg.blind_time / cfg.dt
-    for w in (cqb.ASSAULT, cqb.DEFENSE):
+    for w in range(game.N):
         left = h.blind[st_i][w]
-        shown = eyes == "all" or w == SIDES.get(eyes) or h.seen[st_i][SIDES.get(eyes, w)]
-        if left > 0 and h.alive[st_i][w] and shown:
+        if left > 0 and h.alive[st_i][w] and _shown(tr, st_i, eyes, w):
             V.draw_blind(surf, view, pos[w], min(left / blind_steps, 1.0))
 
 
@@ -218,11 +244,12 @@ def frame(tr: dict, margin: float = 3.5):
 
 def _result(tr: dict) -> tuple[str, tuple]:
     o, alive = tr["outcome"], tr["hist"].alive[-1]
+    a_out, _ = tr["game"].sides_out(np.asarray(alive))
     if o == 1:
         return "ASSAULT WINS", V.ASSAULT
     if o == -1:
-        return ("DEFENSE WINS" if not alive[cqb.ASSAULT] else "TIME UP: DEFENSE WINS"), V.DEFENSE
-    return "BOTH DOWN", T.TEXT
+        return ("DEFENSE WINS" if a_out else "TIME UP: DEFENSE WINS"), V.DEFENSE
+    return ("ALL DOWN" if tr["game"].teams_on else "BOTH DOWN"), T.TEXT
 
 
 def render_round(assault: str, defense: str, building: int, out: str, *, seed: int = 0, eyes: str = "assault",
@@ -262,14 +289,14 @@ def _timeline(steps: int, dt: float, slow: float, hold: float, min_seconds: floa
 def _sounds(tr: dict, timeline: list, events: list) -> None:
     """The round's sounds at the moments they happen on screen (replays included): shots, doors, reloads,
     flashbangs, hits. Shots are thinned to one per shooter every 0.12 s so blind fire stays listenable."""
-    h, last_shot = tr["hist"], [-1.0, -1.0]
+    h, last_shot = tr["hist"], [-1.0] * tr["game"].N
     prev = None
     for f, (i, _) in enumerate(timeline):
         k, t = int(i), f / T.FPS
         if prev is None or k < prev:                          # the start, or a replay jumping back
             prev = k
         for d in range(prev + 1, k + 1):
-            for w in (cqb.ASSAULT, cqb.DEFENSE):
+            for w in range(tr["game"].N):
                 if h.fired[d][w] and t - last_shot[w] >= 0.12:
                     events.append((t, "gunshot", 0.55))
                     last_shot[w] = t
@@ -294,7 +321,7 @@ def render_played(tr: dict, out: str, *, eyes: str = "assault", title: str = "",
     cfg, b = tr["cfg"], tr["building"]
     W, H = (1080, 1920) if vertical else (T.WIDTH, T.HEIGHT)
     surf = pygame.Surface((W, H))
-    lo, size = frame(tr)
+    lo, size = frame(tr, margin=1.5 if vertical else 3.5)   # Shorts: a bigger house on the phone (ep10 review)
     if vertical:   # tag's Shorts lessons (ep8): the bottom ~500 px belong to YouTube's overlay, and the right edge to
         # its buttons; clock and result go in the header (ep9 4e), so the band under the house is free for captions
         rect, x, y = pygame.Rect(20, 330, W - 40, 980), 60, dict(title=110, names=205, step=48, showing=None,
@@ -341,14 +368,14 @@ def render_played(tr: dict, out: str, *, eyes: str = "assault", title: str = "",
                 vw.write(surf)
                 continue
             now = int(min(i, tr["steps"]))
-            lines = [f"{NAMES[w]} flashbangs: {int(tr['hist'].bangs[now][w])} of {cfg.flashbangs[w]}"
-                     for w in (cqb.ASSAULT, cqb.DEFENSE) if cfg.flashbangs[w]]
+            game, h_ = tr["game"], tr["hist"]
+            lines = [f"{NAMES[s]} flashbangs: {sum(int(h_.bangs[now][w]) for w in game.side_ops(s))} of "
+                     f"{cfg.flashbangs[s] * len(game.side_ops(s))}" for s in (cqb.ASSAULT, cqb.DEFENSE) if cfg.flashbangs[s]]
             if cfg.health:
-                lines += [f"{NAMES[w]} health: {int(round(float(tr['hist'].hp[now][w])))}" for w in (cqb.ASSAULT, cqb.DEFENSE)]
+                lines += [f"{op_name(game, w)} health: {int(round(float(h_.hp[now][w])))}" for w in range(game.N)]
             if cfg.magazine:
-                for w in (cqb.ASSAULT, cqb.DEFENSE):
-                    h_ = tr["hist"]
-                    lines.append(f"{NAMES[w]} ammo: {int(h_.mag[now][w])} | {int(h_.reserve[now][w])}"
+                for w in range(game.N):
+                    lines.append(f"{op_name(game, w)} ammo: {int(h_.mag[now][w])} | {int(h_.reserve[now][w])}"
                                  + ("  reloading" if h_.reload_timer[now][w] > 0 else ""))
             for n, line in enumerate(lines):
                 T.text(surf, line, (x, y["lines"] + 40 * n), kind="regular", size=26, color=T.MUTED)
@@ -559,7 +586,7 @@ def render_brain(tr: dict, params: dict, who: int, out: str, *, eyes: str = "all
                 T.text(surf, f"{NAMES[w]}: {labels[w] if labels else label(spec)}",
                        (72, yy), kind="semibold", size=24, anchor="midleft")
             k = int(min(i, tr["steps"]))
-            sees = bool(tr["hist"].seen[k][who])
+            sees = bool(tr["hist"].seen[k][who].any())
             T.text(surf, f"{max(cfg.time_limit - i * cfg.dt, 0):4.1f} s left", (40, 820), kind="mono-bold", size=36)
             T.text(surf, f"can it see the {('attacker', 'defender')[1 - who]}? " + ("YES" if sees else "no"), (40, 875),
                    kind="semibold", size=30, color=T.RED if sees else T.MUTED)
@@ -578,9 +605,10 @@ BAR_COLORS = {"assault": V.ASSAULT, "defense": V.DEFENSE, "muted": T.MUTED, "amb
 
 
 def render_bars(bars: list[dict], out: str, *, heading: str = "", footnote: str = "", per: float = 0.9,
-                hold: float = 2.5, preset: str = "medium", top: float = 1.0) -> None:
+                hold: float = 2.5, preset: str = "medium", top: float = 1.0, number: bool = False) -> None:
     """Numbers as horizontal bars that grow one after another (e.g. Assault's win rate as each rule is added).
-    bars: [{label, value 0..1, color: assault|defense|muted|amber, note}]; `top`: the value a full bar stands for."""
+    bars: [{label, value 0..1, color: assault|defense|muted|amber, note}]; `top`: the value a full bar stands for;
+    `number`: print values as plain numbers (crashes a round: 7.3), not percentages."""
     W, H = T.WIDTH, T.HEIGHT
     n = len(bars)
     y0 = 300 if heading else 200
@@ -607,7 +635,7 @@ def render_bars(bars: list[dict], out: str, *, heading: str = "", footnote: str 
                     pygame.draw.rect(surf, BAR_COLORS.get(b.get("color", "assault"), V.ASSAULT),
                                      (x0, y + 18, w, row - 56), border_radius=12)
                 if grow > 0:
-                    T.text(surf, f"{b['value'] * grow:.0%}", (x0 + w + 24, y + row // 2 - 10), kind="bold", size=48,
+                    T.text(surf, f"{b['value'] * grow:.2g}" if number else f"{b['value'] * grow:.0%}", (x0 + w + 24, y + row // 2 - 10), kind="bold", size=48,
                            anchor="midleft", alpha=int(255 * grow))
                     if b.get("note"):
                         T.text(surf, b["note"], (x0 + w + 150, y + row // 2 - 10), kind="regular", size=30,
