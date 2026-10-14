@@ -47,13 +47,14 @@ def _game_cfg(ck: dict) -> cqb.CQBConfig:
     return cqb.CQBConfig(**{k: tuple(v) if isinstance(v, list) else v for k, v in ck["cqb"].items()})
 
 
-def _matchup(game: cqb.CQBGame, me: int, template: dict, opponent: str, n: int, seed: int, stacked: bool = False):
+def _matchup(game: cqb.CQBGame, me: int, template: dict, opponent: str, n: int, seed: int, stacked: bool = False,
+             sample_words: bool = False):
     """A compiled function (params) -> results of one best-guess round per building 0..n-1 against `opponent`."""
     other = S.SCRIPTS.get(opponent) or A.opponent_player(opponent, 1 - me)
 
     @jax.jit
     def play(params):
-        mine = A.brain(params, me)
+        mine = A.brain(params, me, sample_words=sample_words)
         a, d = (mine, other) if me == cqb.ASSAULT else (other, mine)
         last, first, _ = S.rounds(game, a, d, jnp.arange(n), seed, stacked=stacked)
         return {"outcome": last.outcome, "alive": last.alive, "bangs": last.bangs}
@@ -66,7 +67,7 @@ def _summary(r: dict, me: int, flashbangs: int, game: cqb.CQBGame | None = None)
     o, alive = np.asarray(r["outcome"]), np.asarray(r["alive"])
     won = o == (1 if me == cqb.ASSAULT else -1)
     n_a, mine = (game.nA, game.side_ops(me)) if game is not None else (1, [me])
-    a_out, d_out = ~alive[:, :n_a].any(1), ~alive[:, n_a:].any(1)
+    a_out, d_out = game.sides_out(alive) if game is not None else (~alive[:, :n_a].any(1), ~alive[:, n_a:].any(1))
     return {"won": float(won.mean()), "trades": float((a_out & d_out).mean()),
             "timeouts": float((~a_out & ~d_out).mean()),
             "flashbangs_used": float((flashbangs * len(mine) - np.asarray(r["bangs"])[:, mine].sum(1)).mean())

@@ -11,6 +11,8 @@ Between decisions (10 a second) positions and facings are smoothed for the 60 fp
 light is cast again at each smoothed pose. What each side knows changes only at decisions.
 """
 
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -162,8 +164,9 @@ def draw_round(surf: pygame.Surface, view: V.View, tr: dict, i: float, eyes: str
     mine = _team(tr, eyes)
     color = lambda w: COLORS[int(game.team[w])]           # noqa: E731
     polys = {}
+    pilot = 0 if game.pilot_on else None                   # (ep11) the drone pilot: no weapon light, its own marker
     for w in everyone:
-        if h.alive[st_i][w]:
+        if h.alive[st_i][w] and w != pilot:
             reach = np.asarray(cast(jnp.asarray(pos[w]), jnp.asarray(face[w]), jnp.asarray(doors)))
             polys[w] = V.light_polygon(view, pos[w], face[w], angles, reach)
     if mine:
@@ -189,7 +192,9 @@ def draw_round(surf: pygame.Surface, view: V.View, tr: dict, i: float, eyes: str
             since = min(int(h.since[st_i][m, w]) for m in mine)
             if not visible and since < game.T and not h.known_down[st_i][mine[0], w]:   # a ghost: last seen there
                 V.draw_operator(surf, view, h.mem[st_i][mine[0], w], 0.0, color(w), alpha=70)
-        if visible:
+        if visible and w == pilot:
+            V.draw_pilot(surf, view, pos[w], color(w))
+        elif visible:
             V.draw_operator(surf, view, pos[w], face[w], color(w), down=not h.alive[st_i][w])
             ops = game.side_ops(int(game.team[w]))
             if len(ops) > 1:                                  # which one of its side: "1", "2"
@@ -198,6 +203,8 @@ def draw_round(surf: pygame.Surface, view: V.View, tr: dict, i: float, eyes: str
                        kind="semibold", size=max(14, int(0.5 * view.k)), color=color(w), anchor="midleft")
         if h.flash[st_i][w] > 0 and (visible or eyes == "all"):
             V.draw_flash(surf, view, pos[w], face[w], strength=h.flash[st_i][w] / 2)
+    if pilot is not None or any(cfg.radio) or game.feed_ops or game.intel_ops:
+        _draw_radio(view, surf, tr, i, st_i, pos, face)
     for m in mine:                                            # what each of the shown side hears
         if not h.alive[st_i][m] or h.seen[st_i][m].any():
             continue
@@ -209,7 +216,7 @@ def draw_round(surf: pygame.Surface, view: V.View, tr: dict, i: float, eyes: str
         _draw_flashbangs(surf, view, tr, i, st_i, pos, eyes)
     if cfg.health:                                            # health bars (for whoever's shown)
         for w in everyone:
-            if h.alive[st_i][w] and _shown(tr, st_i, eyes, w):
+            if h.alive[st_i][w] and _shown(tr, st_i, eyes, w) and w != pilot:   # (the pilot doesn't fight)
                 V.draw_health(surf, view, pos[w], float(h.hp[st_i][w]) / cfg.health)
     if cfg.magazine:                                          # who's reloading (if they're shown)
         steps = cfg.reload_time / cfg.dt
@@ -217,6 +224,46 @@ def draw_round(surf: pygame.Surface, view: V.View, tr: dict, i: float, eyes: str
             left = h.reload_timer[st_i][w]
             if left > 0 and h.alive[st_i][w] and _shown(tr, st_i, eyes, w):
                 V.draw_reloading(surf, view, pos[w], 1 - left / steps)
+
+
+CALL_TURN = {1: 0.0, 2: np.pi / 2, 3: -np.pi / 2, 4: np.pi}   # protocol word -> turn from the entry operator's facing
+CALL_SHOW = 1.0                                                  # seconds a call's bubble stays up
+
+
+def _draw_radio(view, surf, tr, i, st_i, pos, face) -> None:
+    """(ep11 10zo) The pilot game: the drone feed's lock on each standing defender (when the pilot's on the feed), and
+    the last call the entry operator heard: its word in a bubble, and (with a protocol) an arrow the way it points,
+    as the operator faced when it heard it. Muted: nothing arrives, so no bubble."""
+    cfg, h, game = tr["cfg"], tr["hist"], tr["game"]
+    fed = [w for w in sorted(set(game.feed_ops) | set(game.intel_ops)) if h.alive[st_i][w]]
+    if fed:                                                   # anyone on the (perfect) feed: show the lock
+        for j in game.side_ops(cqb.DEFENSE):
+            if h.alive[st_i][j]:
+                V.draw_feed_ring(surf, view, pos[j], (i * cfg.dt / 1.2) % 1.0)
+    if not any(cfg.radio):
+        return
+    if not game.pilot_on:                                     # a pair's own words: a bubble at whoever said it
+        for w in game.side_ops(cqb.ASSAULT):
+            d = st_i
+            while d > 0 and not (h.said_age[d][w] == 0 and h.sent[d][w] > 0):
+                d -= 1
+            age = (i - d) * cfg.dt
+            if h.alive[st_i][w] and h.said_age[d][w] == 0 and h.sent[d][w] > 0 and age <= CALL_SHOW:
+                V.draw_call(surf, view, pos[w], WORDS[int(h.sent[d][w])], None, 1.0 - age / CALL_SHOW)
+        return
+    entry = 1
+    if not h.alive[st_i][entry]:
+        return
+    d = st_i
+    while d > 0 and not (h.said_age[d][0] == 0 and h.sent[d][0] > 0):   # the last call sent, at or before now
+        d -= 1
+    w = int(h.sent[d][0])
+    age = (i - d) * cfg.dt
+    if not (h.said_age[d][0] == 0 and w > 0) or age > CALL_SHOW:
+        return
+    turn = CALL_TURN.get(w) if cfg.callout else None
+    direction = None if turn is None else float(h.face[d][entry]) + turn
+    V.draw_call(surf, view, pos[entry], WORDS[w], direction, 1.0 - age / CALL_SHOW)
 
 
 def _draw_flashbangs(surf, view, tr, i, st_i, pos, eyes) -> None:
@@ -290,6 +337,8 @@ def _sounds(tr: dict, timeline: list, events: list) -> None:
     """The round's sounds at the moments they happen on screen (replays included): shots, doors, reloads,
     flashbangs, hits. Shots are thinned to one per shooter every 0.12 s so blind fire stays listenable."""
     h, last_shot = tr["hist"], [-1.0] * tr["game"].N
+    radio = tr["game"].pilot_on and any(tr["cfg"].radio)
+    voiced = (0, -10.0)                                       # (word, time) last spoken aloud
     prev = None
     for f, (i, _) in enumerate(timeline):
         k, t = int(i), f / T.FPS
@@ -308,15 +357,45 @@ def _sounds(tr: dict, timeline: list, events: list) -> None:
                     events.append((t, "flashbang", 0.9))
                 if (h.alive[d - 1][w] and not h.alive[d][w]) or h.hp[d][w] < h.hp[d - 1][w]:
                     events.append((t, "hit", 0.7))
+            if radio and h.said_age[d][0] == 0 and h.sent[d][0] > 0:   # a call reached the entry operator
+                word = int(h.sent[d][0])
+                if word != voiced[0] or t - voiced[1] >= 2.0:    # say it aloud when it changes, else every 2 s
+                    events.append((t, f"radio_{WORDS[word].lower()}", 0.9))
+                    voiced = (word, t)
         prev = k
+
+
+WORDS = ["", "ALPHA", "BRAVO", "CHARLIE", "DELTA"]
+MEANING_WAY = {1: "your way: ahead", 2: "your way: left", 3: "your way: right", 4: "your way: behind"}
+MEANING_BEARING = {1: "he's ahead of you", 2: "he's to your left", 3: "he's to your right", 4: "he's behind you"}
+
+
+def _radio_line(tr: dict, now: int):
+    """(ep11 10zm) With a drone pilot on the radio: the call the entry operator last heard, what it means under the
+    protocol (callout), how fresh it is (dimmer when old); "RADIO MUTED" when muted. -> (text, colour) or None."""
+    cfg, game, h = tr["cfg"], tr["game"], tr["hist"]
+    if not any(cfg.radio):
+        return None
+    if cfg.radio_test == "mute":
+        return "radio: MUTED", T.RED
+    if not game.pilot_on:                                     # a pair: each one's last word, while fresh
+        said = [f"{k + 1}: {WORDS[int(h.sent[now][w])]}" for k, w in enumerate(game.side_ops(cqb.ASSAULT))
+                if h.sent[now][w] > 0 and h.said_age[now][w] * cfg.dt <= cfg.radio_memory]
+        return ("radio  " + "   ".join(said), T.AMBER) if said else ("radio: (silent)", T.MUTED)
+    w, age = int(h.sent[now][0]), int(h.said_age[now][0])
+    if w <= 0 or age * cfg.dt > cfg.radio_memory:
+        return "pilot: (silent)", T.MUTED
+    meaning = (MEANING_WAY if cfg.callout_way else MEANING_BEARING).get(w, "") if cfg.callout else ""
+    return f"pilot: {WORDS[w]}" + (f"  ({meaning})" if meaning else ""), T.AMBER if age <= 5 else T.MUTED
 
 
 def render_played(tr: dict, out: str, *, eyes: str = "assault", title: str = "", slow: float = 1.0, hold: float = 2.0,
                   preset: str = "medium", vertical: bool = False, labels: tuple | None = None,
-                  min_seconds: float = 0.0, events: list | None = None) -> dict:
+                  min_seconds: float = 0.0, events: list | None = None, panel: bool = True) -> dict:
     """Draw a round already played (rollout or played) as a landscape video (vertical: 9:16 for Shorts, the house
     on top and the words under it). labels: what to call (Assault, Defense) on screen (default: run names).
-    min_seconds: the shot's length at least; a short round fills it with a slow-motion replay of its end."""
+    min_seconds: the shot's length at least; a short round fills it with a slow-motion replay of its end.
+    panel: False (ep11, for side_by_side): only the house, and the replay label inside it (no text panel to crop)."""
     assault, defense = tr["assault"], tr["defense"]
     cfg, b = tr["cfg"], tr["building"]
     W, H = (1080, 1920) if vertical else (T.WIDTH, T.HEIGHT)
@@ -339,6 +418,15 @@ def render_played(tr: dict, out: str, *, eyes: str = "assault", title: str = "",
         for i, replaying in timeline:
             surf.fill(T.BG)
             draw_round(surf, view, tr, i, eyes=eyes, cast=cast, bang=bang)
+            if not panel:
+                if replaying:
+                    T.text(surf, "REPLAY · SLOW MOTION", (rect.x + 30, rect.y + 20), kind="display", size=46,
+                           color=T.AMBER)
+                elif slow >= 2 and i < tr["steps"]:
+                    T.text(surf, f"{slow:g}x SPEED", (rect.x + 30, rect.y + 20), kind="display", size=40,
+                           color=T.MUTED)
+                vw.write(surf)
+                continue
             if title:
                 T.text(surf, title, (x, y["title"]), kind="display", size=56 if vertical else 50)
             for n, (w, spec) in enumerate(((cqb.ASSAULT, assault), (cqb.DEFENSE, defense))):
@@ -377,6 +465,10 @@ def render_played(tr: dict, out: str, *, eyes: str = "assault", title: str = "",
                 for w in range(game.N):
                     lines.append(f"{op_name(game, w)} ammo: {int(h_.mag[now][w])} | {int(h_.reserve[now][w])}"
                                  + ("  reloading" if h_.reload_timer[now][w] > 0 else ""))
+            radio = _radio_line(tr, now)
+            if radio:   # (ep11 10zm) what the pilot is calling, and what the call means
+                T.text(surf, radio[0], (x, y["lines"]), kind="semibold", size=30, color=radio[1])
+                lines = [""] + lines
             for n, line in enumerate(lines):
                 T.text(surf, line, (x, y["lines"] + 40 * n), kind="regular", size=26, color=T.MUTED)
             if i >= tr["steps"]:
@@ -386,11 +478,59 @@ def render_played(tr: dict, out: str, *, eyes: str = "assault", title: str = "",
     return tr
 
 
+def side_by_side(halves: list, out: str, heading: str = "", preset: str = "medium", labels=None, results=None) -> None:
+    """(ep11) Two landscape round clips side by side in one 16:9 frame. Each is cropped to its house (the text panel
+    off: on a phone two full frames side by side leave each house tiny), with its label above (labels: two strings)
+    and its result under it from the moment its round ends (results: two (text, colour, seconds) or None); a heading
+    on top; the shorter clip holds its last frame. Video only (compose adds the sound)."""
+    import subprocess
+    import tempfile
+    durs = [float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(h)],
+                                 capture_output=True, text=True).stdout) for h in halves]
+    m, W, H = max(durs), T.WIDTH, T.HEIGHT
+    x0, cw = 560, 1320                        # render_played's landscape house area: x 560-1880
+    hw = (W - 60) // 2                        # each half's width on screen
+    hh = int(H * hw / cw) // 2 * 2
+    top = 190 if heading else 120
+    with tempfile.TemporaryDirectory() as td:
+        bg = Path(td) / "bg.png"
+        surf = pygame.Surface((W, H))
+        surf.fill(T.BG)
+        if heading:
+            T.text(surf, heading, (W // 2, 40), kind="display", size=50, anchor="midtop")
+        for k, lab in enumerate(labels or []):
+            T.text(surf, lab, (20 + k * (hw + 20) + hw // 2, top - 12), kind="display", size=40, anchor="midbottom")
+        pygame.image.save(surf, str(bg))
+        inputs, chain, last = ["-loop", "1", "-framerate", str(T.FPS), "-i", str(bg)], [], "0:v"
+        for k, h in enumerate(halves):
+            inputs += ["-i", str(h)]
+            chain.append(f"[{k + 1}:v]tpad=stop_mode=clone:stop_duration={m},crop={cw}:{H}:{x0}:0,scale={hw}:{hh}[h{k}]")
+            chain.append(f"[{last}][h{k}]overlay={20 + k * (hw + 20)}:{top}[o{k}]")
+            last = f"o{k}"
+        for k, res in enumerate(results or []):
+            if not res:
+                continue
+            text, color, at = res
+            img = pygame.Surface((hw, 70), pygame.SRCALPHA)
+            T.text(img, text, (hw // 2, 35), kind="display", size=44, color=color, anchor="center")
+            png = Path(td) / f"res{k}.png"
+            pygame.image.save(img, str(png))
+            idx = sum(1 for a in inputs if a == "-i")
+            inputs += ["-loop", "1", "-framerate", str(T.FPS), "-i", str(png)]
+            chain.append(f"[{last}][{idx}:v]overlay={20 + k * (hw + 20)}:{top + hh + 10}:enable='gte(t,{at:.2f})'[r{k}]")
+            last = f"r{k}"
+        chain.append(f"[{last}]trim=duration={m},setpts=PTS-STARTPTS[v]")
+        subprocess.run(["ffmpeg", "-v", "error", "-y", *inputs, "-filter_complex", ";".join(chain), "-map", "[v]",
+                        "-an", "-c:v", "libx264", "-preset", preset, "-crf", "18", "-pix_fmt", "yuv420p",
+                        "-r", str(T.FPS), str(out)], check=True)
+
+
 def render_houses(out: str, *, first: int = 0, cols: int = 3, rows: int = 2, seconds: float = 6.0, per: float = 0.8,
-                  heading: str = "", footnote: str = "", preset: str = "medium") -> None:
+                  heading: str = "", footnote: str = "", preset: str = "medium", house: str = "") -> None:
     """A gallery of generated kill houses, cycling: a new set every `per` seconds (seeds from `first`; the
-    practice houses are 0-999, the test houses 100000 on)."""
-    cfg = cqb.CQBConfig()
+    practice houses are 0-999, the test houses 100000 on). house: a preset (cqb.HOUSES; ep11: "big")."""
+    from dataclasses import replace
+    cfg = replace(cqb.CQBConfig(), **cqb.HOUSES[house])
     W, H = T.WIDTH, T.HEIGHT
     top, bottom = (130 if heading else 30), (60 if footnote else 20)
     cw, ch = (W - 40) // cols, (H - top - bottom) // rows

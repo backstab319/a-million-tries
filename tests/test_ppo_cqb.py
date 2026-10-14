@@ -279,3 +279,87 @@ def test_memory_learns_at_its_own_rate(tmp_path):
     train(CQBPPOConfig(**small, mem_lr=1.0), tmp_path / "free")
     c = torch.load(tmp_path / "free" / "checkpoints" / "u00002.pt", weights_only=False)["model"]
     assert not torch.equal(a["memory.weight"], c["memory.weight"])
+
+
+def test_vf_warmup_holds_the_policy(tmp_path):
+    """ep11 10u: for the first vf_warmup updates only the value head learns; every other weight (and the move noise)
+    is exactly as it started; after that the policy learns too."""
+    import torch
+    small = dict(n_envs=32, n_steps=16, minibatch=256, hidden=32, buildings=8)
+    run = tmp_path / "warm"
+    train(CQBPPOConfig(**small, total_steps=3 * 32 * 16, vf_warmup=2), run)
+    ck = [torch.load(run / "checkpoints" / f"u{u:05d}.pt", weights_only=False)["model"] for u in (0, 1, 2, 3)]
+    for k in ck[0]:
+        if k.startswith("value."):
+            assert not torch.equal(ck[0][k], ck[2][k]), k                  # the value head learned
+        else:
+            assert torch.equal(ck[0][k], ck[1][k]) and torch.equal(ck[0][k], ck[2][k]), k   # held
+    assert not torch.equal(ck[2]["policy.weight"], ck[3]["policy.weight"])  # then the policy moves
+
+
+def test_transplant_moves_each_part_of_the_observation():
+    """ep11 10x: a 1v1 brain (route + feed at the end) moved into a 2v1 game with a radio (team numbers, rifle, stun
+    and radio before route + feed): its first layer computes exactly what it did on the numbers it knew, wherever
+    they now sit; the new parts read zero weights."""
+    from dataclasses import replace
+    from ailearns.agents import ppo_cqb as A
+    from ailearns.games import cqb
+    one = replace(CQBConfig(), flashbangs=(2, 0), magazine=30, health=100.0, react=0.3, route=True, feed=1,
+                  **cqb.HOUSES["big"])
+    two = replace(one, team_sizes=(2, 1), bump=15.0, ready=0.3, stun=0.5, share_sight=False, split_entry=True,
+                  radio=(4, 0))
+    p = init_params(jax.random.key(0), one.obs_size, 32, -0.5)
+    q = A.transplant(p, one, two)
+    assert q["body.0.weight"].shape == (32, two.obs_size)
+    obs2 = jax.random.normal(jax.random.key(1), (16, two.obs_size))
+    blocks2 = dict(); at = 0
+    for name, n in A.obs_blocks(two):
+        blocks2[name] = obs2[:, at:at + n]; at += n
+    obs1 = jnp.concatenate([blocks2[name] for name, _ in A.obs_blocks(one)], 1)   # the same numbers in 1v1's order
+    np.testing.assert_allclose(np.asarray(obs2 @ q["body.0.weight"].T), np.asarray(obs1 @ p["body.0.weight"].T),
+                               rtol=1e-5, atol=1e-5)
+    at = 0
+    for name, n in A.obs_blocks(two):
+        if name in ("teams", "ready", "stun", "radio"):
+            assert not np.asarray(q["body.0.weight"][:, at:at + n]).any(), name
+        at += n
+    for c in (one, two, CQBConfig(), replace(two, radio=(0, 0), feed=0)):                 # the parts add up
+        assert sum(n for _, n in A.obs_blocks(c)) == c.obs_size
+
+
+def test_transplant_equals_widen_when_new_parts_come_last():
+    """ep11 10zb: every earlier init_from only added parts at the end (e.g. a 1v1 brain into 2v1); there the transplant
+    gives exactly what widening did, so those runs start the same."""
+    from dataclasses import replace
+    from ailearns.agents import ppo_cqb as A
+    one = replace(CQBConfig(), flashbangs=(2, 0), magazine=30, health=100.0, react=0.3)
+    two = replace(one, team_sizes=(2, 1), bump=15.0, ready=0.3, stun=0.5, radio=(4, 0))
+    p = init_params(jax.random.key(0), one.obs_size, 32, -0.5)
+    a = A.transplant(p, one, two)["body.0.weight"]
+    b = A.widen(p, two.obs_size, A.switches_for(two, 0))["body.0.weight"]
+    assert np.array_equal(np.asarray(a), np.asarray(b))
+
+
+def test_asymmetric_critic(tmp_path):
+    """ep11 10zh critic_priv: a separate value network reads the observation plus where the enemy really is; it
+    learns in a tiny run, its value moves when only the privileged numbers change, and the brain's play (moves and
+    switches) never depends on them."""
+    import torch
+    from dataclasses import replace
+    from ailearns.agents import ppo_cqb as A
+    from ailearns.games import cqb
+    small = dict(n_envs=32, n_steps=16, minibatch=256, hidden=32, buildings=8)
+    run = tmp_path / "crit"
+    train(CQBPPOConfig(**small, total_steps=2 * 32 * 16, critic_priv=True), run)
+    ck = [torch.load(run / "checkpoints" / f"u{u:05d}.pt", weights_only=False)["model"] for u in (0, 2)]
+    assert "critic.0.weight" in ck[0] and not torch.equal(ck[0]["critic.0.weight"], ck[1]["critic.0.weight"])
+    params, _ = A.load(run / "checkpoints" / "u00002.pt")
+    obs = jax.random.normal(jax.random.key(1), (8, CQBConfig().obs_size))
+    p1, p2 = jnp.zeros((8, A.PRIV)), jax.random.normal(jax.random.key(2), (8, A.PRIV))
+    assert not np.allclose(np.asarray(A.critic_value(params, obs, p1)), np.asarray(A.critic_value(params, obs, p2)))
+    m, l, _, _ = forward(params, obs)                                                  # play: obs only
+    assert m.shape == (8, 3) and np.isfinite(np.asarray(l)).all()
+    g = cqb.CQBGame(cqb.make_buildings(list(cqb.TEST_SEEDS)[:2], CQBConfig()), CQBConfig())
+    st = g.init(jax.random.key(0))
+    assert np.allclose(np.asarray(g.privileged(st, 0)), np.asarray(
+        cqb.CQBGame(g.b, replace(CQBConfig(), feed=1)).observe(st, 0)[-cqb.FEED_OBS:]))   # = what the feed shows

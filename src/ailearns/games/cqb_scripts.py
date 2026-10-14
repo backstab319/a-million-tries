@@ -21,6 +21,11 @@ is, unless they see or hear it. The AI gets less than this: only its 107 numbers
   throw from beside the door lands in the room, it goes in like the walker. In a team, number two follows as the
   walker and holds back while number one gets ready or its flashbang is in the air.
 
+- walker_feed, walker_flank (Assault, ep11 10o): **these cheat on purpose**: they read where the defender really is,
+  as a drone feed would show it, to measure what that knowledge is worth to a player that knows how to use it.
+  walker_feed walks the shortest way to the nearest spot with a clear line to him and faces him for the last 3 m;
+  walker_flank prefers a spot outside his light cone (from the side or behind).
+
 Moving around uses the building's waypoint graph (cqb.nav_graph): each decision a script walks
 towards the waypoint in plain view that makes its route shortest, and opens shut doors in its way.
 """
@@ -29,7 +34,7 @@ import jax
 import jax.numpy as jnp
 
 from ailearns.games import cqb
-from ailearns.games.cqb import (ACTION_SIZE, FAR, FIRE, FWD, INTERACT, RELOAD, RUN, SIDE, THROW, TURN, CQBGame, State,
+from ailearns.games.cqb import (ACTION_SIZE, FIRE, FWD, INTERACT, RELOAD, RUN, SIDE, THROW, TURN, CQBGame, State,
                                 _cast, _clear, _rot, _slab, _wrap, full_action)
 
 
@@ -109,23 +114,13 @@ def _walk(game: CQBGame, st: State, who: int, target, interact=False, look=None)
     return _act(fwd=local[0] * slow, side=local[1] * slow / game.cfg.sideways, turn=turn, interact=interact)
 
 
-def _routes(game: CQBGame, st: State, who: int):
-    """From where I stand: which waypoints I can walk straight to, and the walking distance from me
-    to every waypoint (via the visible one that makes it shortest). -> (visible (K,), dist (K,), via (K,))"""
-    b, bi = game.b, st.building
-    p = st.pos[who]
-    nodes = b.nav_nodes[bi]
-    k = game.cfg.radius - 0.05                     # a bit under my radius: pressed against a wall I'm 0.3 m from it
-    lo = jnp.concatenate([b.wall_lo[bi], b.cover_lo[bi]]) - k
-    hi = jnp.concatenate([b.wall_hi[bi], b.cover_hi[bi]]) + k
-    vis = _clear(p, nodes, lo, hi) & (nodes[:, 0] > FAR / 2)
-    first = jnp.where(vis, jnp.linalg.norm(nodes - p, axis=1), 1e5)          # (K,) me -> visible waypoint
-    total = first[:, None] + b.nav_dist[bi]                                  # (K via, K to)
-    return vis, total.min(0), total.argmin(0)
+_routes = cqb.routes   # from where I stand: waypoints in view, walking distance to each, via which (now in the game:
+                       # its `route` observation uses the same)
 
 
-def _nav(game: CQBGame, st: State, who: int, goal):
-    """Walk to waypoint `goal` along the waypoint graph, opening shut doors that are in the way."""
+def _nav(game: CQBGame, st: State, who: int, goal, look=None, look_on=None):
+    """Walk to waypoint `goal` along the waypoint graph, opening shut doors that are in the way (looking where it
+    walks, or at `look` while `look_on`)."""
     b, bi = game.b, st.building
     p = st.pos[who]
     nodes = b.nav_nodes[bi]
@@ -140,7 +135,9 @@ def _nav(game: CQBGame, st: State, who: int, goal):
     crosses = (t_in <= t_out) & (t_out >= 0) & (t_in <= 1) & b.door_valid[bi]
     reach = jnp.linalg.norm(p - jnp.clip(p, b.door_lo[bi], b.door_hi[bi]), axis=1) <= game.cfg.reach * 0.9
     opening = (crosses & ~st.door_open & (st.door_timer == 0) & reach).any()
-    return _walk(game, st, who, target, interact=opening)
+    if look is None:
+        return _walk(game, st, who, target, interact=opening)
+    return _walk(game, st, who, target, interact=opening, look=jnp.where(look_on, look, target))
 
 
 # ── The players ──────────────────────────────────────────────────────────────
@@ -296,8 +293,49 @@ def walker_flash(game: CQBGame, st: State, who: int, key=None):
     return jnp.where(st.alive[lead], follow, act)
 
 
+def _feed_goal(game: CQBGame, st: State, who: int, flank: bool):
+    """(The drone feed: these read where the defender really is.) The waypoint to come at the nearest standing
+    defender from: one with a clear line to him within 10 m, the shortest walk there; with `flank`, a spot outside
+    his light cone (plus 15 degrees) counts as 15 m shorter. None like that: the walker's goal. -> (goal, him)"""
+    b, bi, p = game.b, st.building, st.pos[who]
+    en = jnp.asarray(game.enemies[who])
+    j = en[jnp.argmin(jnp.where(st.alive[en], jnp.linalg.norm(st.pos[en] - p, axis=1), jnp.inf))]
+    him = st.pos[j]
+    nodes = b.nav_nodes[bi]
+    lo, hi = cqb._walls_cover(game, bi)
+    _, dist, _ = _routes(game, st, who)
+    off = jnp.linalg.norm(nodes - him, axis=1)
+    sees = _clear(him, nodes, lo, hi) & (nodes[:, 0] > -500) & (off < 10.0) & (dist < 1e4)
+    cost = dist + off
+    if flank:
+        v = nodes - him
+        ang = jnp.abs(_wrap(jnp.arctan2(v[:, 1], v[:, 0]) - st.face[j]))
+        cost = cost + jnp.where(ang < jnp.deg2rad(game.cfg.fov / 2 + 15), 15.0, 0.0)
+    goal = jnp.argmin(jnp.where(sees, cost, jnp.inf))
+    return jnp.where(sees.any(), goal, _goal(game, st, who)), him
+
+
+def _walker_feed(game: CQBGame, st: State, who: int, flank: bool):
+    seen = contact(game, st, who)[0]
+    goal, him = _feed_goal(game, st, who, flank)
+    close = jnp.linalg.norm(game.b.nav_nodes[st.building, goal] - st.pos[who]) < 3.0   # nearly there: face him
+    act = _nav(game, st, who, goal, look=him, look_on=close)
+    return _reloading(game, st, who, jnp.where(seen, _shoot_on_sight(game, st, who), act))
+
+
+def walker_feed(game: CQBGame, st: State, who: int, key=None):
+    """(ep11 10o; reads the defender's true position, like a drone feed) Goes the shortest way to the nearest spot
+    with a clear line to him, facing him for the last 3 m; fires on sight."""
+    return _walker_feed(game, st, who, flank=False)
+
+
+def walker_flank(game: CQBGame, st: State, who: int, key=None):
+    """(ep11 10o; the drone feed too) walker_feed, preferring a spot he isn't facing: from the side or behind."""
+    return _walker_feed(game, st, who, flank=True)
+
+
 SCRIPTS = {"dummy": dummy, "random": random, "camper": camper, "wanderer": wanderer, "walker": walker,
-           "walker_flash": walker_flash}
+           "walker_flash": walker_flash, "walker_feed": walker_feed, "walker_flank": walker_flank}
 
 
 def play_rounds(game: CQBGame, assault, defense, buildings, seed: int = 0, record: bool = False,

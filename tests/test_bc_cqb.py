@@ -81,3 +81,45 @@ def test_throw_only_moves_nothing_but_the_throw_output():
     _, logits, _, _ = A.forward(p, obs)
     throws = np.asarray(logits[:, A.SWITCHES.index("throw")] > 0)
     assert throws[:8].all() and not throws[8:].any()
+
+
+def test_moves_only_copies_the_moves_and_holds_the_switches():
+    """ep11 10r: the moves go to the script's; the switches stay where the starting brain had them (fire, doors...),
+    whatever the script did with its own switches."""
+    rules = RULES
+    n_switch = A.switches_for(rules, cqb.ASSAULT)
+    params = A.widen(A.init_params(jax.random.PRNGKey(0), rules.obs_size, 32, -0.5, 3), rules.obs_size, n_switch)
+    obs = jax.random.normal(jax.random.PRNGKey(1), (64, rules.obs_size))
+    act = jax.random.uniform(jax.random.PRNGKey(2), (64, cqb.ACTION_SIZE), minval=-0.8, maxval=0.8)
+    act = act.at[:, A.N_MOVE:].set(1.0)                      # the script: every switch on
+    keep = jax.nn.sigmoid(A.forward(params, obs)[1])
+    step = jax.jit(BC.make_step(BC.CQBBCConfig(lr=3e-2, moves_only=True), n_switch))
+    from ailearns.agents.ppo_jax import adam_init
+    p, opt = params, adam_init({k: params[k] for k in BC.TRAINED})
+    first = None
+    for _ in range(1000):
+        p, opt, (loss, moves, held, _) = step(p, opt, obs, act, keep)
+        first = float(moves) if first is None else first
+    mean, logits, _, _ = A.forward(p, obs)
+    assert float(moves) < first / 3                                                  # the moves: copied
+    assert np.abs(np.asarray(jax.nn.sigmoid(logits)) - np.asarray(keep)).max() < 0.05   # the switches: held
+
+
+def test_near_weight_counts_the_close_decisions_more():
+    """ep11 10t: with near_weight, the move loss is a weighted mean: decisions whose feed says he's within `near`
+    metres on foot count near_weight times."""
+    rules = replace(RULES, route=True, feed=1)
+    n_switch = A.switches_for(rules, cqb.ASSAULT)
+    params = A.widen(A.init_params(jax.random.PRNGKey(0), rules.obs_size, 32, -0.5, 3), rules.obs_size, n_switch)
+    obs = jax.random.normal(jax.random.PRNGKey(1), (8, rules.obs_size))
+    obs = obs.at[:, -1].set(1.0).at[:4, -2].set(0.1).at[4:, -2].set(0.9)                  # 4 close (4 m), 4 far (36 m)
+    act = jnp.zeros((8, cqb.ACTION_SIZE)).at[:, A.N_MOVE:].set(-1.0)
+    mean = A.forward(params, obs)[0]
+    err = np.asarray(jnp.mean((mean - act[:, :A.N_MOVE]) ** 2, 1))
+    keep = jax.nn.sigmoid(A.forward(params, obs)[1])
+    for wgt in (1.0, 10.0):
+        step = BC.make_step(BC.CQBBCConfig(lr=0.0, moves_only=True, near_weight=wgt), n_switch)
+        from ailearns.agents.ppo_jax import adam_init
+        _, _, (_, moves, _, _) = step(params, adam_init({k: params[k] for k in BC.TRAINED}), obs, act, keep)
+        want = (wgt * err[:4].sum() + err[4:].sum()) / (4 * wgt + 4)
+        assert np.isclose(float(moves), want, rtol=1e-4), (wgt, float(moves), want)

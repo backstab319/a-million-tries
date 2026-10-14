@@ -83,31 +83,56 @@ export class Game {
     this.gunsOn = cfg.magazine > 0; this.reloadSteps = steps(cfg.reload_time);
     this.healthOn = (cfg.health || 0) > 0; this.reactOn = (cfg.react || 0) > 0;
     this.reactSteps = Math.max(steps(cfg.react || 0), 1);
+    // episode 10: crash rules and teams (operators: Assault first, then Defense)
+    this.bumpOn = (cfg.bump || 0) > 0; this.readyOn = (cfg.ready || 0) > 0; this.stunOn = (cfg.stun || 0) > 0;
+    this.readySteps = Math.max(steps(cfg.ready || 0), 1); this.stunSteps = Math.max(steps(cfg.stun || 0), 1);
+    const [nA, nD] = cfg.team_sizes || [1, 1];
+    this.nA = nA; this.nD = nD; this.N = nA + nD; this.teamsOn = !(nA === 1 && nD === 1);
+    this.ops = [...Array(this.N).keys()];
+    this.team = this.ops.map((i) => (i < nA ? ASSAULT : DEFENSE));
+    this.enemies = this.ops.map((i) => this.ops.filter((j) => this.team[j] !== this.team[i]));
+    this.mates = this.ops.map((i) => this.ops.filter((j) => j !== i && this.team[j] === this.team[i]));
+    this.slots = Math.max(nA, nD);
   }
+
+  sideOps(side) { return side === ASSAULT ? this.ops.slice(0, this.nA) : this.ops.slice(this.nA); }
 
   // A round's start: given (check.mjs: pos, face, door_open as the Python game had them) or drawn like init().
   start(h, given = null, rand = Math.random) {
-    const cfg = this.cfg;
+    const cfg = this.cfg, N = this.N;
     if (!given) {
-      const e = Math.floor(rand() * h.entries.length);
-      const d = h.spawn[Math.floor(rand() * cfg.spawn_points)];
-      given = { pos: [h.entries[e].slice(), d.slice()], face: [h.entryFace[e], (rand() * 2 - 1) * Math.PI],
+      const e = Math.floor(rand() * h.entries.length), fa = h.entryFace[e], gap = cfg.stack_gap || 0.8;
+      const yard = [cfg.yard_w, cfg.yard_h];
+      const aPos = [...Array(this.nA).keys()].map((k) => {
+        const p = [h.entries[e][0] - Math.cos(fa) * gap * k, h.entries[e][1] - Math.sin(fa) * gap * k];
+        return this.nA > 1 ? p.map((x, ax) => clip(x, cfg.radius, yard[ax] - cfg.radius)) : p;
+      });
+      const spots = [];
+      while (spots.length < this.nD) {
+        const k = Math.floor(rand() * cfg.spawn_points);
+        if (!spots.includes(k) || this.nD === 1) spots.push(k);
+      }
+      given = { pos: [...aPos, ...spots.map((k) => h.spawn[k].slice())],
+                face: [...aPos.map(() => fa), ...spots.map(() => (rand() * 2 - 1) * Math.PI)],
                 door_open: h.doorValid.map((v, k) => v && !h.doorOutside[k] && rand() < cfg.inside_open) };
     }
     const pos = given.pos.map((p) => p.slice()), z2 = () => [0, 0];
+    const each = (f) => this.ops.map(f), pairs = (f) => this.ops.map(() => this.ops.map(f));
     const st = {
-      pos, vel: [z2(), z2()], face: given.face.slice(), turn: [0, 0], doorOpen: given.door_open.slice(),
-      doorTimer: h.doors.map(() => 0), doorEvent: [false, false], doorAt: pos.map((p) => p.slice()),
-      seen: [false, false], mem: [z2(), z2()], memVel: [z2(), z2()], since: [this.T, this.T],
-      cleared: [h.cells.map(() => false), h.cells.map(() => false)],
-      sound: [0, 1].map(() => [0, 1, 2].map(() => [0, 0, 0])), soundAge: [0, 1].map(() => [0, 1, 2].map(() => this.soundSteps)),
-      alive: [true, true], fired: [false, false], flash: [0, 0], flashSeen: [false, false],
-      bangs: cfg.flashbangs.slice(), bangPos: pos.map((p) => p.slice()), bangTimer: [0, 0], bangNow: [false, false],
-      blind: [0, 0], bangHeard: [[0, 0, 0], [0, 0, 0]], bangAge: [this.soundSteps, this.soundSteps],
-      mag: [cfg.magazine, cfg.magazine], reserve: [cfg.magazine * cfg.spare_mags, cfg.magazine * cfg.spare_mags],
-      reloadTimer: [0, 0], reloadNow: [false, false], kick: [0, 0], reloadHeard: [[0, 0, 0], [0, 0, 0]],
-      reloadAge: [this.soundSteps, this.soundSteps], hp: [cfg.health || 0, cfg.health || 0],
-      landed: [this.soundSteps, this.soundSteps], aim: [0, 0], t: 0, done: false, outcome: 0,
+      pos, vel: each(z2), face: given.face.slice(), turn: each(() => 0), doorOpen: given.door_open.slice(),
+      doorTimer: h.doors.map(() => 0), doorEvent: each(() => false), doorAt: pos.map((p) => p.slice()),
+      seen: pairs(() => false), mem: pairs(z2), memVel: pairs(z2), since: pairs(() => this.T),
+      cleared: each(() => h.cells.map(() => false)),
+      sound: each(() => [0, 1, 2].map(() => [0, 0, 0])), soundAge: each(() => [0, 1, 2].map(() => this.soundSteps)),
+      alive: each(() => true), fired: each(() => false), flash: each(() => 0), flashSeen: pairs(() => false),
+      bangs: each((i) => cfg.flashbangs[this.team[i]]), bangPos: pos.map((p) => p.slice()), bangTimer: each(() => 0),
+      bangNow: each(() => false), blind: each(() => 0), bangHeard: each(() => [0, 0, 0]), bangAge: each(() => this.soundSteps),
+      mag: each(() => cfg.magazine), reserve: each(() => cfg.magazine * cfg.spare_mags),
+      reloadTimer: each(() => 0), reloadNow: each(() => false), kick: each(() => 0), reloadHeard: each(() => [0, 0, 0]),
+      reloadAge: each(() => this.soundSteps), hp: each(() => cfg.health || 0),
+      landed: each(() => this.soundSteps), aim: pairs(() => 0), knownDown: pairs(() => false), hitBy: each(() => -1),
+      bumped: each(() => false), readyT: each(() => this.readySteps), stunT: each(() => 0),
+      t: 0, done: false, outcome: 0,
     };
     return this.look(h, st);
   }
@@ -147,9 +172,9 @@ export class Game {
     return [q, [q[0] - dy * k, q[1] + dx * k], [q[0] + dy * k, q[1] - dx * k]];
   }
 
-  sees(st, who, boxes) {
+  sees(st, who, boxes, target = 1 - who) {
     const p = st.pos[who];
-    return st.blind[who] === 0 && this.body(p, st.pos[1 - who]).some((q) => this.inCone(p, st.face[who], q) && clear(p, q, boxes));
+    return st.blind[who] === 0 && this.body(p, st.pos[target]).some((q) => this.inCone(p, st.face[who], q) && clear(p, q, boxes));
   }
 
   light(p, face, boxes) {
@@ -165,26 +190,33 @@ export class Game {
     });
   }
 
+  teamAny(x) {   // anyone on i's team (i too) has x[k][j]
+    if (!this.teamsOn) return x;
+    return this.ops.map((i) => this.ops.map((j) => this.ops.some((k) => this.team[k] === this.team[i] && x[k][j])));
+  }
+
   look(h, st) {
-    const boxes = this.boxes(h, st);
-    const seen = [0, 1].map((w) => this.sees(st, w, boxes));
-    st.mem = [0, 1].map((w) => (seen[w] ? st.pos[1 - w].slice() : st.mem[w]));
-    st.memVel = [0, 1].map((w) => (seen[w] ? st.vel[1 - w].slice() : st.memVel[w]));
-    st.since = [0, 1].map((w) => (seen[w] ? 0 : Math.min(st.since[w] + 1, this.T)));
-    st.cleared = [0, 1].map((w) => {
+    const boxes = this.boxes(h, st), T = this.T;
+    const seen = this.ops.map((i) => this.ops.map((j) => j !== i && this.sees(st, i, boxes, j)
+      && (!this.teamsOn || (st.alive[i] && st.alive[j]))));
+    const spotted = this.teamAny(seen).map((r, i) => r.map((x, j) => x && this.team[i] !== this.team[j]));
+    st.mem = st.mem.map((r, i) => r.map((m, j) => (spotted[i][j] ? st.pos[j].slice() : m)));
+    st.memVel = st.memVel.map((r, i) => r.map((m, j) => (spotted[i][j] ? st.vel[j].slice() : m)));
+    st.since = st.since.map((r, i) => r.map((x, j) => (spotted[i][j] ? 0 : Math.min(x + 1, T))));
+    st.cleared = this.ops.map((w) => {
       const look = this.lit(st.pos[w], st.face[w], h.cells, boxes);
       return st.cleared[w].map((c, k) => c || (look[k] && st.blind[w] === 0));
     });
     st.seen = seen;
-    if (this.reactOn) st.aim = [0, 1].map((w) => (seen[w] ? Math.min(st.aim[w] + 1, this.reactSteps) : Math.max(st.aim[w] - 1, 0)));
+    if (this.reactOn) st.aim = st.aim.map((r, i) => r.map((x, j) => (seen[i][j] ? Math.min(x + 1, this.reactSteps) : Math.max(x - 1, 0))));
     return st;
   }
 
   move(h, st, a) {
-    const cfg = this.cfg, r = cfg.radius;
-    const face = [0, 1].map((w) => wrap(st.face[w] + clip(a[w][TURN], -1, 1) * (cfg.turn_rate * Math.PI / 180) * cfg.dt));
+    const cfg = this.cfg, r = cfg.radius, N = this.N;
+    const face = this.ops.map((w) => wrap(st.face[w] + clip(a[w][TURN], -1, 1) * (cfg.turn_rate * Math.PI / 180) * cfg.dt));
     let pos = [], vel = [];
-    for (const w of [0, 1]) {
+    for (const w of this.ops) {
       let m = [clip(a[w][FWD], -1, 1), clip(a[w][SIDE], -1, 1)];
       const n = Math.max(norm(m[0], m[1]), 1);
       m = [m[0] / n, m[1] / n];
@@ -198,23 +230,37 @@ export class Game {
       vel.push(v);
       pos.push([st.pos[w][0] + v[0] * cfg.dt, st.pos[w][1] + v[1] * cfg.dt]);
     }
-    const gx = pos[1][0] - pos[0][0], gy = pos[1][1] - pos[0][1], dist = norm(gx, gy);
-    const over = Math.max(2 * r - dist, 0), px = (gx / Math.max(dist, 1e-6)) * over / 2, py = (gy / Math.max(dist, 1e-6)) * over / 2;
-    pos = [[pos[0][0] - px, pos[0][1] - py], [pos[1][0] + px, pos[1][1] + py]];
-    const yard = [cfg.yard_w, cfg.yard_h], boxes = this.boxes(h, st);
-    for (const w of [0, 1]) {
+    // each overlapping pair is pushed apart, half each (with teams, the fallen don't count)
+    const moves = this.ops.map(() => []);
+    for (let i = 0; i < N; i++) {
+      for (let j = i + 1; j < N; j++) {
+        const gx = pos[j][0] - pos[i][0], gy = pos[j][1] - pos[i][1], dist = norm(gx, gy);
+        let over = Math.max(2 * r - dist, 0);
+        if (this.teamsOn && !(st.alive[i] && st.alive[j])) over = 0;
+        const px = (gx / Math.max(dist, 1e-6)) * over / 2, py = (gy / Math.max(dist, 1e-6)) * over / 2;
+        moves[i].push([-px, -py]); moves[j].push([px, py]);
+      }
+    }
+    pos = pos.map((p, w) => {
+      const d = moves[w].slice(1).reduce((s, m) => [s[0] + m[0], s[1] + m[1]], moves[w][0]);
+      return [p[0] + d[0], p[1] + d[1]];
+    });
+    const yard = [cfg.yard_w, cfg.yard_h], boxes = this.boxes(h, st), impact = [];
+    for (const w of this.ops) {
       const c = [0, 1].map((ax) => clip(pos[w][ax], r, yard[ax] - r));
       vel[w] = vel[w].map((v, ax) => (c[ax] !== pos[w][ax] ? 0 : v));
+      const before = vel[w];
       [pos[w], vel[w]] = pushOut(c, vel[w], boxes, r);
+      impact.push(norm(before[0] - vel[w][0], before[1] - vel[w][1]));   // the speed walls took away
     }
-    return [pos, vel, face];
+    return [pos, vel, face, impact];
   }
 
   doors(h, st, a, pos) {
     const cfg = this.cfg, D = h.doors.length;
     const gap = (p, b) => norm(p[0] - clip(p[0], b[0], b[2]), p[1] - clip(p[1], b[1], b[3]));
-    const near = [0, 0], start = [false, false], hitAny = new Array(D).fill(false);
-    for (const w of [0, 1]) {
+    const near = this.ops.map(() => 0), start = this.ops.map(() => false), hitAny = new Array(D).fill(false);
+    for (const w of this.ops) {
       let best = Infinity, k = 0;
       h.doors.forEach((b, d) => { const g = h.doorValid[d] ? gap(pos[w], b) : Infinity; if (g < best) { best = g; k = d; } });
       near[w] = k;
@@ -224,28 +270,50 @@ export class Game {
     const timer = h.doors.map((_, d) => Math.max((hitAny[d] ? this.doorSteps : st.doorTimer[d]) - 1, 0));
     const open = h.doors.map((b, d) => {
       const finishing = st.doorTimer[d] === 1 || (hitAny[d] && this.doorSteps === 1);
-      const blocked = pos.some((p) => gap(p, b) < cfg.radius);
+      const blocked = pos.some((p, w) => gap(p, b) < cfg.radius && (!this.teamsOn || st.alive[w]));
       return st.doorOpen[d] !== (finishing && !(st.doorOpen[d] && blocked));
     });
     const at = near.map((k) => [(h.doors[k][0] + h.doors[k][2]) / 2, (h.doors[k][1] + h.doors[k][3]) / 2]);
     return [open, timer, start, at];
   }
 
-  hitChance(st, who, boxes) {
-    const cfg = this.cfg, o = 1 - who;
-    const dx = st.pos[o][0] - st.pos[who][0], dy = st.pos[o][1] - st.pos[who][1], dist = norm(dx, dy);
+  onAim(st, who, j) {
+    const dx = st.pos[j][0] - st.pos[who][0], dy = st.pos[j][1] - st.pos[who][1];
+    return dx * Math.cos(st.face[who]) + dy * Math.sin(st.face[who]) >= this.cosAim * norm(dx, dy);
+  }
+
+  hitChance(st, who, boxes, j = 1 - who) {
+    const cfg = this.cfg;
+    const dx = st.pos[j][0] - st.pos[who][0], dy = st.pos[j][1] - st.pos[who][1], dist = norm(dx, dy);
     const onAim = dx * Math.cos(st.face[who]) + dy * Math.sin(st.face[who]) >= this.cosAim * dist;
     let p = clip(cfg.hit_close - cfg.hit_falloff * dist, 0.05, 1.0);
     p *= 1 - cfg.move_penalty * Math.min(norm(...st.vel[who]) / cfg.walk, 1.0);
     p *= 1 - cfg.turn_penalty * Math.abs(st.turn[who]);
     if (this.healthOn) p *= st.hp[who] < cfg.wounded_below ? cfg.wounded_aim : 1;
-    if (this.reactOn) p *= st.aim[who] / this.reactSteps;
-    return onAim && this.sees(st, who, boxes) ? p : 0;
+    if (this.reactOn) p *= st.aim[who][j] / this.reactSteps;
+    if (this.readyOn) p *= st.readyT[who] / this.readySteps;
+    return onAim && this.sees(st, who, boxes, j) ? p : 0;
+  }
+
+  targets(st, boxes) {   // games/cqb.py targets: the first body on each shooter's aim line, teammates included
+    if (!this.teamsOn) return [[1, 0], [0, 1].map((w) => this.hitChance(st, w, boxes))];
+    const tgt = [], chance = [];
+    for (const i of this.ops) {
+      const others = this.ops.filter((j) => j !== i);
+      let k = -1, best = Infinity;
+      others.forEach((j, n) => {
+        const d = norm(st.pos[j][0] - st.pos[i][0], st.pos[j][1] - st.pos[i][1]);
+        if (this.onAim(st, i, j) && st.seen[i][j] && d < best) { best = d; k = n; }
+      });
+      tgt.push(others[Math.max(k, 0)]);
+      chance.push(k >= 0 ? this.hitChance(st, i, boxes, others[k]) : 0);
+    }
+    return [tgt, chance];
   }
 
   reload(st, a) {
     const cfg = this.cfg;
-    for (const w of [0, 1]) {
+    for (const w of this.ops) {
       const timer = Math.max(st.reloadTimer[w] - 1, 0);
       if (st.reloadTimer[w] === 1) {
         const take = Math.min(cfg.magazine - st.mag[w], st.reserve[w]);
@@ -261,25 +329,35 @@ export class Game {
   }
 
   shoot(h, st, a, dice, where) {
-    const cfg = this.cfg, boxes = this.boxes(h, st);
-    const fire = [0, 1].map((w) => a[w][FIRE] > 0 && a[w][RUN] <= 0 && st.alive[w] && !st.done
-                                   && (!this.gunsOn || (st.mag[w] > 0 && st.reloadTimer[w] === 0)));
-    const p = [0, 1].map((w) => this.hitChance(st, w, boxes) * (this.gunsOn ? 1 - cfg.recoil * st.kick[w] : 1));
-    const hits = [0, 1].map((w) => fire[w] && dice[w] < p[w]);   // hits[w]: w hit the other one
+    const cfg = this.cfg, boxes = this.boxes(h, st), ops = this.ops;
+    const fire = ops.map((w) => a[w][FIRE] > 0 && a[w][RUN] <= 0 && st.alive[w] && !st.done
+                               && (!this.gunsOn || (st.mag[w] > 0 && st.reloadTimer[w] === 0)));
+    const [tgt, chance] = this.targets(st, boxes);
+    const p = ops.map((w) => chance[w] * (this.gunsOn ? 1 - cfg.recoil * st.kick[w] : 1));
+    const hits = ops.map((w) => fire[w] && dice[w] < p[w]);          // hits[w]: w hit its target
+    const H = ops.map((i) => ops.map((j) => hits[i] && tgt[i] === j)); // [shooter][hit]
     let alive;
     if (this.healthOn) {
       const dmg = where.map((u) => (u < cfg.head_share ? cfg.head_damage : u < cfg.head_share + cfg.torso_share ? cfg.torso_damage : cfg.limb_damage));
-      const hp = [0, 1].map((w) => st.hp[w] - (hits[1 - w] ? dmg[1 - w] : 0));
-      alive = [0, 1].map((w) => st.alive[w] && hp[w] > 0);
+      const hp = ops.map((j) => st.hp[j] - ops.reduce((s, i) => s + (H[i][j] ? dmg[i] : 0), 0));
+      alive = ops.map((w) => st.alive[w] && hp[w] > 0);
       st.hp = hp.map((x) => Math.max(x, 0));
-      st.landed = [0, 1].map((w) => (hits[w] ? 0 : Math.min(st.landed[w] + 1, this.soundSteps)));
+      st.landed = ops.map((w) => (hits[w] ? 0 : Math.min(st.landed[w] + 1, this.soundSteps)));
     } else {
-      alive = [0, 1].map((w) => st.alive[w] && !hits[1 - w]);
+      alive = ops.map((w) => st.alive[w] && !ops.some((i) => H[i][w]));
     }
-    const flash = [0, 1].map((w) => (fire[w] ? this.flashSteps : Math.max(st.flash[w] - 1, 0)));
-    const seesFlash = [0, 1].map((w) => flash[1 - w] > 0 && clear(st.pos[w], st.pos[1 - w], boxes) && st.blind[w] === 0);
-    st.mem = [0, 1].map((w) => (seesFlash[w] ? st.pos[1 - w].slice() : st.mem[w]));
-    st.since = [0, 1].map((w) => (seesFlash[w] ? 0 : st.since[w]));
+    const flash = ops.map((w) => (fire[w] ? this.flashSteps : Math.max(st.flash[w] - 1, 0)));
+    const seesFlash = ops.map((w) => ops.map((j) => this.enemies[w].includes(j) && flash[j] > 0
+      && clear(st.pos[w], st.pos[j], boxes) && st.blind[w] === 0 && (!this.teamsOn || st.alive[w])));
+    const spotted = this.teamAny(seesFlash);
+    st.mem = st.mem.map((r, i) => r.map((m, j) => (spotted[i][j] ? st.pos[j].slice() : m)));
+    st.since = st.since.map((r, i) => r.map((x, j) => (spotted[i][j] ? 0 : x)));
+    if (this.teamsOn) {   // who's down, as each team knows it: it fell in sight of the team, or to its shot
+      const seenT = this.teamAny(st.seen), hitT = this.teamAny(H);
+      st.knownDown = st.knownDown.map((r, i) => r.map((x, j) => x || ((seenT[i][j] || hitT[i][j])
+        && st.alive[j] && !alive[j] && this.team[i] !== this.team[j])));
+    }
+    st.hitBy = ops.map((j) => { const i = ops.findIndex((k) => H[k][j]); return i >= 0 ? i : st.hitBy[j]; });
     Object.assign(st, { alive, fired: fire, flash, flashSeen: seesFlash, hits });
     if (this.gunsOn) {
       st.mag = st.mag.map((m, w) => m - (fire[w] ? 1 : 0));
@@ -305,29 +383,38 @@ export class Game {
     return [Math.cos(ang), Math.sin(ang), loud];
   }
 
+  static loudest(xs) {  // several enemies' sounds of one kind: the loudest (the first on a tie)
+    return xs.reduce((b, x) => (x[2] > b[2] ? x : b), xs[0]);
+  }
+
   hear(h, st) {
     const cfg = this.cfg, walls = this.wallsOnly(h, st);
-    const made = [0, 1].map((w) => {
+    const made = this.ops.map((w) => {
       const speed = norm(...st.vel[w]);
-      const steps = speed > cfg.walk + 0.1 ? cfg.hear_run : speed > cfg.still ? cfg.hear_walk : 0;
+      let steps = speed > cfg.walk + 0.1 ? cfg.hear_run : speed > cfg.still ? cfg.hear_walk : 0;
+      if (this.bumpOn && st.bumped[w]) steps = Math.max(steps, cfg.bump);
       return [steps, st.doorEvent[w] ? cfg.hear_door : 0, st.fired[w] ? cfg.hear_shot : 0].map((x) => x * (st.alive[w] ? 1 : 0));
     });
-    for (const w of [0, 1]) {
-      const me = st.pos[w], o = 1 - w;
-      const d0 = st.doorAt[o], dd = Math.max(norm(me[0] - d0[0], me[1] - d0[1]), 1e-6);
-      const door = [d0[0] + ((me[0] - d0[0]) / dd) * cfg.wall, d0[1] + ((me[1] - d0[1]) / dd) * cfg.wall];
-      [st.pos[o], door, st.pos[o]].forEach((src, kind) => {
-        const nu = this.heard(me, src, made[o][kind], walls);
+    for (const w of this.ops) {
+      const me = st.pos[w];
+      const per = this.enemies[w].map((o) => {
+        const d0 = st.doorAt[o], dd = Math.max(norm(me[0] - d0[0], me[1] - d0[1]), 1e-6);
+        const door = [d0[0] + ((me[0] - d0[0]) / dd) * cfg.wall, d0[1] + ((me[1] - d0[1]) / dd) * cfg.wall];
+        return [st.pos[o], door, st.pos[o]].map((src, kind) => this.heard(me, src, made[o][kind], walls));
+      });
+      for (const kind of [0, 1, 2]) {
+        const nu = Game.loudest(per.map((x) => x[kind]));
         const age = Math.min(st.soundAge[w][kind] + 1, this.soundSteps);
         const old = age < this.soundSteps ? st.sound[w][kind] : [0, 0, 0];
         const take = nu[2] > 0 && nu[2] >= old[2];
         st.sound[w][kind] = take ? nu : old;
         st.soundAge[w][kind] = take ? 0 : age;
-      });
+      }
     }
     if (!this.bangsOn) return st;
-    const nb = [0, 1].map((w) => this.heard(st.pos[w], st.bangPos[1 - w], st.bangNow[1 - w] ? cfg.hear_bang : 0, walls));
-    for (const w of [0, 1]) {
+    const nb = this.ops.map((w) => Game.loudest(this.enemies[w].map((o) =>
+      this.heard(st.pos[w], st.bangPos[o], st.bangNow[o] ? cfg.hear_bang : 0, walls))));
+    for (const w of this.ops) {
       const age = Math.min(st.bangAge[w] + 1, this.soundSteps), old = age < this.soundSteps ? st.bangHeard[w] : [0, 0, 0];
       st.bangHeard[w] = nb[w][2] > 0 ? nb[w] : old;
       st.bangAge[w] = nb[w][2] > 0 ? 0 : age;
@@ -337,8 +424,9 @@ export class Game {
 
   hearReload(h, st) {
     const walls = this.wallsOnly(h, st);
-    const nr = [0, 1].map((w) => this.heard(st.pos[w], st.pos[1 - w], st.reloadNow[1 - w] && st.alive[1 - w] ? this.cfg.hear_reload : 0, walls));
-    for (const w of [0, 1]) {
+    const nr = this.ops.map((w) => Game.loudest(this.enemies[w].map((o) =>
+      this.heard(st.pos[w], st.pos[o], st.reloadNow[o] && st.alive[o] ? this.cfg.hear_reload : 0, walls))));
+    for (const w of this.ops) {
       const age = Math.min(st.reloadAge[w] + 1, this.soundSteps), old = age < this.soundSteps ? st.reloadHeard[w] : [0, 0, 0];
       st.reloadHeard[w] = nr[w][2] > 0 ? nr[w] : old;
       st.reloadAge[w] = nr[w][2] > 0 ? 0 : age;
@@ -350,7 +438,7 @@ export class Game {
     const cfg = this.cfg, walls = this.wallsOnly(h, st);
     const timer = st.bangTimer.map((x) => Math.max(x - 1, 0)), now = st.bangTimer.map((x) => x === 1);
     let blind = st.blind.map((x) => Math.max(x - 1, 0));
-    for (const src of [0, 1]) {
+    for (const src of this.ops) {
       const q = st.bangPos[src];
       blind = blind.map((b, w) => {
         const d = norm(st.pos[w][0] - q[0], st.pos[w][1] - q[1]);
@@ -358,7 +446,7 @@ export class Game {
         return now[src] && d <= cfg.bang_range && clear(q, st.pos[w], walls) && st.alive[w] ? Math.max(b, steps) : b;
       });
     }
-    for (const w of [0, 1]) {
+    for (const w of this.ops) {
       const thrown = a[w][THROW] > 0 && st.bangs[w] > 0 && timer[w] === 0 && st.alive[w] && !st.done;
       if (thrown) {
         const ahead = [Math.cos(st.face[w]), Math.sin(st.face[w])];
@@ -372,21 +460,30 @@ export class Game {
     return st;
   }
 
-  // One decision. actions: [assault, defense], 8 numbers each (see FWD..RELOAD). dice: two uniforms for the hits
-  // (check.mjs passes the Python game's; the browser rolls them), where: two more for where hits land (health on).
-  step(h, st, actions, dice = [Math.random(), Math.random()], where = [Math.random(), Math.random()]) {
+  // One decision. actions: one per operator (Assault first), 8 numbers each (see FWD..RELOAD). dice: a uniform per
+  // operator for its hit (check.mjs passes the Python game's; the browser rolls them), where: one more each for where a
+  // hit lands (health on).
+  step(h, st, actions, dice = null, where = null) {
     if (st.done) return st;
-    const a = actions.map((x) => [...x, ...Array(8 - x.length).fill(-1)]);
+    const cfg = this.cfg, ops = this.ops;
+    dice = dice || ops.map(() => Math.random()); where = where || ops.map(() => Math.random());
+    let a = actions.map((x) => [...x, ...Array(8 - x.length).fill(-1)]);
+    if (this.stunOn) a = a.map((x, w) => (st.stunT[w] > 0 ? [0, 0, 0, -1, -1, -1, -1, -1] : x));   // stunned: nothing
     const prev = st;
     st = structuredClone(st);
-    let [pos, vel, face] = this.move(h, prev, a);
+    let [pos, vel, face, impact] = this.move(h, prev, a);
     pos = pos.map((p, w) => (prev.alive[w] ? p : prev.pos[w].slice()));
     vel = vel.map((v, w) => (prev.alive[w] ? v : [0, 0]));
+    const hard = ops.map((w) => impact[w] > cfg.walk + 0.1 && prev.alive[w]);   // harder than walking into a wall
     const live = a.map((x, w) => x.map((v) => v * (prev.alive[w] ? 1 : 0)));
     const [open, timer, event, at] = this.doors(h, prev, live, pos);
     Object.assign(st, { pos, vel, face: face.map((f, w) => (prev.alive[w] ? f : prev.face[w])),
       turn: a.map((x, w) => clip(x[TURN], -1, 1) * (prev.alive[w] ? 1 : 0)), doorOpen: open, doorTimer: timer,
-      doorEvent: event, doorAt: at.map((p, w) => (event[w] ? p : prev.doorAt[w])), t: prev.t + 1 });
+      doorEvent: event, doorAt: at.map((p, w) => (event[w] ? p : prev.doorAt[w])), t: prev.t + 1,
+      bumped: this.bumpOn ? hard : prev.bumped });
+    if (this.stunOn) st.stunT = ops.map((w) => (hard[w] ? this.stunSteps : Math.max(prev.stunT[w] - 1, 0)));
+    if (this.readyOn) st.readyT = ops.map((w) => ((a[w][RUN] > 0 && norm(...vel[w]) > cfg.walk + 0.1) || hard[w]
+      ? 0 : Math.min(prev.readyT[w] + 1, this.readySteps)));
     if (this.bangsOn) st = this.flashbangs(h, st, a);
     st = this.look(h, st);
     if (this.gunsOn) st = this.reload(st, a);
@@ -396,23 +493,42 @@ export class Game {
     const f = Math.fround;
     st.pos = st.pos.map((p) => p.map(f)); st.vel = st.vel.map((v) => v.map(f)); st.face = st.face.map(f);
     st.kick = st.kick.map(f); st.hp = st.hp.map(f);
-    const aDown = !st.alive[ASSAULT], dDown = !st.alive[DEFENSE], timeout = st.t >= this.T && !aDown && !dDown;
+    const aDown = !st.alive.slice(0, this.nA).some((x) => x), dDown = !st.alive.slice(this.nA).some((x) => x);
+    const timeout = st.t >= this.T && !aDown && !dDown;
     st.outcome = dDown && !aDown ? 1 : aDown && !dDown ? -1 : timeout ? -1 : 0;
     st.done = aDown || dDown || timeout;
     return st;
   }
 
+  // games/cqb.py enemy_order: me's enemies, nearest known first; the ones its team knows are down last.
+  enemyOrder(st, me) {
+    const p = st.pos[me];
+    return this.enemies[me].map((j, n) => {
+      const dm = norm(st.mem[me][j][0] - p[0], st.mem[me][j][1] - p[1]);
+      let key = st.seen[me][j] ? norm(st.pos[j][0] - p[0], st.pos[j][1] - p[1]) : st.since[me][j] < this.T ? 1e3 + dm : 1e6;
+      key += (st.knownDown[me][j] ? 1e7 : 0) + n * 1e-3;
+      return [key, j];
+    }).sort((x, y) => x[0] - y[0]).map((x) => x[1]);
+  }
+
+  enemyObs(st, me, j, own, p) {
+    const cfg = this.cfg, sub = (a, b) => [a[0] - b[0], a[1] - b[1]], sc = (v, k) => [v[0] * k, v[1] * k];
+    const seen = st.seen[me][j], never = st.since[me][j] >= this.T, rel = sub(st.pos[j], p), dn = Math.max(norm(...rel), 1e-6);
+    return [seen ? 1 : 0, ...(seen ? sc(own(rel), 1 / cfg.sight) : [0, 0]), ...(seen ? sc(own(st.vel[j]), 1 / cfg.run) : [0, 0]),
+            ...(never ? [0, 0] : sc(own(sub(st.mem[me][j], p)), 1 / cfg.sight)), Math.min(st.since[me][j] / this.T, 1),
+            ...(st.flashSeen[me][j] ? own(sc(rel, 1 / dn)) : [0, 0])];
+  }
+
   // What operator `who` knows (games/cqb.py observe): about -1..1, in its own frame. Nothing it can't see or hear.
   observe(h, st, who) {
-    const cfg = this.cfg, me = who, o = 1 - who, p = st.pos[me], face = st.face[me];
+    const cfg = this.cfg, me = who, p = st.pos[me], face = st.face[me];
     const own = (v) => rot(v, -face), sub = (a, b) => [a[0] - b[0], a[1] - b[1]], sc = (v, k) => [v[0] * k, v[1] * k];
     const boxes = this.boxes(h, st), obs = [];
     const lasers = this.cast(p, this.rayDirs.map((d) => rot(d, face)), boxes);
     obs.push(...lasers.map((x) => x / cfg.sight));
-    const seen = st.seen[me], never = st.since[me] >= this.T, rel = sub(st.pos[o], p), dn = Math.max(norm(...rel), 1e-6);
-    obs.push(seen ? 1 : 0, ...(seen ? sc(own(rel), 1 / cfg.sight) : [0, 0]), ...(seen ? sc(own(st.vel[o]), 1 / cfg.run) : [0, 0]),
-             ...(never ? [0, 0] : sc(own(sub(st.mem[me], p)), 1 / cfg.sight)), Math.min(st.since[me] / this.T, 1),
-             ...(st.flashSeen[me] ? own(sc(rel, 1 / dn)) : [0, 0]));
+    const order = this.teamsOn ? this.enemyOrder(st, me) : [1 - who];
+    const blank = (j) => this.teamsOn && st.knownDown[me][j];
+    obs.push(...(blank(order[0]) ? Array(10).fill(0) : this.enemyObs(st, me, order[0], own, p)));
     for (const s of st.sound[me]) obs.push(...(s[2] > 0 ? own([s[0], s[1]]) : [0, 0]), s[2]);
     const flo = h.footLo, fhi = h.footHi;
     obs.push(Math.sin(face), Math.cos(face), ...sc(own(st.vel[me]), 1 / cfg.run),
@@ -428,7 +544,7 @@ export class Game {
     obs.push(...st.cleared[me].map((c) => (c ? 1 : 0)), 1 - st.t / this.T);
     if (this.bangsOn) {
       const live = st.bangTimer[me] > 0, hb = st.bangHeard[me];
-      obs.push(st.bangs[me] / Math.max(cfg.flashbangs[me], 1), st.blind[me] / this.blindSteps,
+      obs.push(st.bangs[me] / Math.max(cfg.flashbangs[this.team[me]], 1), st.blind[me] / this.blindSteps,
                ...(live ? sc(own(sub(st.bangPos[me], p)), 1 / cfg.sight) : [0, 0]), st.bangTimer[me] / this.fuseSteps,
                ...(hb[2] > 0 ? own([hb[0], hb[1]]) : [0, 0]), hb[2]);
     }
@@ -438,7 +554,24 @@ export class Game {
                st.reloadTimer[me] / this.reloadSteps, st.kick[me], ...(rh[2] > 0 ? own([rh[0], rh[1]]) : [0, 0]), rh[2]);
     }
     if (this.healthOn) obs.push(st.hp[me] / cfg.health, st.landed[me] < this.soundSteps ? 1 : 0);
-    if (this.reactOn) obs.push(st.aim[me] / this.reactSteps);
+    if (this.reactOn) obs.push(st.aim[me][order[0]] / this.reactSteps);
+    if (this.teamsOn) {   // the other enemies, my teammates, which one of my team I am
+      const extra = this.slots - 1;
+      for (let k = 1; k <= extra; k++) {
+        const j = order[k];
+        obs.push(...(j === undefined || blank(j) ? Array(10).fill(0) : this.enemyObs(st, me, j, own, p)));
+      }
+      for (let k = 0; k < extra; k++) {
+        const j = this.mates[me][k];
+        if (j === undefined) { obs.push(0, 0, 0, 0, 0, 0); continue; }
+        const rel = st.face[j] - face;
+        obs.push(...sc(own(sub(st.pos[j], p)), 1 / cfg.sight), Math.sin(rel), Math.cos(rel),
+                 this.healthOn ? st.hp[j] / cfg.health : st.alive[j] ? 1 : 0, st.alive[j] ? 1 : 0);
+      }
+      obs.push(this.sideOps(this.team[me]).indexOf(me) / extra);
+    }
+    if (this.readyOn) obs.push(st.readyT[me] / this.readySteps);
+    if (this.stunOn) obs.push(st.stunT[me] / this.stunSteps);
     return obs;
   }
 

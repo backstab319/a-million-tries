@@ -54,6 +54,14 @@ class CQBBCConfig:
     throw_only: bool = False     # copy only the throw decision: train just the throw output's row, so the brain's
                                  # moving, shooting and doors stay exactly as they were (bc1 showed that copying the
                                  # script's walking wrecks it: ep9 3bb)
+    moves_only: bool = False     # (ep11 10r) copy only the script's moves (forward, sideways, turn: aiming and walking are
+                                 # one thing in the body's frame); the on/off switches are held to what the starting
+                                 # brain did on the same decisions (fire, doors, reloads stay its own)
+    near_weight: float = 1.0     # (ep11 10t, with feed) decisions with him this close on foot (the feed's walking
+    near: float = 6.0            # distance, metres) count near_weight times in the move loss: the aiming moments are few
+    house: str = ""              # the game's settings, as in CQBPPOConfig (ep11)
+    route: bool = False
+    feed: int = 0
     buildings: int = 1024
     seed: int = 0
     method: str = "bc"
@@ -114,15 +122,24 @@ def demonstrations(cfg: CQBBCConfig, game: CQBGame, me: int, chunk: int = 512) -
             "throws_per_won_round": n_throws / max(n_won, 1), "won_by_opponent": per_opp}
 
 
-def make_step(cfg: CQBBCConfig, n_switch: int):
+def make_step(cfg: CQBBCConfig, n_switch: int, sight: float = 20.0):
     """One minibatch of behaviour cloning: (params, opt, obs, act) -> (params, opt, losses). throw_only: the loss is
     the throw decision's alone, and only the throw output's row and bias move (everything else is held fixed)."""
     throw = A.SWITCHES.index("throw")
     row = A.N_MOVE + throw
 
-    def loss_fn(trained, rest, obs, act):
+    def loss_fn(trained, rest, obs, act, keep=None):
         mean, logits, _, _ = A.forward({**rest, **trained}, obs)
-        moves = jnp.mean((mean - act[:, :A.N_MOVE]) ** 2)
+        if cfg.near_weight != 1.0:   # the feed's last two numbers: walking distance / (2 x sight), on the feed
+            close = (obs[:, -1] > 0) & (obs[:, -2] * 2 * sight < cfg.near)
+            w = jnp.where(close, cfg.near_weight, 1.0)
+            moves = jnp.sum(jnp.mean((mean - act[:, :A.N_MOVE]) ** 2, 1) * w) / jnp.sum(w)
+        else:
+            moves = jnp.mean((mean - act[:, :A.N_MOVE]) ** 2)
+        if cfg.moves_only:   # the switches: towards the starting brain's own choices (as probabilities)
+            bce = -(keep * jax.nn.log_sigmoid(logits) + (1 - keep) * jax.nn.log_sigmoid(-logits))
+            held = jnp.mean(bce + keep * jnp.log(jnp.clip(keep, 1e-6)) + (1 - keep) * jnp.log(jnp.clip(1 - keep, 1e-6)))
+            return moves + held, (moves, held, jnp.asarray(0.0))
         target = (act[:, A.N_MOVE:A.N_MOVE + n_switch] > 0).astype(jnp.float32)
         bce = -(target * jax.nn.log_sigmoid(logits) + (1 - target) * jax.nn.log_sigmoid(-logits))
         w = jnp.ones_like(bce).at[:, throw].set(jnp.where(target[:, throw] > 0, cfg.throw_weight, 1.0))
@@ -134,10 +151,10 @@ def make_step(cfg: CQBBCConfig, n_switch: int):
         throw_recall = jnp.sum(agree[:, throw] * target[:, throw]) / jnp.maximum(target[:, throw].sum(), 1)
         return moves + switches, (moves, switches, throw_recall)
 
-    def step(params, opt, obs, act):
+    def step(params, opt, obs, act, keep=None):
         trained = {n: params[n] for n in TRAINED}
         rest = {k: v for k, v in params.items() if k not in TRAINED}
-        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(trained, rest, obs, act)
+        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(trained, rest, obs, act, keep)
         if cfg.throw_only:   # nothing but the throw output's row moves
             keep = {n: jnp.zeros_like(g) for n, g in grads.items()}
             keep["policy.weight"] = keep["policy.weight"].at[row].set(grads["policy.weight"][row])
@@ -153,8 +170,9 @@ def train(cfg: CQBBCConfig, run_dir: str | Path, max_hours: float | None = None,
     import torch
     from ailearns.agents import tracking
     from ailearns.checkpoints import pick_checkpoint
+    game_cfg = replace(game_cfg, **cqb.HOUSES[cfg.house])
     game_cfg = replace(game_cfg, time_cost=cfg.time_cost, flashbangs=tuple(cfg.flashbangs), magazine=cfg.magazine,
-                       health=cfg.health, react=cfg.react)
+                       health=cfg.health, react=cfg.react, route=cfg.route, feed=cfg.feed)
     run_dir = Path(run_dir)
     (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
     if resume:   # (cheap enough to do again from the start after a preemption)
@@ -190,10 +208,12 @@ def train(cfg: CQBBCConfig, run_dir: str | Path, max_hours: float | None = None,
 
     save(0, {})
     opt = adam_init({n: params[n] for n in TRAINED})
-    step = jax.jit(make_step(cfg, n_switch))
+    step = jax.jit(make_step(cfg, n_switch, game_cfg.sight))
     obs = jnp.asarray(d["obs"][:, :n_in])
     act = jnp.asarray(d["act"])
     N = obs.shape[0]
+    start = dict(params)                      # moves_only: the starting brain's switch choices on every decision
+    keep = jnp.concatenate([jax.nn.sigmoid(A.forward(start, obs[i:i + 65536])[1]) for i in range(0, N, 65536)])
     log = open(run_dir / "metrics.jsonl", "a")
     tracker = tracking.start(run_dir, json.loads((run_dir / "config.json").read_text()))
     rng = np.random.default_rng(cfg.seed)
@@ -203,7 +223,7 @@ def train(cfg: CQBBCConfig, run_dir: str | Path, max_hours: float | None = None,
         n_b = 0
         for i in range(0, N - cfg.batch + 1, cfg.batch):
             idx = jnp.asarray(order[i:i + cfg.batch])
-            params, opt, out = step(params, opt, obs[idx], act[idx])
+            params, opt, out = step(params, opt, obs[idx], act[idx], keep[idx])
             sums += np.asarray(jax.device_get(jnp.stack(out)))
             n_b += 1
         loss, moves, switches, recall = sums / max(n_b, 1)

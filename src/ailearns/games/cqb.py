@@ -27,10 +27,10 @@ import numpy as np
 
 ASSAULT, DEFENSE = 0, 1
 FAR = -1000.0  # where unused (or open) boxes are parked
-# an action is 8 numbers per operator: forward/back, sideways (left +), turn (left +), and five
-# on/off choices (on when > 0). Older players give 6 or 7: a missing THROW or RELOAD reads as off
-FWD, SIDE, TURN, FIRE, INTERACT, RUN, THROW, RELOAD = range(8)
-ACTION_SIZE = 8
+# an action is 9 numbers per operator: forward/back, sideways (left +), turn (left +), five on/off choices (on when
+# > 0), and a word said on the radio (0 = silence, 1..K; ep11). Older players give 6-8: the rest read as off / silent
+FWD, SIDE, TURN, FIRE, INTERACT, RUN, THROW, RELOAD, SAY = range(9)
+ACTION_SIZE = 9
 BANG_OBS = 8  # extra observation numbers when the game has flashbangs (see CQBGame.observe)
 GUN_OBS = 7   # and when it has magazines
 HEALTH_OBS = 2  # and when it has health
@@ -39,10 +39,27 @@ ENEMY_OBS = 10  # numbers about one enemy (with teams: one slot per enemy, neare
 MATE_OBS = 6    # numbers about one teammate
 READY_OBS = 1   # and, last, how far my rifle is up (with `ready`)
 STUN_OBS = 1    # and, after it, how long I'm still stunned (with `stun`)
+ROUTE_OBS = 4   # and, after the radio, the way to the enemy I know of (with `route`)
+FEED_OBS = 8    # and, last, the drone feed (with `feed`, for the operators on it)
+# and, after that, the radio (with `radio`): the last word heard (one-hot) and how fresh it is, the same for my own
+
+
+# Building presets (CQBConfig settings; "" = the houses every run so far used). "big" (ep11 10j): 8-12 rooms instead of
+# 3-6, about 2.6x the floor (20-26 x 12-19 m), more cover, the same 45 s clock: searching costs. The "seen" map keeps
+# its 8 x 6 cells (bigger cells), so every brain reads the same numbers.
+HOUSES = {
+    "": {},
+    "big": dict(rooms=(8, 12), width=(20.0, 34.0), depth=(12.0, 26.0), yard_w=48.0, yard_h=38.0, cover=(2, 8),
+                max_walls=32, max_doors=16, max_cover=8, max_rooms=12),
+}
+
+def radio_obs(words: int) -> int:
+    return 2 * (words + 1)
 
 
 def full_action(a):
-    """Pad actions (..., 6 or 7) from players that predate flashbangs or reloading to (..., 8), the rest off."""
+    """Pad actions (..., 6-8) from players that predate flashbangs, reloading or the radio to (..., 9), the rest off
+    (a missing word reads as -1: silence)."""
     if a.shape[-1] == ACTION_SIZE:
         return a
     return jnp.concatenate([a, -jnp.ones(a.shape[:-1] + (ACTION_SIZE - a.shape[-1],), a.dtype)], -1)
@@ -141,6 +158,39 @@ class CQBConfig:
     # (1, 1) = the game before ep10, exactly. Assault pairs start stacked at one door, `stack_gap` apart
     team_sizes: tuple = (1, 1)
     stack_gap: float = 0.8
+    relay: float = 0.0            # (ep11, with share_sight False) fresh callouts only: a teammate's sighting reaches
+                                  # you while it's at most this many seconds old, then you're back to your own memory
+                                  # (nothing stale lingers). 0 = off. Changes only what brains see, not the game
+    intel: int = 0                # (ep11 radio try #4, the ceiling for a drone) the first this-many Assault operators
+                                  # always know where each defender is right now, as if just seen (a perfect drone
+                                  # feed). 0 = off. Changes only what brains see, not the game
+    feed: int = 0                 # (ep11 10m) like `intel`, but as its own numbers (a screen of its own, read from
+                                  # zero weights) instead of written into the brain's memory of him: where the nearest
+                                  # defender is, which way he faces, the way there (as `route`). The first this-many
+                                  # Assault operators read it; everyone else reads zeros. Only what brains see
+    pilot: bool = False           # (ep11 10z, with teams) Assault operator 1 is the drone pilot: stays where it starts
+                                  # (outside, in cover), can't move, turn, fire, open doors or throw, only talk; nobody
+                                  # sees or hits it; Assault is out when its other operators are. Off: the game before
+    callout: bool = False         # (ep11 10zc, with pilot and a radio) the pilot speaks a fixed protocol instead of its
+                                  # own words, from the feed: word 1 "Alpha" = he's ahead of the entry operator (within
+                                  # 45° of where it faces), 2 "Bravo" = to its left, 3 "Charlie" = to its right, 4
+                                  # "Delta" = behind it; silent while nobody's standing. A drilled callout, not learned
+    callout_way: bool = False     # (ep11 10ze, with callout) call the way, not the bearing: the same four words for the
+                                  # direction of the next step of the shortest walk to him (as `route` / the feed's
+                                  # "way there"), as the entry operator faces
+    route: bool = False           # (ep11 10d) the floor plan: each operator also reads the way to the enemy it knows of
+                                  # (seen, remembered, or on the feed): the direction to the next waypoint of the
+                                  # shortest walk there, and how far that is on foot. Only what brains see
+    split_entry: bool = False     # (ep11) Assault operators start at different outside doors (a simultaneous entry),
+                                  # not stacked at one (a house with one entry: stacked anyway)
+    share_sight: bool = True      # (ep11) a team shares where anyone on it saw each enemy, and who it saw go down (an
+                                  # automatic callout). False: each operator knows only its own sightings and hits
+    # the radio (ep11): words with no meaning given ("Alpha".."Delta" in the videos); teammates hear them, the enemy
+    # doesn't (headsets)
+    radio: tuple = (0, 0)         # words per side (Assault, Defense); (0, 0) = no radio: the game before, exactly
+    word_time: float = 0.5        # seconds a word takes: no new word until it's said
+    radio_memory: float = 3.0     # seconds over which a word (heard or said) fades from the observation
+    radio_test: str = ""          # for measuring only: "mute" (teammates hear nothing) or "scramble" (a random word)
     # habits (ep10 step 9, owner OK): sprinting into walls was free and silent; real operators keep off walls and slow
     # down to shoot. Both off by default (the game before, exactly)
     bump: float = 0.0             # metres a collision is heard: hitting a wall, door or crate faster than walking
@@ -163,7 +213,9 @@ class CQBConfig:
         base = self.n_rays + 10 + 9 + 7 + 8 + self.seen_grid[0] * self.seen_grid[1] + 1
         return (base + (BANG_OBS if any(self.flashbangs) else 0) + (GUN_OBS if self.magazine else 0)
                 + (HEALTH_OBS if self.health else 0) + (REACT_OBS if self.react else 0) + self.team_obs
-                + (READY_OBS if self.ready else 0) + (STUN_OBS if self.stun else 0))
+                + (READY_OBS if self.ready else 0) + (STUN_OBS if self.stun else 0)
+                + (radio_obs(max(self.radio)) if any(self.radio) else 0) + (ROUTE_OBS if self.route else 0)
+                + (FEED_OBS if self.feed else 0))
 
     @property
     def team_obs(self) -> int:
@@ -665,6 +717,25 @@ def _clear(p, q, lo, hi):
     return ~((t_in <= t_out) & (t_out >= 0) & (t_in <= 1)).any(-1)
 
 
+def _walls_cover(game, bi):
+    """Walls and cover, widened by a bit under an operator's radius (pressed against a wall it's 0.3 m from it)."""
+    b, k = game.b, game.cfg.radius - 0.05
+    return (jnp.concatenate([b.wall_lo[bi], b.cover_lo[bi]]) - k, jnp.concatenate([b.wall_hi[bi], b.cover_hi[bi]]) + k)
+
+
+def routes(game, st, who: int):
+    """From where `who` stands: which waypoints (nav_graph) it can walk straight to, and the walking distance to every
+    waypoint (via the visible one that makes it shortest). -> (visible (K,), dist (K,), via (K,))"""
+    b, bi = game.b, st.building
+    p = st.pos[who]
+    nodes = b.nav_nodes[bi]
+    lo, hi = _walls_cover(game, bi)
+    vis = _clear(p, nodes, lo, hi) & (nodes[:, 0] > FAR / 2)
+    first = jnp.where(vis, jnp.linalg.norm(nodes - p, axis=1), 1e5)          # (K,) me -> visible waypoint
+    total = first[:, None] + b.nav_dist[bi]                                  # (K via, K to)
+    return vis, total.min(0), total.argmin(0)
+
+
 def _cast(p, d, lo, hi, cfg):
     """Distance from p along each direction d (R, 2) to the first box or the yard's edge, capped at sight."""
     yard = jnp.array([cfg.yard_w, cfg.yard_h])
@@ -701,7 +772,7 @@ class State(NamedTuple):
     door_event: jax.Array  # (N,) did this operator start moving a door this decision (a sound)
     door_at: jax.Array    # (N, 2) the middle of the door it started moving (where that sound comes from)
     seen: jax.Array       # (N, N) does i see j right now (j alive, i not blinded)
-    mem: jax.Array        # (N, N, 2) where i's team last saw enemy j
+    mem: jax.Array        # (N, N, 2) where i's team last saw enemy j (without share_sight: i itself)
     mem_vel: jax.Array    # (N, N, 2) and how it was moving then
     since: jax.Array      # (N, N) decisions since then (T = never)
     cleared: jax.Array    # (N, cells) the "seen" map: which cells of the building each has looked at
@@ -734,6 +805,9 @@ class State(NamedTuple):
     bumped: jax.Array     # (N,) ran into a wall, door or crate this decision (with `bump`: a sound)
     ready_t: jax.Array    # (N,) decisions since this operator last ran or bumped, up to ready_steps (with `ready`)
     stun_t: jax.Array     # (N,) decisions of stun left (with `stun`)
+    said: jax.Array       # (N,) the last word this operator said (0: none yet; with `radio`)
+    sent: jax.Array       # (N,) the word its teammates heard (the same, unless `radio_test`)
+    said_age: jax.Array   # (N,) decisions since (T: never)
     key: jax.Array        # randomness for hits (in the state, so a recorded round replays exactly)
     t: jax.Array          # decisions taken
     done: jax.Array
@@ -767,6 +841,9 @@ class CQBGame:
         self.ready_steps = max(int(round(cfg.ready / cfg.dt)), 1)
         self.stun_on = cfg.stun > 0
         self.stun_steps = max(int(round(cfg.stun / cfg.dt)), 1)
+        self.radio_on = any(cfg.radio)          # likewise the radio
+        self.word_steps = max(int(round(cfg.word_time / cfg.dt)), 1)
+        self.radio_fade = max(cfg.radio_memory / cfg.dt, 1.0)
         # teams (ep10): who's who, all static
         self.nA, self.nD = (int(n) for n in cfg.team_sizes)
         self.N = self.nA + self.nD
@@ -776,15 +853,37 @@ class CQBGame:
         self.mates = [[j for j in range(self.N) if self.team[j] == self.team[i] and j != i] for i in range(self.N)]
         self.is_enemy = jnp.asarray(self.team[:, None] != self.team[None, :])
         self.same_team = jnp.asarray(self.team[:, None] == self.team[None, :])
+        self.share = bool(cfg.share_sight)
+        self.relay_on = cfg.relay > 0 and not self.share and self.teams_on
+        self.relay_steps = int(round(cfg.relay / cfg.dt))
+        self.intel_ops = list(range(min(int(cfg.intel), self.nA)))         # who has the (perfect) drone feed
+        self.feed_ops = list(range(min(int(cfg.feed), self.nA)))           # who reads it as its own numbers
+        self.pilot_on = bool(cfg.pilot) and self.teams_on and self.nA >= 2   # Assault operator 0 is the drone pilot
         self.slots = max(self.nA, self.nD)                                   # enemy (and teammate + 1) slots
+        self.words = np.array([cfg.radio[s] for s in self.team])            # radio words per operator (0: none)
 
     def side_ops(self, side: int) -> list:
         """The operators on a side (ASSAULT or DEFENSE)."""
         return list(range(self.nA)) if side == ASSAULT else list(range(self.nA, self.N))
 
+    def callout_word(self, st: State):
+        """(callout) The protocol word for where the nearest standing defender is (callout_way: which way to walk to
+        him), as the entry operator (Assault's operator 2) faces: 1 ahead (within 45°), 2 left, 3 right, 4 behind; 0
+        when it's down or nobody's standing."""
+        me, en = 1, jnp.asarray(self.enemies[1])
+        up = st.alive[en]
+        j = en[jnp.argmin(jnp.where(up, jnp.linalg.norm(st.pos[en] - st.pos[me], axis=1), jnp.inf))]
+        rel = _rot(st.pos[j] - st.pos[me], -st.face[me])
+        if self.cfg.callout_way:   # the next step of the walk there, in the entry operator's frame
+            rel = self._way(st, me, st.pos[j], up.any())[:2]
+        a = jnp.degrees(jnp.arctan2(rel[1], rel[0]))
+        w = jnp.where(jnp.abs(a) <= 45, 1, jnp.where((a > 45) & (a <= 135), 2, jnp.where((a < -45) & (a >= -135), 3, 4)))
+        return jnp.where(up.any() & st.alive[me], w, 0)
+
     def sides_out(self, alive):
-        """alive (..., N) -> is Assault out, is Defense out (...): all of a side down."""
-        return ~alive[..., :self.nA].any(-1), ~alive[..., self.nA:].any(-1)
+        """alive (..., N) -> is Assault out, is Defense out (...): all of a side down (with a pilot: all of Assault's
+        fighters)."""
+        return ~alive[..., int(self.pilot_on):self.nA].any(-1), ~alive[..., self.nA:].any(-1)
 
     def init(self, key, building=None) -> State:
         """Assault outside a random outside door, facing it (a team stacked one behind the other); Defense on random
@@ -796,6 +895,13 @@ class CQBGame:
         face_a = b.entry_face[bi, e]
         back = -jnp.stack([jnp.cos(face_a), jnp.sin(face_a)]) * cfg.stack_gap
         a_pos = [b.entry[bi, e] + back * k if k else b.entry[bi, e] for k in range(self.nA)]
+        a_face = [face_a] * self.nA
+        if cfg.split_entry and self.nA > 1:                                 # each at its own door, facing it
+            for k in range(1, self.nA):
+                ek = (e + k) % b.n_entries[bi]
+                own = ek != e
+                a_pos[k] = jnp.where(own, b.entry[bi, ek], a_pos[k])
+                a_face[k] = jnp.where(own, b.entry_face[bi, ek], face_a)
         if self.nD == 1:                                                     # the draws of the game before teams
             d_pos = [b.spawn[bi, jax.random.randint(ks, (), 0, cfg.spawn_points)]]
             d_face = [jax.random.uniform(kf, (), minval=-jnp.pi, maxval=jnp.pi)]
@@ -805,7 +911,7 @@ class CQBGame:
         pos = jnp.stack(a_pos + d_pos)
         if self.nA > 1:                                                      # the stack stays in the yard
             pos = jnp.clip(pos, cfg.radius, jnp.array([cfg.yard_w, cfg.yard_h]) - cfg.radius)
-        face = jnp.stack([face_a] * self.nA + d_face)
+        face = jnp.stack(a_face + d_face)
         D = b.door_lo.shape[1]
         door_open = (jax.random.uniform(kd, (D,)) < cfg.inside_open) & ~b.door_outside[bi] & b.door_valid[bi]
         z = jnp.asarray(0)
@@ -825,7 +931,8 @@ class CQBGame:
                    reload_age=jnp.full(N, self.sound_steps, jnp.int32), hp=jnp.full(N, cfg.health),
                    landed=jnp.full(N, self.sound_steps, jnp.int32), aim=jnp.zeros((N, N), jnp.int32),
                    known_down=jnp.zeros((N, N), bool), hit_by=jnp.full(N, -1, jnp.int32), bumped=jnp.zeros(N, bool),
-                   ready_t=jnp.full(N, self.ready_steps, jnp.int32), stun_t=jnp.zeros(N, jnp.int32), key=key, t=z,
+                   ready_t=jnp.full(N, self.ready_steps, jnp.int32), stun_t=jnp.zeros(N, jnp.int32),
+                   said=n1, sent=n1, said_age=jnp.full(N, self.T, jnp.int32), key=key, t=z,
                    done=jnp.asarray(False), outcome=z)
         return self._look(st)
 
@@ -911,8 +1018,8 @@ class CQBGame:
         return self.b.cell_point[building]
 
     def _team_any(self, x):
-        """(N, N) bools -> (N, N): does anyone on i's team have it about j."""
-        return (self.same_team[:, :, None] & x[None, :, :]).any(1) if self.teams_on else x
+        """(N, N) bools -> (N, N): does anyone on i's team have it about j (without sharing: does i)."""
+        return (self.same_team[:, :, None] & x[None, :, :]).any(1) if self.teams_on and self.share else x
 
     def _sight(self, st: State, lo, hi):
         """(N, N): who sees whom (only the living see, and are seen; nobody sees themselves)."""
@@ -921,6 +1028,8 @@ class CQBGame:
             row = [self.sees(st, i, lo, hi, j) if j != i else jnp.asarray(False) for j in range(self.N)]
             rows.append(jnp.stack(row))
         seen = jnp.stack(rows)
+        if self.pilot_on:   # the pilot is outside in cover with a tablet: it sees nobody and nobody sees it
+            seen = seen.at[0, :].set(False).at[:, 0].set(False)
         return seen & st.alive[:, None] & st.alive[None, :] if self.teams_on else seen
 
     def _look(self, st: State) -> State:
@@ -1144,6 +1253,24 @@ class CQBGame:
                                                                               1e-6)), 0.0),
         ])
 
+    def _relayed(self, st: State, me: int) -> State:
+        """`relay`: me's memory of each enemy, with a teammate's sighting in its place while that sighting is fresh
+        (at most relay_steps old) and newer than mine. Only for the observation."""
+        mem, vel, since = st.mem[me], st.mem_vel[me], st.since[me]
+        for k in self.mates[me]:
+            fresh = (st.since[k] <= self.relay_steps) & (st.since[k] < since)
+            mem = jnp.where(fresh[:, None], st.mem[k], mem)
+            vel = jnp.where(fresh[:, None], st.mem_vel[k], vel)
+            since = jnp.where(fresh, st.since[k], since)
+        return st._replace(mem=st.mem.at[me].set(mem), mem_vel=st.mem_vel.at[me].set(vel), since=st.since.at[me].set(since))
+
+    def _with_intel(self, st: State, me: int) -> State:
+        """`intel`: me (on the drone feed) knows where each defender is now, as a sighting 0 decisions old (down ones
+        too: telling who's down stays the job of sight). Only for the observation."""
+        en = jnp.asarray(self.enemies[me])
+        return st._replace(mem=st.mem.at[me, en].set(st.pos[en]), mem_vel=st.mem_vel.at[me, en].set(st.vel[en]),
+                           since=st.since.at[me, en].set(0))
+
     def enemy_order(self, st: State, me: int):
         """`me`'s enemies, nearest known first: seen now (by distance), then remembered (by distance to where they were
         last seen), then never seen; those the team knows are down go last. -> (enemies,) operator numbers."""
@@ -1160,6 +1287,10 @@ class CQBGame:
         (x straight ahead, y to its left). Nothing here comes from what it can't see or hear."""
         cfg, b, bi = self.cfg, self.b, st.building
         me = who
+        if self.relay_on:
+            st = self._relayed(st, me)
+        if me in self.intel_ops:
+            st = self._with_intel(st, me)
         p, face = st.pos[me], st.face[me]
         own = lambda v: _rot(v, -face)                                          # world -> my frame
         if self.teams_on:
@@ -1228,7 +1359,98 @@ class CQBGame:
             obs.append((st.ready_t[me] / self.ready_steps)[None].astype(jnp.float32))
         if self.stun_on:    # (after it) how long I'm still stunned
             obs.append((st.stun_t[me] / self.stun_steps)[None].astype(jnp.float32))
+        if self.radio_on:   # (after that) the radio: the last word heard from a teammate, how fresh; the same for mine
+            obs.append(self._radio_obs(st, me))
+        if self.cfg.route:  # (after that) the way to the enemy I know of
+            obs.append(self._route_obs(st, me, order[0] if self.teams_on else 1 - who))
+        if self.cfg.feed:   # (last) the drone feed, its own numbers
+            obs.append(self._feed_obs(st, me))
         return jnp.concatenate(obs)
+
+    def _way(self, st: State, me: int, spot, known):
+        """The way from `me` to `spot` (a point it knows of): the direction (my frame) to the next waypoint of the
+        shortest walk there (straight at it when nothing's in between), the walking distance (/ 2 x sight, at most 1),
+        and a 1 that it knows a way. Zeros unless `known`."""
+        b, bi, p = self.b, st.building, st.pos[me]
+        nodes = b.nav_nodes[bi]
+        lo, hi = _walls_cover(self, bi)
+        vis, dist, via = routes(self, st, me)
+        last = jnp.where(_clear(spot, nodes, lo, hi) & (nodes[:, 0] > FAR / 2),
+                         jnp.linalg.norm(nodes - spot, axis=1), 1e5)       # waypoints in plain view of the spot
+        total = dist + last
+        goal = jnp.argmin(total)
+        n = via[goal]
+        n = jnp.where(jnp.linalg.norm(nodes[n] - p) < 0.25, b.nav_next[bi, n, goal], n)   # there: on to the next
+        after = b.nav_next[bi, n, goal]
+        n = jnp.where(vis[after] & (after >= 0), after, n)                 # the one after is in view: cut the corner
+        direct = _clear(p, spot[None], lo, hi)[0] | (jnp.linalg.norm(nodes[goal] - p) < 0.25)
+        target = jnp.where(direct, spot, nodes[jnp.maximum(n, 0)])
+        length = jnp.where(direct, jnp.linalg.norm(spot - p), total[goal])
+        way = known & (length < 1e4)
+        v = target - p
+        u = _rot(v / jnp.maximum(jnp.linalg.norm(v), 1e-6), -st.face[me])
+        return jnp.concatenate([jnp.where(way, u, 0.0), jnp.where(way, jnp.minimum(length / (2 * self.cfg.sight),
+                                                                                   1.0), 0.0)[None],
+                                way[None].astype(jnp.float32)])
+
+    def _route_obs(self, st: State, me: int, j):
+        """`route`: the way to where `me` knows enemy j is (seen now, remembered, on the feed). Zeros when it knows of
+        nobody (or he's down)."""
+        known = st.since[me, j] < self.T
+        if self.teams_on:
+            known = known & ~st.known_down[me, j]
+        return self._way(st, me, st.mem[me, j], known)                     # mem = where he is, while seen
+
+    def _feed_obs(self, st: State, me: int):
+        """`feed`: the nearest standing defender as the drone shows him: where (my frame), which way he faces (my
+        frame), the way there, and a 1 for "on the feed". Zeros for operators not on it, or when nobody's standing."""
+        if me not in self.feed_ops:
+            return jnp.zeros(FEED_OBS)
+        return self.privileged(st, me)
+
+    def privileged(self, st: State, me: int):
+        """The feed's 8 numbers for any operator (where the nearest standing enemy is, which way he faces, the way
+        there, standing?). For training only (ep11 10zh: the asymmetric critic reads them); never part of what a
+        brain plays from unless it's on the feed."""
+        en = jnp.asarray(self.enemies[me])
+        p, face = st.pos[me], st.face[me]
+        up = st.alive[en]
+        j = en[jnp.argmin(jnp.where(up, jnp.linalg.norm(st.pos[en] - p, axis=1), jnp.inf))]
+        on = up.any()
+        rel = st.face[j] - face
+        where = jnp.concatenate([_rot(st.pos[j] - p, -face) / self.cfg.sight, jnp.stack([jnp.sin(rel), jnp.cos(rel)])])
+        way = self._way(st, me, st.pos[j], on)[:3]
+        return jnp.concatenate([jnp.where(on, where, 0.0), way, on[None].astype(jnp.float32)])
+
+    def _radio_obs(self, st: State, me: int):
+        K = max(self.cfg.radio)
+        if self.words[me] == 0:                     # a side without a radio reads zeros (one size for both sides)
+            return jnp.zeros(radio_obs(K))
+
+        def word(w, age):                           # one-hot of the word, and how fresh (1 just said -> 0)
+            fresh = jnp.maximum(1.0 - age / self.radio_fade, 0.0)
+            return jnp.concatenate([jax.nn.one_hot(w - 1, K) * (w > 0), (fresh * (w > 0))[None]])
+        if self.mates[me]:                          # the latest word from any teammate
+            m = jnp.asarray(self.mates[me])
+            k = jnp.argmin(jnp.where(st.sent[m] > 0, st.said_age[m], self.T + 1))
+            heard = word(st.sent[m][k], st.said_age[m][k])
+        else:
+            heard = jnp.zeros(K + 1)
+        return jnp.concatenate([heard, word(st.said[me], st.said_age[me])]).astype(jnp.float32)
+
+    def _talk(self, st: State, actions) -> State:
+        """Each operator with a radio, up and not mid-word, says the word in its action (0 or less: silence)."""
+        K = jnp.asarray(self.words)
+        w = jnp.clip(jnp.round(actions[:, SAY]), 0, K).astype(jnp.int32)
+        speak = (w > 0) & st.alive & (st.said_age + 1 >= self.word_steps)   # word_steps decisions apart
+        sent, key = w, st.key
+        if self.cfg.radio_test == "mute":
+            sent = jnp.zeros_like(w)
+        elif self.cfg.radio_test == "scramble":
+            key, k = jax.random.split(key)
+            sent = jax.random.randint(k, w.shape, 1, jnp.maximum(K, 1) + 1)
+        return st._replace(said=jnp.where(speak, w, st.said), sent=jnp.where(speak, sent, st.sent),
+                           said_age=jnp.where(speak, 0, jnp.minimum(st.said_age + 1, self.T)), key=key)
 
     def reset_if(self, st: State, key) -> State:
         """Finished rounds start again in a random building (for training)."""
@@ -1353,13 +1575,18 @@ class CQBGame:
         return st._replace(reload_heard=jnp.where(take[:, None], heard, old), reload_age=jnp.where(take, 0, age))
 
     def step(self, st: State, actions) -> tuple[State, jax.Array]:
-        """actions: (N, 8) per operator (see FWD..RELOAD; 6 or 7 = the rest off). Returns the new state and Assault's
+        """actions: (N, 9) per operator (see FWD..SAY; 6-8 = the rest off / silent). Returns the new state and Assault's
         reward (Defense's is its negative). A side is out when all of it is down. Once a round is over, nothing
         changes."""
         cfg = self.cfg
+        actions = full_action(jnp.asarray(actions))
         if self.stun_on:   # stunned: no moving, turning, firing or anything else this decision
             off = jnp.concatenate([jnp.zeros(3), -jnp.ones(actions.shape[-1] - 3)])
             actions = jnp.where((st.stun_t > 0)[:, None], off, actions)
+        if self.pilot_on:  # the pilot only talks
+            actions = actions.at[0, :SAY].set(jnp.concatenate([jnp.zeros(3), -jnp.ones(SAY - 3)]))
+            if self.cfg.callout:   # ...and with a protocol, says what the drone shows (callout)
+                actions = actions.at[0, SAY].set(self.callout_word(st).astype(actions.dtype))
         pos, vel, face, impact = self._move(st, actions)
         alive = st.alive[:, None]
         pos, vel = jnp.where(alive, pos, st.pos), jnp.where(alive, vel, 0.0)
@@ -1377,13 +1604,15 @@ class CQBGame:
             new = new._replace(ready_t=jnp.where(ran | hard, 0, jnp.minimum(st.ready_t + 1, self.ready_steps)))
         if self.bangs_on:
             new = self._flashbangs(new, actions)
+        if self.radio_on:
+            new = self._talk(new, actions)
         new = self._look(new)
         if self.guns_on:
             new = self._reload(new, actions)
         new = self._hear(self._shoot(new, actions))
         if self.guns_on:
             new = self._hear_reload(new)
-        a_down, d_down = ~new.alive[:self.nA].any(), ~new.alive[self.nA:].any()
+        a_down, d_down = self.sides_out(new.alive)
         timeout = (new.t >= self.T) & ~a_down & ~d_down
         outcome = jnp.where(d_down & ~a_down, 1, jnp.where(a_down & ~d_down, -1, jnp.where(timeout, -1, 0)))
         done = a_down | d_down | timeout

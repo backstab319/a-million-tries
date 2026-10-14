@@ -35,6 +35,11 @@ from ailearns.games.cqb import ASSAULT, DEFENSE, TRAIN_SEEDS, CQBConfig, CQBGame
 EVOLVED = ("body.0.weight", "body.0.bias", "body.2.weight", "body.2.bias", "policy.weight", "policy.bias")
 
 
+def _evolved(params: dict) -> tuple:
+    """What evolution changes: EVOLVED, and a radio's word head when the brain has one (ep11 10x)."""
+    return EVOLVED + (("say.weight", "say.bias") if "say.weight" in params else ())
+
+
 @dataclass
 class CQBESConfig:
     side: str = "assault"
@@ -64,11 +69,26 @@ class CQBESConfig:
     blind_bonus: float = 0.0
     self_blind_cost: float = 0.0
     guard: int = -1              # undo a step that loses more than this many of the generation's rounds (-1: off)
+    # (ep11 10v, the owner's call: "reward generations with better aim") a member's score also gets up to this much a
+    # round for having its rifle on him when they first see each other (either way): aim_bonus x (1 - off / 90°),
+    # nothing at 90° or more, nothing in rounds where they never meet. Only the ranking score, like blind_bonus
+    aim_bonus: float = 0.0
+    house: str = ""              # the game's settings, as in CQBPPOConfig (ep11)
+    route: bool = False
+    feed: int = 0
+    teams: tuple = (1, 1)        # (ep11 10x) with teams the brain plays every operator of its side
+    bump: float = 0.0
+    ready: float = 0.0
+    stun: float = 0.0
+    share_sight: bool = True
+    split_entry: bool = False
+    radio: tuple = (0, 0)
+    pilot: bool = False
 
 
 def _sigmas(cfg: CQBESConfig, params: dict, throw_row: int) -> dict:
     """Per weight: how big a member's change is (bold on the throw output's row and bias, small elsewhere)."""
-    sig = {k: jnp.full(params[k].shape, cfg.sigma) for k in EVOLVED}
+    sig = {k: jnp.full(params[k].shape, cfg.sigma) for k in _evolved(params)}
     sig["policy.weight"] = sig["policy.weight"].at[throw_row].set(cfg.sigma_throw)
     sig["policy.bias"] = sig["policy.bias"].at[throw_row].set(cfg.sigma_throw)
     return sig
@@ -76,28 +96,48 @@ def _sigmas(cfg: CQBESConfig, params: dict, throw_row: int) -> dict:
 
 def _rollout(game: CQBGame, me: int, params: dict, opp, bis, keys, drill):
     """Rounds in buildings bis (the same starts and luck for every member: keys; drill: entry-drill starts),
-    `params` playing its best guess as `me` against player `opp`. -> per round: outcome, throws, throws that
-    blinded the enemy, that blinded me."""
+    `params` playing its best guess as every operator of side `me` against player `opp`. -> per round: outcome,
+    throws, throws that blinded an enemy, that blinded one of mine, side counts (decisions played; my crashes; decisions
+    an enemy heard my footsteps; mine downed by mine; words said: for watching, not scored), and per operator of mine how
+    far its aim was off the nearest standing enemy (radians) when it first saw one or was first seen (pi: never met)."""
     n_in = params["body.0.weight"].shape[1]
-    other = 1 - me
+    mine, theirs = game.side_ops(me), game.side_ops(1 - me)
+    mo, eo = jnp.asarray(mine), jnp.asarray(theirs)
 
     def one(key, bi, d):
         st = jax.tree.map(lambda a, b: jnp.where(d, a, b), game.init_stacked(key, bi), game.init(key, bi))
 
         def tick(carry, k):
-            st, thrown, hit_them, hit_me = carry
-            mine = cqb.full_action(A.best_guess(params, game.observe(st, me)[None, :n_in])[0])
-            theirs = cqb.full_action(opp(game, st, other, k))
-            new, _ = game.step(st, jnp.stack([mine, theirs]) if me == ASSAULT else jnp.stack([theirs, mine]))
-            bang = new.bang_now[me]
-            return (new, thrown + (new.bangs[me] < st.bangs[me]),
-                    hit_them + (bang & (new.blind[other] > st.blind[other])),
-                    hit_me + (bang & (new.blind[me] > st.blind[me]))), None
+            st, thrown, hit_them, hit_me, side, off = carry
+            acts = [None] * game.N
+            for op in mine:
+                acts[op] = cqb.full_action(A.best_guess(params, game.observe(st, op)[None, :n_in])[0])
+            ks = [k] if len(theirs) == 1 else list(jax.random.split(k, len(theirs)))
+            for op, kk in zip(theirs, ks):
+                acts[op] = cqb.full_action(opp(game, st, op, kk))
+            new, _ = game.step(st, jnp.stack(acts))
+            bang = new.bang_now[mo].any()
+            offs = []
+            for i, op in enumerate(mine):
+                near = jnp.where(new.alive[eo], jnp.linalg.norm(new.pos[eo] - new.pos[op], axis=1), jnp.inf)
+                d = new.pos[eo[jnp.argmin(near)]] - new.pos[op]
+                first = (new.seen[op, eo] | new.seen[eo, op]).any() & (off[i] >= jnp.pi) & ~st.done
+                offs.append(jnp.where(first, jnp.abs(cqb._wrap(jnp.arctan2(d[1], d[0]) - new.face[op])), off[i]))
+            on = ~st.done
+            fell = st.alive[mo] & ~new.alive[mo]
+            side = side + on * jnp.stack([
+                1, new.bumped[mo].sum(), (new.sound_age[eo, 0] == 0).any(),
+                (fell & jnp.isin(new.hit_by[mo], mo)).sum(),
+                ((new.said_age[mo] == 0) & (new.said[mo] > 0)).sum()]).astype(jnp.int32)
+            return (new, thrown + (new.bangs[mo] < st.bangs[mo]).sum(),
+                    hit_them + (bang & (new.blind[eo] > st.blind[eo]).any()),
+                    hit_me + (bang & (new.blind[mo] > st.blind[mo]).any()), side, jnp.stack(offs)), None
 
         z = jnp.asarray(0)
-        (last, thrown, hit_them, hit_me), _ = jax.lax.scan(
-            tick, (st, z, z, z), jax.random.split(jax.random.fold_in(key, 1), game.T))
-        return last.outcome, thrown, hit_them, hit_me
+        (last, thrown, hit_them, hit_me, side, off), _ = jax.lax.scan(
+            tick, (st, z, z, z, jnp.zeros(5, jnp.int32), jnp.full(len(mine), jnp.pi, jnp.float32)),
+            jax.random.split(jax.random.fold_in(key, 1), game.T))
+        return last.outcome, thrown, hit_them, hit_me, side, off
 
     return jax.vmap(one)(keys, bis, drill)
 
@@ -110,31 +150,41 @@ def centered_ranks(f):
     return (less + (same - 1) / 2) / (f.shape[0] - 1) - 0.5
 
 
+def _met_off(off):
+    """Mean aim off him at first sight (degrees) over the rounds where they met."""
+    met = off < jnp.pi
+    return jnp.degrees(jnp.where(met, off, 0.0).sum() / jnp.maximum(met.sum(), 1))
+
+
 def make_generation(cfg: CQBESConfig, game: CQBGame, me: int, opponents: list, sig: dict):
     """One generation as one compiled function: (brain, key, rounds) -> (gradient estimate, stats)."""
     pairs = cfg.pop // 2
     sign = 1.0 if me == ASSAULT else -1.0       # outcomes are Assault's
 
+    names = tuple(sig)                          # EVOLVED (+ the word head)
+
     def noise(k):
-        ks = jax.random.split(k, len(EVOLVED))
-        return {name: jax.random.normal(kk, sig[name].shape) for name, kk in zip(EVOLVED, ks)}
+        ks = jax.random.split(k, len(names))
+        return {name: jax.random.normal(kk, sig[name].shape) for name, kk in zip(names, ks)}
 
     def play(params, groups):
         outs = [_rollout(game, me, params, opp, *g) for opp, g in zip(opponents, groups)]
-        outcome, thrown, hit_them, hit_me = (jnp.concatenate(x) for x in zip(*outs))
-        return sign * outcome.astype(jnp.float32), thrown, hit_them, hit_me
+        outcome, thrown, hit_them, hit_me, side, off = (jnp.concatenate(x) for x in zip(*outs))
+        return sign * outcome.astype(jnp.float32), thrown, hit_them, hit_me, side, off
 
     def member(center, k, s, groups):
         eps = noise(k)
-        p = dict(center, **{n: center[n] + s * sig[n] * eps[n] for n in EVOLVED})
-        score, thrown, hit_them, hit_me = play(p, groups)
+        p = dict(center, **{n: center[n] + s * sig[n] * eps[n] for n in names})
+        score, thrown, hit_them, hit_me, _, off = play(p, groups)
         coached = score + cfg.blind_bonus * hit_them - cfg.self_blind_cost * hit_me
-        return coached.mean(), thrown.mean(), hit_them.sum(), hit_me.sum(), thrown.sum(), (score > 0).mean()
+        coached = coached + cfg.aim_bonus * jnp.maximum(0.0, 1.0 - off / (jnp.pi / 2)).mean(-1)   # mean: my operators
+        return (coached.mean(), thrown.mean(), hit_them.sum(), hit_me.sum(), thrown.sum(), (score > 0).mean(),
+                _met_off(off))
 
     def generation(center, key, groups):
         ks = jax.random.split(key, pairs)
         signs = jnp.concatenate([jnp.ones(pairs), -jnp.ones(pairs)])           # each pair: + change, - change
-        f, thrown, hit_them, hit_me, n_thrown, won = jax.vmap(lambda k, s: member(center, k, s, groups))(
+        f, thrown, hit_them, hit_me, n_thrown, won, m_off = jax.vmap(lambda k, s: member(center, k, s, groups))(
             jnp.concatenate([ks, ks]), signs)
         ranks = centered_ranks(f)
         w = ranks[:pairs] - ranks[pairs:]
@@ -142,10 +192,10 @@ def make_generation(cfg: CQBESConfig, game: CQBGame, me: int, opponents: list, s
         def add(acc, kw):
             k, wi = kw
             eps = noise(k)
-            return {n: acc[n] + wi * eps[n] for n in EVOLVED}, None
-        g, _ = jax.lax.scan(add, {n: jnp.zeros_like(center[n]) for n in EVOLVED}, (ks, w))
-        grad = {n: -g[n] / (pairs * sig[n]) for n in EVOLVED}    # minus: adam_step descends
-        own, own_thrown, own_them, _ = play(center, groups)
+            return {n: acc[n] + wi * eps[n] for n in names}, None
+        g, _ = jax.lax.scan(add, {n: jnp.zeros_like(center[n]) for n in names}, (ks, w))
+        grad = {n: -g[n] / (pairs * sig[n]) for n in names}      # minus: adam_step descends
+        own, own_thrown, own_them, own_me, side, own_off = play(center, groups)
         drill = jnp.concatenate([g[2] for g in groups])
         throws = n_thrown.sum()
         stats = {"score": f.mean(), "score_best": f.max(), "won_members": won.mean(),
@@ -156,7 +206,13 @@ def make_generation(cfg: CQBESConfig, game: CQBGame, me: int, opponents: list, s
                  "blinded_enemy_per_throw": hit_them.sum() / jnp.maximum(throws, 1),
                  "blinded_self_per_throw": hit_me.sum() / jnp.maximum(throws, 1),
                  "brain_throws_per_round": own_thrown.mean(),
-                 "brain_blinded_enemy": own_them.sum() / jnp.maximum(own_thrown.sum(), 1)}
+                 "brain_blinded_enemy": own_them.sum() / jnp.maximum(own_thrown.sum(), 1),
+                 "brain_aim_off_deg": _met_off(own_off), "members_aim_off_deg": m_off.mean(),
+                 "brain_met": (own_off < jnp.pi).mean(),
+                 # (ep11 10y) watched, not scored: per round, the brain's side
+                 "brain_blinded_mine": own_me.mean(), "brain_crashes": side[:, 1].mean(),
+                 "brain_heard_share": side[:, 2].sum() / jnp.maximum(side[:, 0].sum(), 1),
+                 "brain_friendly_downs": side[:, 3].mean(), "brain_words": side[:, 4].mean()}
         return grad, stats
 
     return generation
@@ -178,8 +234,12 @@ def train(cfg: CQBESConfig, run_dir: str | Path, max_hours: float | None = None,
     import torch
     from ailearns.agents import tracking
     from ailearns.checkpoints import pick_checkpoint
+    game_cfg = replace(game_cfg, **cqb.HOUSES[cfg.house])
     game_cfg = replace(game_cfg, time_cost=cfg.time_cost, flashbangs=tuple(cfg.flashbangs), magazine=cfg.magazine,
-                       health=cfg.health, react=cfg.react)
+                       health=cfg.health, react=cfg.react, route=cfg.route, feed=cfg.feed,
+                       team_sizes=tuple(cfg.teams), bump=cfg.bump, ready=cfg.ready, stun=cfg.stun,
+                       share_sight=cfg.share_sight, split_entry=cfg.split_entry, radio=tuple(cfg.radio),
+                       pilot=cfg.pilot)
     run_dir = Path(run_dir)
     (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
     state = None
@@ -197,7 +257,13 @@ def train(cfg: CQBESConfig, run_dir: str | Path, max_hours: float | None = None,
     me = ASSAULT if cfg.side == "assault" else DEFENSE
     n_switch = A.switches_for(game_cfg, me)
     run, _, ck = cfg.init_from.partition(":")
-    params = A.widen(A.load(pick_checkpoint(run, ck or "last"))[0], game_cfg.obs_size, n_switch)
+    params, src_ck = A.load(pick_checkpoint(run, ck or "last"))
+    src = CQBConfig(**{k: tuple(v) if isinstance(v, list) else v for k, v in src_ck["cqb"].items()})
+    if params["body.0.weight"].shape[1] == src.obs_size and A.obs_blocks(src) != A.obs_blocks(game_cfg):
+        params = A.transplant(params, src, game_cfg)       # (ep11 10x) e.g. a 1v1 brain into a 2v1 game with a radio
+    params = A.widen(params, game_cfg.obs_size, n_switch)
+    if game_cfg.radio[me] and "say.weight" not in params:
+        params = A.add_radio(params, game_cfg.radio[me])
     if state:
         params = {k: jnp.asarray(v.numpy()) for k, v in state["model"].items()}
     throw_row = A.N_MOVE + A.SWITCHES.index("throw")
@@ -208,7 +274,8 @@ def train(cfg: CQBESConfig, run_dir: str | Path, max_hours: float | None = None,
         raise SystemExit(f"rounds ({cfg.rounds}) must divide among the {K} opponents")
     generation = jax.jit(make_generation(cfg, game, me, opponents, sig))
     judge = jax.jit(make_judge(game, me, opponents))
-    opt = jax.tree.map(jnp.asarray, state["optimizer"]) if state else adam_init({n: params[n] for n in EVOLVED})
+    names = _evolved(params)
+    opt = jax.tree.map(jnp.asarray, state["optimizer"]) if state else adam_init({n: params[n] for n in names})
     first = state["update"] + 1 if state else 1
     if state:
         print(f"resuming at generation {first}", flush=True)
@@ -233,10 +300,10 @@ def train(cfg: CQBESConfig, run_dir: str | Path, max_hours: float | None = None,
         groups = [(bis[i], jax.random.split(jax.random.fold_in(k_rounds, i + 1), n), drill) for i in range(K)]
         grad, m = generation(params, k_gen, groups)
         if cfg.lr_rel:   # Adam's step is linear in lr: take it at lr 1, then scale it per weight
-            new, opt_new = adam_step({n: params[n] for n in EVOLVED}, opt, grad, 1.0)
-            new = {n: params[n] + cfg.lr_rel * sig[n] * (new[n] - params[n]) for n in EVOLVED}
+            new, opt_new = adam_step({n: params[n] for n in names}, opt, grad, 1.0)
+            new = {n: params[n] + cfg.lr_rel * sig[n] * (new[n] - params[n]) for n in names}
         else:
-            new, opt_new = adam_step({n: params[n] for n in EVOLVED}, opt, grad, cfg.lr)
+            new, opt_new = adam_step({n: params[n] for n in names}, opt, grad, cfg.lr)
         kept = True
         if cfg.guard >= 0:   # the step stands only if the brain still wins these rounds (within `guard` of them)
             before = int(round(float(m["won_brain"]) * K * (cfg.rounds // K)))
@@ -257,7 +324,11 @@ def train(cfg: CQBESConfig, run_dir: str | Path, max_hours: float | None = None,
                   f"throws {stats['brain_throws_per_round']:.2f}/round)  members {stats['score']:+.2f} "
                   f"(best {stats['score_best']:+.2f}; {stats['members_throwing']:.0%} throw, "
                   f"{stats['throws_per_round']:.2f}/round; per throw: enemy blinded {stats['blinded_enemy_per_throw']:.2f}, "
-                  f"self {stats['blinded_self_per_throw']:.2f}; members won {stats['won_members']:.2f})"
+                  f"self {stats['blinded_self_per_throw']:.2f}; members won {stats['won_members']:.2f}; "
+                  f"aim off at first sight: brain {stats['brain_aim_off_deg']:.0f} deg, members "
+                  f"{stats['members_aim_off_deg']:.0f}; brain a round: crashes {stats['brain_crashes']:.1f}, heard "
+                  f"{stats['brain_heard_share']:.0%}, friendly downs {stats['brain_friendly_downs']:.2f}, words "
+                  f"{stats['brain_words']:.1f}, own side blinded {stats['brain_blinded_mine']:.2f})"
                   + ("" if kept else "  step undone") + f"  {stats['time']:.0f} s", flush=True)
         if max_hours is not None and time.time() - start > max_hours * 3600:
             save(g, stats)

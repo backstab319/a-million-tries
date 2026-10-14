@@ -174,3 +174,53 @@ def draw_blind(surf: pygame.Surface, view: View, p, strength: float) -> None:
     for k, rad in enumerate((1.0, 0.7, 0.45)):
         pygame.draw.circle(layer, (*BANG, int(strength * (35 + 45 * k))), view.px(p), rad * view.k)
     surf.blit(layer, (0, 0))
+
+
+def draw_pilot(surf: pygame.Surface, view: View, p, color) -> None:
+    """(ep11) The drone pilot: a tablet with an antenna, no weapon (it doesn't fight), labelled PILOT."""
+    c = view.px(p)
+    w, h = max(10.0, 0.8 * view.k), max(7.0, 0.55 * view.k)
+    rect = pygame.Rect(c[0] - w / 2, c[1] - h / 2, w, h)
+    pygame.draw.rect(surf, color, rect, border_radius=max(2, int(h / 5)))
+    pygame.draw.rect(surf, T.BG, rect.inflate(-max(3, w / 5), -max(3, h / 4)), border_radius=max(1, int(h / 8)))
+    tip = (rect.right - w * 0.18, rect.top - h * 0.7)
+    pygame.draw.line(surf, color, (rect.right - w * 0.18, rect.top), tip, max(2, int(view.k * 0.08)))
+    pygame.draw.circle(surf, T.AMBER, tip, max(2, int(view.k * 0.1)))
+    T.text(surf, "PILOT", (c[0], rect.bottom + max(4, 0.15 * view.k)), kind="bold", size=max(14, int(0.42 * view.k)),
+           color=color, anchor="midtop")
+
+
+def draw_feed_ring(surf: pygame.Surface, view: View, p, phase: float) -> None:
+    """(ep11) The drone feed's lock on someone: a ring pulsing outward (the pilot knows where he is, through walls)."""
+    c = view.px(p)
+    layer = pygame.Surface(surf.get_size(), pygame.SRCALPHA)
+    for k in range(2):
+        f = (phase + k / 2) % 1.0
+        r = (0.45 + 0.9 * f) * view.k
+        pygame.draw.circle(layer, (*T.AMBER, int(170 * (1 - f))), c, r, max(2, int(view.k * 0.07)))
+    surf.blit(layer, (0, 0))
+
+
+def draw_call(surf: pygame.Surface, view: View, p, word: str, direction, strength: float) -> None:
+    """(ep11) A radio call arriving at an operator: the word in a bubble above it and (direction: a world angle, or
+    None) an arrow the way the call points; fades with strength 1 -> 0."""
+    a = int(255 * max(0.0, min(strength, 1.0)))
+    c = view.px(p)
+    layer = pygame.Surface(surf.get_size(), pygame.SRCALPHA)
+    if direction is not None:
+        d = np.array([np.cos(direction), np.sin(direction)])
+        start, end = view.px(np.asarray(p) + 0.55 * d), view.px(np.asarray(p) + 2.2 * d)
+        width = max(3, int(view.k * 0.14))
+        pygame.draw.line(layer, (*T.AMBER, a), start, end, width)
+        side = np.array([-d[1], d[0]])
+        head = [end, view.px(np.asarray(p) + 1.75 * d + 0.35 * side), view.px(np.asarray(p) + 1.75 * d - 0.35 * side)]
+        pygame.draw.polygon(layer, (*T.AMBER, a), head)
+    size = max(16, int(0.55 * view.k))
+    img = T.font("bold", size).render(word, True, T.BG)
+    box = img.get_rect(midbottom=(c[0], c[1] - 0.75 * view.k)).inflate(size * 0.7, size * 0.35)
+    pygame.draw.rect(layer, (*T.AMBER, a), box, border_radius=int(size * 0.35))
+    pygame.draw.polygon(layer, (*T.AMBER, a), [(box.centerx - size * 0.25, box.bottom), (box.centerx + size * 0.25, box.bottom),
+                                                 (box.centerx, box.bottom + size * 0.3)])
+    img.set_alpha(a)
+    layer.blit(img, img.get_rect(center=box.center))
+    surf.blit(layer, (0, 0))

@@ -1,7 +1,7 @@
 // The Kill House vs the AI: you clear a dark house against episode 9's trained defender, or hold a room against
-// its trained attacker. Same game, same rules, ten decisions a second for both of you; you see only what your light
-// shows. The AI's moves come from its real trained brain, running here (engine.js, checked against the Python game:
-// node check.mjs).
+// its trained attacker; or, from episode 10, hold it against the AI pair, or attack with an AI partner. Same game,
+// same rules, ten decisions a second for everyone; you see what your side sees (your light, your partner's). The AI's
+// moves come from its real trained brains, running here (engine.js, checked against the Python game: node check.mjs).
 import { ASSAULT, Brain, DEFENSE, Game, House } from "./engine.js";
 
 const C = { bg: "#0d0f16", yard: "#11141c", floor: "#1d2230", wall: "#9aa3b8", door: "#fbbf24", cover: "#6b5d4a",
@@ -13,16 +13,30 @@ const weights = new Float32Array(buf);
 const houses = data.houses.map((h) => new House(h));
 const brainOf = (spec) => { const b = data.brains.find((x) => x.spec === spec); return { ...b, brain: new Brain(b.layers, weights) }; };
 const MODES = {
-  attack: { me: ASSAULT, ai: brainOf("runs/cqb-d5-guns:900"), rules: "runs/cqb-d5-guns:900", color: C.blue,
+  attack: { me: 0, ai: brainOf("runs/cqb-d5-guns:900"), rules: "runs/cqb-d5-guns:900", color: C.blue,
             goal: "Find the defender somewhere in the house and take it down within 45 seconds. You carry a rifle " +
                   "(30 rounds, 3 spare magazines) and two flashbangs: the thing my AI never learned to use.",
             ai_line: "The AI defender practised for {n} decisions. Under these rules my AI attacker beats it 13% of " +
                      "the time; my hand-written flash-and-enter script, about 22%." },
-  defend: { me: DEFENSE, ai: brainOf("runs/cqb-a12-react:300"), rules: "runs/cqb-a12-react:300", color: C.red,
+  defend: { me: 1, ai: brainOf("runs/cqb-a12-react:300"), rules: "runs/cqb-a12-react:300", color: C.red,
             goal: "Hold your room until the 45 seconds run out. The AI attacker starts outside, in the dark. Health " +
                   "is on (hits wound, they don't always kill), and nobody can aim the instant they see someone.",
             ai_line: "The AI attacker is the one from the end of episode 9 ({n} decisions in its last training run). " +
                      "It beats my best AI defender 25% of the time." },
+  // episode 10: two attackers, one brain; under the pair's rules (crashes are loud and stun you, the rifle comes up
+  // slowly after running)
+  defend2: { me: 2, ai: brainOf("runs/cqb-p4-stun:650"), rules: "runs/cqb-p4-stun:650", color: C.red, ep: 10,
+             goal: "Hold your room against two AI attackers for 45 seconds. They share what either one sees, and " +
+                   "they trade: if one goes down, the other is usually right behind. Crashing into a wall is loud and " +
+                   "stuns you for half a second.",
+             ai_line: "The AI pair from the end of episode 10 ({n} decisions in its last run). It beats my best AI " +
+                      "defenders about 55% of the time." },
+  attack2: { me: 0, ai: brainOf("runs/cqb-d8-vs-pair:350"), partner: brainOf("runs/cqb-p4-stun:650"),
+             rules: "runs/cqb-p4-stun:650", color: C.blue, ep: 10,
+             goal: "You're number one of a pair; the AI pair's brain plays number two. You see what either of you " +
+                   "sees. Friendly fire is on, and crashing into a wall is loud and stuns you for half a second.",
+             ai_line: "The AI defender trained against pairs ({n} decisions). Two AIs together beat it about 55% of " +
+                      "the time." },
 };
 const NAMES = ["attacker", "defender"];
 
@@ -81,14 +95,16 @@ canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 const once = (code) => { const p = pressed[code]; pressed[code] = false; return p; };
 
 // ── a round ──
-let phase = "menu", game, house, st, prev, acc, countdown, M, me, ai, result, view = null;
+let phase = "menu", game, house, st, prev, acc, countdown, M, me, side, team, foes, brains, result, view = null;
 let tries = Number(localStorage.getItem("cqb-tries")) || 0;
 globalThis.cqbState = () => ({ st, house, phase, me });   // for automated checks (read only)
 function showMenu() { phase = "menu"; menu.hidden = false; renderMenu(); }
 function start() { menu.hidden = true; initAudio(); next(); }
 function next() {
-  M = MODES[mode]; me = M.me; ai = 1 - me;
+  M = MODES[mode]; me = M.me;
   game = new Game(data.rules[M.rules]);
+  side = game.team[me]; team = game.sideOps(side); foes = game.sideOps(1 - side);
+  brains = game.ops.map((w) => (w === me ? null : game.team[w] === side ? M.partner.brain : M.ai.brain));
   house = houses[Math.floor(Math.random() * houses.length)];
   st = prev = game.start(house); acc = 0; countdown = 3; result = null; phase = "countdown";
   tries += 1; localStorage.setItem("cqb-tries", tries);
@@ -114,29 +130,30 @@ function myAction() {
           on(keys.ShiftLeft || keys.ShiftRight), on(once("KeyG")), on(once("KeyR"))];
 }
 
-function sounds(a, b) {   // what you hear this decision: your own noise, and the other's if it reached you
+function sounds(a, b) {   // what you hear this decision: your side's noise, and the enemy's if it reached you
   const heard = (kind) => b.sound[me][kind][2];
-  if (b.fired[me]) play("gunshot", 1);
-  if (b.fired[ai]) play("gunshot", 0.25 + 0.75 * heard(2));
-  if (b.doorEvent[me]) play("door", 0.7);
-  if (b.doorEvent[ai] && heard(1) > 0) play("door", 0.3 + 0.7 * heard(1));
-  if (b.reloadNow[me]) play("reload", 0.8);
-  if (b.reloadNow[ai] && b.reloadHeard[me][2] > 0) play("reload", 0.3 + 0.7 * b.reloadHeard[me][2]);
-  for (const w of [0, 1]) if (b.bangNow[w]) play("flashbang", w === me ? 1 : 0.3 + 0.7 * b.bangHeard[me][2]);
-  for (const w of [0, 1]) if ((a.alive[w] && !b.alive[w]) || b.hp[w] < a.hp[w]) play("hit", w === me ? 1 : 0.7);
+  for (const w of game.ops) {
+    const ours = team.includes(w), near = w === me ? 1 : 0.6;
+    if (b.fired[w]) play("gunshot", ours ? near : 0.25 + 0.75 * heard(2));
+    if (b.doorEvent[w] && (ours || heard(1) > 0)) play("door", ours ? 0.7 * near : 0.3 + 0.7 * heard(1));
+    if (b.reloadNow[w] && (ours || b.reloadHeard[me][2] > 0)) play("reload", ours ? 0.8 * near : 0.3 + 0.7 * b.reloadHeard[me][2]);
+    if (b.bangNow[w]) play("flashbang", ours ? near : 0.3 + 0.7 * b.bangHeard[me][2]);
+    if ((a.alive[w] && !b.alive[w]) || b.hp[w] < a.hp[w]) play("hit", w === me ? 1 : 0.7);
+    if (b.bumped && b.bumped[w] && (ours || heard(0) > 0)) play("door", ours ? 0.5 * near : 0.2 + 0.5 * heard(0));
+  }
 }
 
 function tick() {  // one decision each (10 per second)
-  const acts = [];
-  acts[me] = myAction();
-  acts[ai] = M.ai.brain.act(game.observe(house, st, ai));
+  const acts = game.ops.map((w) => (w === me ? myAction() : brains[w].act(game.observe(house, st, w))));
   prev = st; st = game.step(house, st, acts);
   sounds(prev, st);
   if (st.done) {
-    const won = me === ASSAULT ? st.outcome === 1 : st.outcome === -1, [w, p] = score();
+    const won = side === ASSAULT ? st.outcome === 1 : st.outcome === -1, [w, p] = score();
     localStorage.setItem(`cqb-score-${mode}`, JSON.stringify([w + won, p + 1]));
-    const how = !st.alive[me] && !st.alive[ai] ? "both down" : st.alive[me] && st.alive[ai] ? "time ran out"
-      : st.alive[me] ? `you took the ${NAMES[ai]} down` : `the ${NAMES[ai]} took you down`;
+    const up = (ops) => ops.some((k) => st.alive[k]), foe = foes.length > 1 ? `the AI ${NAMES[1 - side]}s` : `the AI ${NAMES[1 - side]}`;
+    const how = !up(team) && !up(foes) ? "all down" : up(team) && up(foes) ? "time ran out"
+      : up(team) ? (st.alive[me] ? `you took ${foe} down` : `you went down; your partner finished it`)
+      : `${foe} took ${team.length > 1 ? "you both" : "you"} down`;
     result = { won, how, at: performance.now() }; phase = "over";
   }
 }
@@ -196,8 +213,11 @@ function draw(alpha) {
   const tf = (x, y) => [ox + x * s, oy + (cfg.yard_h - y) * s];
   view = { inv: (px, py) => [(px - ox) / s, cfg.yard_h - (py - oy) / s] };
   const a = phase === "playing" ? alpha : 1, over = phase === "over";
-  const pos = [0, 1].map((w) => [lerp(prev.pos[w][0], st.pos[w][0], a), lerp(prev.pos[w][1], st.pos[w][1], a)]);
-  const face = [0, 1].map((w) => lerpAngle(prev.face[w], st.face[w], a));
+  const pos = game.ops.map((w) => [lerp(prev.pos[w][0], st.pos[w][0], a), lerp(prev.pos[w][1], st.pos[w][1], a)]);
+  const face = game.ops.map((w) => lerpAngle(prev.face[w], st.face[w], a));
+  // your side sees what any of it sees (and always knows where its own are)
+  const shown = (w) => over || team.includes(w) || team.some((k) => st.seen[k][w]);
+  const lights = team.filter((k) => st.alive[k]);
 
   g.save(); g.beginPath(); g.rect(0, hud, W, H - hud); g.clip();   // the world stays under the HUD
   // the yard, the house, cover, doors
@@ -209,19 +229,20 @@ function draw(alpha) {
   for (const b of house.walls) box(b, C.wall);
   house.doors.forEach((b, k) => { if (house.doorValid[k]) box(b, st.doorOpen[k] ? "rgba(251,191,36,0.25)" : C.door); });
 
-  // lights: yours always; the other's while you can see it
-  const showAI = over || st.seen[me];
-  const reach = [0, 1].map((w) => game.lightOf(house, st, w));
+  // lights: your side's always; an enemy's while your side can see it
+  const reach = game.ops.map((w) => game.lightOf(house, st, w));
   g.fillStyle = C.light;
-  for (const w of [me, ...(showAI ? [ai] : [])]) { cone(g, (x, y) => tf(x, y), pos[w], face[w], reach[w]); g.fill(); }
+  for (const w of game.ops) if (st.alive[w] && shown(w)) { cone(g, (x, y) => tf(x, y), pos[w], face[w], reach[w]); g.fill(); }
 
   // the dark: everything but your light (and a little around you)
   if (!over) {
     darkCanvas.width = canvas.width; darkCanvas.height = canvas.height;
     dg.setTransform(dpr, 0, 0, dpr, 0, 0); dg.clearRect(0, 0, W, H); dg.fillStyle = C.dark; dg.fillRect(0, hud, W, H - hud);
     dg.globalCompositeOperation = "destination-out";
-    cone(dg, tf, pos[me], face[me], reach[me]); dg.fill();
-    const [mx, my] = tf(...pos[me]); dg.beginPath(); dg.arc(mx, my, 1.2 * s, 0, 2 * Math.PI); dg.fill();
+    for (const k of lights) {
+      cone(dg, tf, pos[k], face[k], reach[k]); dg.fill();
+      const [kx, ky] = tf(...pos[k]); dg.beginPath(); dg.arc(kx, ky, 1.2 * s, 0, 2 * Math.PI); dg.fill();
+    }
     dg.globalCompositeOperation = "source-over";
     g.drawImage(darkCanvas, 0, 0, W, H);
     g.globalAlpha = 0.3;   // the layout stays faintly visible in the dark (the AI's lasers feel the walls around it too)
@@ -231,24 +252,37 @@ function draw(alpha) {
   }
 
   // flashbangs: yours lying there, and the bang
-  for (const w of [0, 1]) {
-    if (st.bangTimer[w] > 0 && (w === me || over)) { const [x, y] = tf(...st.bangPos[w]); g.fillStyle = C.amber;
+  for (const w of game.ops) {
+    if (st.bangTimer[w] > 0 && (team.includes(w) || over)) { const [x, y] = tf(...st.bangPos[w]); g.fillStyle = C.amber;
       g.beginPath(); g.arc(x, y, 0.18 * s, 0, 2 * Math.PI); g.fill(); }
     if (st.bangNow[w] || prev.bangNow?.[w]) glow(tf, s, st.bangPos[w], cfg.bang_range, "rgba(255,255,255,0.85)");
   }
-  // muzzle flashes you can see, and where you last saw or heard the other
-  for (const w of [0, 1]) if (st.fired[w] && (w === me || st.flashSeen[me] || showAI)) glow(tf, s, pos[w], 1.2, "rgba(255,210,120,0.9)");
-  if (!showAI && st.since[me] < game.T) {
-    const [x, y] = tf(...st.mem[me]), r = 0.5 * s;
-    g.setLineDash([r * 0.5, r * 0.4]); g.strokeStyle = MODES[mode] === MODES.attack ? C.red : C.blue; g.lineWidth = 2;
+  // muzzle flashes your side can see, and where your side last saw or heard each enemy
+  const flashed = (w) => team.some((k) => st.flashSeen[k][w]);
+  for (const w of game.ops) if (st.fired[w] && (shown(w) || flashed(w))) glow(tf, s, pos[w], 1.2, "rgba(255,210,120,0.9)");
+  const foeColor = side === ASSAULT ? C.red : C.blue;
+  for (const j of foes) {
+    if (shown(j) || st.since[me][j] >= game.T || (st.knownDown && st.knownDown[me][j])) continue;
+    const [x, y] = tf(...st.mem[me][j]), r = 0.5 * s;
+    g.setLineDash([r * 0.5, r * 0.4]); g.strokeStyle = foeColor; g.lineWidth = 2;
     g.beginPath(); g.arc(x, y, r, 0, 2 * Math.PI); g.stroke(); g.setLineDash([]);
     text("?", x, y - r * 0.6, r * 1.2, g.strokeStyle, "center");
   }
-  operator(tf, s, pos[me], face[me], M.color); marks(tf, s, me, pos[me]);
-  if (showAI || (st.flashSeen[me] && st.fired[ai])) {
-    operator(tf, s, pos[ai], face[ai], me === ASSAULT ? C.red : C.blue);
-    if (showAI) marks(tf, s, ai, pos[ai]);
+  for (const w of game.ops) {
+    const ours = team.includes(w), color = ours ? M.color : foeColor;
+    if (!shown(w) && !(flashed(w) && st.fired[w])) continue;
+    if (!st.alive[w]) {   // down: a cross
+      const [x, y] = tf(...pos[w]), r = 0.35 * s; g.strokeStyle = color; g.lineWidth = Math.max(2, 0.12 * s);
+      g.beginPath(); g.moveTo(x - r, y - r); g.lineTo(x + r, y + r); g.moveTo(x - r, y + r); g.lineTo(x + r, y - r); g.stroke();
+      continue;
+    }
+    operator(tf, s, pos[w], face[w], color); if (shown(w)) marks(tf, s, w, pos[w]);
+    if (ours && team.length > 1) {   // you, and your partner
+      const [x, y] = tf(...pos[w]);
+      text(w === me ? "you" : "AI", x + 0.55 * s, y - 0.9 * s, Math.max(12, 0.45 * s), color, "left", 700);
+    }
   }
+  if (st.stunT && st.stunT[me] > 0 && !over) text("STUNNED", ...tf(...pos[me]).map((v, i) => v + (i ? 0.7 * s : 0)), Math.max(14, 0.5 * s), C.amber, "center");
 
   // what you hear: a mark on a ring around you, towards the sound (steps grey, door amber, shot red)
   const [mx, my] = tf(...pos[me]);
@@ -265,15 +299,17 @@ function draw(alpha) {
 
   // HUD
   const pad = 16, small = Math.max(13, Math.min(W, H) / 52), left = Math.max(0, cfg.time_limit - st.t * cfg.dt), [won, played] = score();
-  text(`You: the ${NAMES[me]} · vs the AI ${NAMES[ai]} (episode 9)`, pad, pad, small * 1.5, M.color);
+  const vs = foes.length > 1 ? `the AI ${NAMES[1 - side]}s` : `the AI ${NAMES[1 - side]}`;
+  text(`You: the ${NAMES[side]}${team.length > 1 ? " + an AI partner" : ""} · vs ${vs} (episode ${M.ep || 9})` +
+       (st.alive[me] || over ? "" : " · you're down: watching your partner"), pad, pad, small * 1.5, M.color);
   text(`you ${won} of ${played} vs this AI · try #${tries}`, pad, pad + small * 2.1, small, C.muted, "left", 600);
   const stats = [`${left.toFixed(1)} s left`];
   if (game.gunsOn) stats.push(st.reloadTimer[me] > 0 ? "reloading…" : `${st.mag[me]} | ${st.reserve[me]} rounds`);
-  if (game.bangsOn && cfg.flashbangs[me]) stats.push(`${st.bangs[me]} flashbang${st.bangs[me] === 1 ? "" : "s"}`);
+  if (game.bangsOn && cfg.flashbangs[side]) stats.push(`${st.bangs[me]} flashbang${st.bangs[me] === 1 ? "" : "s"}`);
   if (game.healthOn) stats.push(`health ${Math.round(st.hp[me])}`);
   text(stats.join("   ·   "), pad, pad + small * 3.6, small * 1.25, left < 5 ? C.red : C.text, "left", 700);
-  if (W >= 1000) text("WASD · mouse aim · click fire · F door · Shift run · G flashbang · R reload · Esc menu",
-                      W - pad, pad, small * 0.85, C.muted, "right", 500);
+  if (W >= 1000) text("WASD · mouse aim · click fire · F door · Shift run · G flashbang · R reload · Esc menu",   // (under
+                      W - pad, W >= 1700 ? pad : pad + small * 3.8, small * 0.85, C.muted, "right", 500);   // the title if narrow)
   if (phase === "countdown") text(String(Math.ceil(countdown)), W / 2, H / 2 - small * 4, small * 8, C.text, "center");
   if (over) {
     const y0 = H - small * 9;   // at the bottom, so the revealed round stays in view

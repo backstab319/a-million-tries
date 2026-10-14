@@ -58,6 +58,7 @@ video used them (the model pages on Hugging Face name the tag their brains run w
 |---|---|---|
 | 9, "The Kill House" (1 vs 1) | [`episode-9`](https://github.com/backstab319/a-million-tries/tree/episode-9) | one attacker vs one defender; flashbangs, magazines, health and reaction time as options |
 | 10, "I Gave My AI a Partner. It Shot Him." (2 vs 1) | [`episode-10`](https://github.com/backstab319/a-million-tries/tree/episode-10) | teams (`--teams 2,1`: shared sightings, friendly fire); loud crashes, the rifle coming up after running and a stun on hard crashes as options (`--bump 15 --ready 0.3 --stun 0.5`); the evolution gallery (`qd_cqb.py`) |
+| 11, "I Gave My AI a Radio. It Ignored It 10 Times." (the radio) | [`episode-11`](https://github.com/backstab319/a-million-tries/tree/episode-11) | a radio (`--radio 4,0`), no automatic sharing (`--no-share`), two doors (`--split`), the perfect drone feed (`--feed 1`), the route (`--route`), big houses (`--house big`), the drone pilot and its protocol (`--pilot --callout --callout-way`), the asymmetric critic (`--critic-priv`); evolution with an aim bonus (`es_cqb.py`, `aim_bonus`) |
 
 ```
 git checkout episode-9
@@ -65,6 +66,9 @@ uv run games watch-cqb runs/<brain>:<update> camper 100064 --batch 64,64   # a r
 
 git checkout episode-10                                                       # two attackers sharing one brain
 uv run games train-cqb runs/pair --teams 2,1 --init-from runs/<1v1 brain>:last --opponent camper     --flashbangs 2,0 --magazine 30 --health 100 --react 0.3 --bump 15 --ready 0.3 --stun 0.5 --time-cost 0.01
+
+git checkout episode-11                                                       # radio try #11: pilot + entry, the coach that knows
+uv run games train-cqb runs/radio --teams 2,1 --radio 4,0 --no-share --split --feed 1 --route --house big     --pilot --callout --callout-way --critic-priv --gamma 0.999 --flashbangs 2,0 --magazine 30 --health 100     --react 0.3 --bump 15 --ready 0.3 --stun 0.5 --time-cost 0.01 --init-from runs/<1v1 searcher>:last --opponent camper
 ```
 
 ## Licence

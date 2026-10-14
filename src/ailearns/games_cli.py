@@ -104,6 +104,22 @@ def main() -> None:
     sp.add_argument("--bump", type=float, default=0.0, help="metres a collision is heard (0: silent)")
     sp.add_argument("--ready", type=float, default=0.0, help="seconds to bring the rifle up after running (0: none)")
     sp.add_argument("--stun", type=float, default=0.0, help="seconds a hard collision stuns you (0: none)")
+    sp.add_argument("--no-share", action="store_true", help="teams don't share sightings (each knows its own)")
+    sp.add_argument("--radio", default="0,0", help="radio words per side, Assault,Defense (e.g. 4,0; ep11)")
+    sp.add_argument("--split", action="store_true", help="the Assault team starts at different doors (ep11)")
+    sp.add_argument("--listen", type=float, default=0.0, help="radio: nudge to act on words heard (ep11)")
+    sp.add_argument("--relay", type=float, default=0.0, help="with --no-share: fresh callouts, at most this old (s)")
+    sp.add_argument("--intel", type=int, default=0, help="Assault operators who always know where the defender is (ep11)")
+    sp.add_argument("--feed", type=int, default=0, help="Assault operators on a drone feed of their own (ep11)")
+    sp.add_argument("--route", action="store_true", help="each operator reads the way to the enemy it knows of (ep11)")
+    sp.add_argument("--pilot", action="store_true", help="Assault operator 1 is a drone pilot who only talks (ep11)")
+    sp.add_argument("--callout", action="store_true", help="with --pilot: the pilot speaks a fixed protocol (ep11)")
+    sp.add_argument("--callout-way", action="store_true", help="with --callout: call the way to him, not the bearing")
+    sp.add_argument("--vf-warmup", type=int, default=0, help="first N updates train only the value head (ep11)")
+    sp.add_argument("--gamma", type=float, default=0.995, help="how much it values the future (per decision; ep11: 0.999)")
+    sp.add_argument("--critic-priv", action="store_true", help="asymmetric critic: the value also reads where he really is (training only; ep11)")
+    sp.add_argument("--house", default="", help="a building preset (cqb.HOUSES: big = 8-12 rooms; ep11)")
+    sp.add_argument("--signal", type=float, default=0.0, help="radio: nudge to say different words in different cases")
     sp.add_argument("--plateau", type=int, default=0, help="stop after this many updates without a new best (0: never)")
     sp.add_argument("--stacked", type=float, default=0.0, help="share of rounds that are entry drills (start beside "
                                                                  "Defense's door)")
@@ -201,7 +217,10 @@ def main() -> None:
                            flashbangs=tuple(int(x) for x in args.flashbangs.split(",")), stacked=args.stacked,
                            memory=args.memory, plateau=args.plateau, magazine=args.magazine, health=args.health,
                            react=args.react, teams=tuple(int(x) for x in args.teams.split(",")), bump=args.bump,
-                           ready=args.ready, stun=args.stun),
+                           ready=args.ready, stun=args.stun, share_sight=not args.no_share,
+                           radio=tuple(int(x) for x in args.radio.split(",")), split_entry=args.split,
+                           listen_coef=args.listen, signal_coef=args.signal, relay=args.relay, intel=args.intel, feed=args.feed, route=args.route, house=args.house, pilot=args.pilot, callout=args.callout, callout_way=args.callout_way, vf_warmup=args.vf_warmup, critic_priv=args.critic_priv,
+                           gamma=args.gamma),
               args.run, resume=args.resume, max_hours=args.max_hours)
     elif args.cmd == "eval-cqb":
         from ailearns.agents.ppo_cqb import evaluate

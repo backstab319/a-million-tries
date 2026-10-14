@@ -15,23 +15,28 @@ for (const ref of data.reference) {
   const scripted = ref.attacker_moves.length > 0;   // a script's recorded moves (it throws flashbangs)
   const a = scripted ? null : brain(ref.attacker), d = brain(ref.defender);
   let st = game.start(house, ref.start), drift5 = 0, drift = 0;
-  for (let k = 0; k < ref.steps && !st.done; k++) {
-    const acts = [scripted ? ref.attacker_moves[k] : a.act(game.observe(house, st, ASSAULT)), d.act(game.observe(house, st, DEFENSE))];
-    st = game.step(house, st, acts, ref.dice[k], ref.where[k] || [0, 0]);
-    const e = Math.max(...[0, 1].map((w) => Math.hypot(st.pos[w][0] - ref.pos[k + 1][w][0], st.pos[w][1] - ref.pos[k + 1][w][1])));
+  for (let k = 0; k < ref.steps && !st.done; k++) {   // every operator plays its side's brain (2 vs 1: three)
+    const acts = game.ops.map((w) => (game.team[w] === DEFENSE ? d.act(game.observe(house, st, w))
+      : scripted ? ref.attacker_moves[k] : a.act(game.observe(house, st, w))));
+    st = game.step(house, st, acts, ref.dice[k], ref.where[k] || game.ops.map(() => 0));
+    const e = Math.max(...game.ops.map((w) => Math.hypot(st.pos[w][0] - ref.pos[k + 1][w][0], st.pos[w][1] - ref.pos[k + 1][w][1])));
     drift = Math.max(drift, e);
     if (k < 50) drift5 = drift;
   }
   const ok = st.outcome === ref.outcome && st.t === ref.steps;
   same += ok;
-  if (!ok && ref.steps < 300) shortMiss++;
+  if (!ok && ref.steps < 200) shortMiss++;
   const res = (o) => (o === 1 ? "attacker wins" : "defender wins");
-  console.log(`${name(ref.attacker)} vs ${name(ref.defender)} house ${ref.house}: JS ${res(st.outcome)} at ${(st.t / 10).toFixed(1)} s, ` +
+  console.log(`${game.nA}v${game.nD} ${name(ref.attacker)} vs ${name(ref.defender)} house ${ref.house}: JS ${res(st.outcome)} at ${(st.t / 10).toFixed(1)} s, ` +
     `Python ${res(ref.outcome)} at ${(ref.steps / 10).toFixed(1)} s ${ok ? "✓" : "✗"}; ` +
     `drift ${drift5.toFixed(4)} m in 5 s, ${drift.toFixed(4)} m overall` + (ref.bangs ? `; ${ref.bangs} flashbang(s)` : ""));
 }
 console.log(`${same}/${data.reference.length} rounds end the same way`);
-// Python computes in float32, JS in float64: tiny differences grow, and over 30 s or more a close decision can flip
-// (the same rounds also come out differently on the Python game's GPU and CPU). A round under 30 s must match.
-console.log(shortMiss ? `${shortMiss} round(s) under 30 s differ: a porting bug` : "every round under 30 s matches");
+// Python computes in float32, JS in float64: tiny differences grow, and in a long round a close decision can flip
+// (the same rounds also come out differently on the Python game's GPU and CPU). Episode 9 (two operators) allowed
+// that over 30 s; with three operators edge cases come 50% more often, and in episode 10's rounds we found: house
+// 100078 (2v1) flips "has the defender looked at cell 9" at 1.4 s, the cell 1e-7 rad from its light's edge, and still
+// ends the same; house 100104 (2v1) parts by 0.1 mm at 11.1 s with every input identical (rounding) and ends
+// differently at 21 s. So: a round under 20 s must match.
+console.log(shortMiss ? `${shortMiss} round(s) under 20 s differ: a porting bug` : "every round under 20 s matches");
 process.exit(shortMiss ? 1 : 0);
