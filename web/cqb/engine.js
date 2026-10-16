@@ -66,6 +66,50 @@ export class House {
     this.entries = h.entry.slice(0, h.n_entries); this.entryFace = h.entry_face.slice(0, h.n_entries);
     this.spawn = h.spawn; this.footLo = h.foot_lo; this.footHi = h.foot_hi; this.cells = h.cell_point;
   }
+
+  // (ep12) games/cqb.py nav_graph: waypoints (the map's cell points, two per doorway, four per crate corner) and the
+  // walking distance / next waypoint between every pair (Floyd-Warshall). Nodes that can't be stood on stay, as in
+  // Python, joined to nothing (routes can still steer at one in plain view); only the empty slots are left out.
+  nav(cfg, body = 0.32) {
+    if (this._nav) return this._nav;
+    const out = cfg.wall / 2 + cfg.cover_gap / 2, m = cfg.cover_gap / 2, pts = [];
+    for (const c of this.cells) pts.push(c);
+    this.doors.forEach((b, k) => {
+      if (!this.doorValid[k]) return;
+      const mid = [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2], axis = b[2] - b[0] <= b[3] - b[1] ? 0 : 1;
+      const n = axis === 0 ? [1, 0] : [0, 1];
+      pts.push([mid[0] - n[0] * out, mid[1] - n[1] * out], [mid[0] + n[0] * out, mid[1] + n[1] * out]);
+    });
+    for (const c of this.cover) {
+      const lo = [c[0] - m, c[1] - m], hi = [c[2] + m, c[3] + m];
+      pts.push(lo, hi, [lo[0], hi[1]], [hi[0], lo[1]]);
+    }
+    const boxes = [...this.walls, ...this.cover].map((b) => [b[0] - body, b[1] - body, b[2] + body, b[3] + body]);
+    const yard = [cfg.yard_w, cfg.yard_h];
+    const nodes = pts, real = pts.map((p) => p.every((x, ax) => x > cfg.radius && x < yard[ax] - cfg.radius)
+      && !boxes.some((b) => p[0] > b[0] && p[0] < b[2] && p[1] > b[1] && p[1] < b[3]));
+    const K = nodes.length, dist = [], next = [];
+    for (let i = 0; i < K; i++) {
+      dist.push(new Float64Array(K)); next.push(new Int32Array(K));
+      for (let j = 0; j < K; j++) {
+        const ok = i === j || (real[i] && real[j] && clear(nodes[i], nodes[j], boxes));
+        dist[i][j] = i === j ? 0 : ok ? norm(nodes[j][0] - nodes[i][0], nodes[j][1] - nodes[i][1]) : Infinity;
+        next[i][j] = ok ? j : -1;
+      }
+    }
+    for (let k = 0; k < K; k++) {
+      for (let i = 0; i < K; i++) {
+        const dik = dist[i][k];
+        for (let j = 0; j < K; j++) {
+          const via = dik + dist[k][j];
+          if (via < dist[i][j]) { dist[i][j] = via; next[i][j] = next[i][k]; }
+        }
+      }
+    }
+    for (let i = 0; i < K; i++) for (let j = 0; j < K; j++) dist[i][j] = Math.fround(Number.isFinite(dist[i][j]) ? dist[i][j] : 1e4);
+    this._nav = { nodes: nodes.map((p) => p.map(Math.fround)), dist, next };
+    return this._nav;
+  }
 }
 
 export class Game {
@@ -93,6 +137,10 @@ export class Game {
     this.enemies = this.ops.map((i) => this.ops.filter((j) => this.team[j] !== this.team[i]));
     this.mates = this.ops.map((i) => this.ops.filter((j) => j !== i && this.team[j] === this.team[i]));
     this.slots = Math.max(nA, nD);
+    // episode 12: a hostage to secure (and, with extract, to walk out; with hostage_noise, Defense hears it moved)
+    this.hostageOn = !!cfg.hostage; this.extractOn = this.hostageOn && !!cfg.extract;
+    this.noiseOn = this.extractOn && (cfg.hostage_noise || 0) > 0;
+    this.secureSteps = Math.max(1, Math.round((cfg.secure_time ?? 3) / cfg.dt));
   }
 
   sideOps(side) { return side === ASSAULT ? this.ops.slice(0, this.nA) : this.ops.slice(this.nA); }
@@ -102,9 +150,12 @@ export class Game {
     const cfg = this.cfg, N = this.N;
     if (!given) {
       const e = Math.floor(rand() * h.entries.length), fa = h.entryFace[e], gap = cfg.stack_gap || 0.8;
-      const yard = [cfg.yard_w, cfg.yard_h];
+      const yard = [cfg.yard_w, cfg.yard_h], n = h.entries.length;
+      const own = (k) => cfg.split_entry && k > 0 && (e + k) % n !== e;   // (ep11) split entry: each at its own door
+      const aFace = [...Array(this.nA).keys()].map((k) => (own(k) ? h.entryFace[(e + k) % n] : fa));
       const aPos = [...Array(this.nA).keys()].map((k) => {
-        const p = [h.entries[e][0] - Math.cos(fa) * gap * k, h.entries[e][1] - Math.sin(fa) * gap * k];
+        const p = own(k) ? h.entries[(e + k) % n].slice()
+          : [h.entries[e][0] - Math.cos(fa) * gap * k, h.entries[e][1] - Math.sin(fa) * gap * k];
         return this.nA > 1 ? p.map((x, ax) => clip(x, cfg.radius, yard[ax] - cfg.radius)) : p;
       });
       const spots = [];
@@ -113,8 +164,9 @@ export class Game {
         if (!spots.includes(k) || this.nD === 1) spots.push(k);
       }
       given = { pos: [...aPos, ...spots.map((k) => h.spawn[k].slice())],
-                face: [...aPos.map(() => fa), ...spots.map(() => (rand() * 2 - 1) * Math.PI)],
-                door_open: h.doorValid.map((v, k) => v && !h.doorOutside[k] && rand() < cfg.inside_open) };
+                face: [...aFace, ...spots.map(() => (rand() * 2 - 1) * Math.PI)],
+                door_open: h.doorValid.map((v, k) => v && !h.doorOutside[k] && rand() < cfg.inside_open),
+                hostage: this.hostageOn ? this.hostageSpot(h, rand) : [0, 0] };
     }
     const pos = given.pos.map((p) => p.slice()), z2 = () => [0, 0];
     const each = (f) => this.ops.map(f), pairs = (f) => this.ops.map(() => this.ops.map(f));
@@ -133,8 +185,61 @@ export class Game {
       landed: each(() => this.soundSteps), aim: pairs(() => 0), knownDown: pairs(() => false), hitBy: each(() => -1),
       bumped: each(() => false), readyT: each(() => this.readySteps), stunT: each(() => 0),
       t: 0, done: false, outcome: 0,
+      hostage: (given.hostage || [0, 0]).slice(), secure: 0, escort: -1,
+      hostageHeard: each(() => [0, 0, 0]), hostageAge: each(() => this.soundSteps),
     };
     return this.look(h, st);
+  }
+
+  // (ep12) games/cqb.py _hostage_spot: one of the inside start spots; with hostage_deep, one at least that far from
+  // every way in (the farthest if none is). The browser draws its own luck.
+  hostageSpot(h, rand = Math.random) {
+    const spots = h.spawn.slice(0, this.cfg.spawn_points), deep = this.cfg.hostage_deep || 0;
+    if (!deep) return spots[Math.floor(rand() * spots.length)].slice();
+    const far = spots.map((s) => Math.min(...h.entries.map((e) => norm(s[0] - e[0], s[1] - e[1]))));
+    const ok = spots.filter((_, k) => far[k] >= deep);
+    return (ok.length ? ok[Math.floor(rand() * ok.length)] : spots[far.indexOf(Math.max(...far))]).slice();
+  }
+
+  // (ep12) games/cqb.py _exit: the way in nearest to p (straight line): the way out.
+  exitNear(h, p) {
+    let best = Infinity, out = h.entries[0];
+    for (const e of h.entries) { const d = norm(e[0] - p[0], e[1] - p[1]); if (d < best) { best = d; out = e; } }
+    return out;
+  }
+
+  // (ep12) games/cqb.py routes: which waypoints `who` can walk straight to, and the walking distance to every one.
+  routes(h, st, who) {
+    const { nodes, dist } = h.nav(this.cfg), K = nodes.length, p = st.pos[who], k = this.cfg.radius - 0.05;
+    const boxes = [...h.walls, ...h.cover].map((b) => [b[0] - k, b[1] - k, b[2] + k, b[3] + k]);
+    const vis = nodes.map((q) => clear(p, q, boxes));
+    const first = nodes.map((q, n) => (vis[n] ? Math.fround(norm(q[0] - p[0], q[1] - p[1])) : 1e5));
+    const best = new Array(K).fill(Infinity), via = new Array(K).fill(0);
+    for (let v = 0; v < K; v++) for (let to = 0; to < K; to++) {
+      const x = first[v] + dist[v][to];
+      if (x < best[to]) { best[to] = x; via[to] = v; }
+    }
+    return { vis, dist: best, via, boxes };
+  }
+
+  // (ep12) games/cqb.py _way: the way from `me` to `spot`: the direction (my frame) to the next waypoint of the
+  // shortest walk there (straight at it when nothing's in between), the walking distance (/ 2 x sight, at most 1),
+  // and a 1 that it knows a way. Zeros unless `known`.
+  way(h, st, me, spot, known, r) {
+    const { nodes, next } = h.nav(this.cfg), p = st.pos[me], { vis, dist, via, boxes } = r;
+    const total = nodes.map((q, n) => dist[n] + (clear(spot, q, boxes) ? Math.fround(norm(q[0] - spot[0], q[1] - spot[1])) : 1e5));
+    let goal = 0;
+    total.forEach((x, n) => { if (x < total[goal]) goal = n; });
+    let n = via[goal];
+    if (norm(nodes[n][0] - p[0], nodes[n][1] - p[1]) < 0.25) n = next[n][goal];   // there: on to the next
+    const after = n >= 0 ? next[n][goal] : -1;
+    if (after >= 0 && vis[after]) n = after;                                      // the one after in view: cut the corner
+    const direct = clear(p, spot, boxes) || norm(nodes[goal][0] - p[0], nodes[goal][1] - p[1]) < 0.25;
+    const target = direct ? spot : nodes[Math.max(n, 0)];
+    const length = direct ? norm(spot[0] - p[0], spot[1] - p[1]) : total[goal];
+    const ok = known && length < 1e4, v = [target[0] - p[0], target[1] - p[1]], vn = Math.max(norm(...v), 1e-6);
+    const u = rot([v[0] / vn, v[1] / vn], -st.face[me]);
+    return ok ? [u[0], u[1], Math.min(length / (2 * this.cfg.sight), 1), 1] : [0, 0, 0, 0];
   }
 
   boxes(h, st, doorOpen = st.doorOpen) {   // walls, cover, shut doors (in this order: pushOut's ties follow it)
@@ -223,6 +328,7 @@ export class Game {
       m = [m[0] * (m[0] > 0 ? 1 : cfg.sideways), m[1] * cfg.sideways];
       let speed = a[w][RUN] > 0 ? cfg.run : cfg.walk;
       if (this.healthOn) speed *= st.hp[w] < cfg.wounded_below ? cfg.wounded_speed : 1;
+      if (this.extractOn && w === st.escort) speed *= cfg.escort_speed;   // (ep12) moving the hostage: slower
       const want = rot(m, face[w]).map((x) => x * speed);
       let dv = [want[0] - st.vel[w][0], want[1] - st.vel[w][1]];
       const k = Math.min(1, (cfg.accel * cfg.dt) / Math.max(norm(dv[0], dv[1]), 1e-9));
@@ -467,7 +573,7 @@ export class Game {
     if (st.done) return st;
     const cfg = this.cfg, ops = this.ops;
     dice = dice || ops.map(() => Math.random()); where = where || ops.map(() => Math.random());
-    let a = actions.map((x) => [...x, ...Array(8 - x.length).fill(-1)]);
+    let a = actions.map((x) => [...x, ...Array(Math.max(0, 8 - x.length)).fill(-1)]);   // (a 9th: ep11's radio word)
     if (this.stunOn) a = a.map((x, w) => (st.stunT[w] > 0 ? [0, 0, 0, -1, -1, -1, -1, -1] : x));   // stunned: nothing
     const prev = st;
     st = structuredClone(st);
@@ -494,10 +600,56 @@ export class Game {
     st.pos = st.pos.map((p) => p.map(f)); st.vel = st.vel.map((v) => v.map(f)); st.face = st.face.map(f);
     st.kick = st.kick.map(f); st.hp = st.hp.map(f);
     const aDown = !st.alive.slice(0, this.nA).some((x) => x), dDown = !st.alive.slice(this.nA).some((x) => x);
-    const timeout = st.t >= this.T && !aDown && !dDown;
-    st.outcome = dDown && !aDown ? 1 : aDown && !dDown ? -1 : timeout ? -1 : 0;
-    st.done = aDown || dDown || timeout;
+    const secured = this.hostageOn ? this.hostageStep(h, st, aDown, dDown) : false;
+    const timeout = st.t >= this.T && !aDown && !dDown && !secured;
+    st.outcome = dDown && !aDown ? 1 : aDown && !dDown ? -1 : secured ? 1 : timeout ? -1 : 0;
+    st.done = aDown || dDown || timeout || secured;
     return st;
+  }
+
+  // (ep12) an attacker beside the hostage, with a clear line, adds a decision; else it resets. With extract: secured,
+  // the nearest attacker beside it takes it; it goes where he goes; him down, it stays (not secured); out of the
+  // house, it's the win. Without extract, securing it is the win. -> secured (a win for Assault)
+  hostageStep(h, st, aDown, dDown) {
+    const cfg = this.cfg, walls = this.wallsOnly(h, st), ops = this.sideOps(ASSAULT);
+    if (this.extractOn) {
+      const e = Math.max(st.escort, 0), lost = st.escort >= 0 && !st.alive[e];
+      if (lost) { st.escort = -1; st.secure = 0; } else if (st.escort >= 0) st.hostage = st.pos[e].slice();
+    }
+    const d = ops.map((w) => norm(st.pos[w][0] - st.hostage[0], st.pos[w][1] - st.hostage[1]));
+    const near = ops.map((w, k) => d[k] <= cfg.secure_radius && st.alive[w] && clear(st.hostage, st.pos[w], walls));
+    let secured = false;
+    if (this.extractOn) {
+      const free = st.escort < 0;
+      if (free) st.secure = near.some((x) => x) ? st.secure + 1 : 0;
+      if (free && st.secure >= this.secureSteps) {
+        let k = 0;
+        ops.forEach((_, n) => { if (near[n] && (!near[k] || d[n] < d[k])) k = n; });
+        st.escort = ops[k]; st.hostage = st.pos[ops[k]].slice();
+      }
+      const out = [0, 1].some((ax) => st.hostage[ax] < h.footLo[ax] - cfg.escort_out || st.hostage[ax] > h.footHi[ax] + cfg.escort_out);
+      secured = st.escort >= 0 && out && !aDown && !dDown;
+      if (this.noiseOn) this.hearHostage(h, st);
+    } else {
+      st.secure = near.some((x) => x) ? st.secure + 1 : 0;
+      secured = st.secure >= this.secureSteps && !aDown && !dDown;
+    }
+    st.hostage = st.hostage.map(Math.fround);
+    return secured;
+  }
+
+  // (ep12) games/cqb.py _hear_hostage: Defense hears the hostage while its escort walks it (hostage_noise metres,
+  // less through walls, like footsteps), held for sound_memory like other sounds.
+  hearHostage(h, st) {
+    const cfg = this.cfg, walls = this.wallsOnly(h, st), e = Math.max(st.escort, 0);
+    const moving = st.escort >= 0 && st.alive[e] && norm(...st.vel[e]) > cfg.still;
+    for (const w of this.ops) {
+      const nu = this.team[w] === DEFENSE ? this.heard(st.pos[w], st.hostage, moving ? cfg.hostage_noise : 0, walls) : [0, 0, 0];
+      const age = Math.min(st.hostageAge[w] + 1, this.soundSteps), old = age < this.soundSteps ? st.hostageHeard[w] : [0, 0, 0];
+      const take = nu[2] > 0;
+      st.hostageHeard[w] = take ? nu : old;
+      st.hostageAge[w] = take ? 0 : age;
+    }
   }
 
   // games/cqb.py enemy_order: me's enemies, nearest known first; the ones its team knows are down last.
@@ -572,6 +724,21 @@ export class Game {
     }
     if (this.readyOn) obs.push(st.readyT[me] / this.readySteps);
     if (this.stunOn) obs.push(st.stunT[me] / this.stunSteps);
+    if (this.hostageOn) {   // (ep12) where (my frame), the way there, how far it's secured
+      let known = true;
+      if (this.extractOn && this.team[me] === DEFENSE) known = st.escort < 0 || st.since[me][Math.max(st.escort, 0)] === 0;
+      const r = this.routes(h, st, me);
+      obs.push(...(known ? sc(own(sub(st.hostage, p)), 1 / cfg.sight) : [0, 0]), ...this.way(h, st, me, st.hostage, known, r),
+               st.secure / this.secureSteps);
+      if (this.extractOn) {   // am I moving it, is anyone, and (Assault) the way out from here
+        obs.push(st.escort === me ? 1 : 0, st.escort >= 0 ? 1 : 0,
+                 ...this.way(h, st, me, this.exitNear(h, p), this.team[me] === ASSAULT, r));
+        if (this.noiseOn) {   // the hostage being moved, heard: where from (my frame), how loud
+          const hh = st.hostageHeard[me];
+          obs.push(...(hh[2] > 0 ? own([hh[0], hh[1]]) : [0, 0]), hh[2]);
+        }
+      }
+    }
     return obs;
   }
 

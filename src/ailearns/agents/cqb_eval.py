@@ -50,7 +50,7 @@ def _game_cfg(ck: dict) -> cqb.CQBConfig:
 def _matchup(game: cqb.CQBGame, me: int, template: dict, opponent: str, n: int, seed: int, stacked: bool = False,
              sample_words: bool = False):
     """A compiled function (params) -> results of one best-guess round per building 0..n-1 against `opponent`."""
-    other = S.SCRIPTS.get(opponent) or A.opponent_player(opponent, 1 - me)
+    other = S.SCRIPTS.get(opponent) or A.opponent_player(opponent, 1 - me, game.cfg)
 
     @jax.jit
     def play(params):

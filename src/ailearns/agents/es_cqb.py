@@ -48,6 +48,18 @@ class CQBESConfig:
     time_cost: float = 0.0       # the game's rules, as in CQBPPOConfig
     flashbangs: tuple = (0, 0)
     magazine: int = 0
+    spare_mags: int = 3          # the game's CQBConfig.spare_mags (ep12: 1)
+    time_limit: float = 45.0     # the game's CQBConfig.time_limit
+    blind_away: float = 1.0      # the game's CQBConfig.blind_away (ep12: 0.25)
+    hostage: bool = False        # the game's CQBConfig.hostage (ep12)
+    hostage_deep: float = 0.0    # the game's CQBConfig.hostage_deep
+    extract: bool = False        # the game's CQBConfig.extract (the coaching then counts the way out too)
+    hostage_noise: float = 0.0   # the game's CQBConfig.hostage_noise
+    hostage_bonus: float = 0.0   # (ep12, coaching like aim_bonus: the ranking only) up to this a round for how far an
+                                 # attacker got securing the hostage (its best stretch beside it, / secure_time); the
+                                 # defenders lose the same
+    sigma_hostage: float = 0.0   # (ep12) a member's change to the weights on the hostage numbers (0: as `sigma`): they
+                                 # start at zero, and at sigma 0.005 evolution never grew them (e8)
     health: float = 0.0
     react: float = 0.0
     pop: int = 256               # members a generation (mirrored pairs)
@@ -91,6 +103,10 @@ def _sigmas(cfg: CQBESConfig, params: dict, throw_row: int) -> dict:
     sig = {k: jnp.full(params[k].shape, cfg.sigma) for k in _evolved(params)}
     sig["policy.weight"] = sig["policy.weight"].at[throw_row].set(cfg.sigma_throw)
     sig["policy.bias"] = sig["policy.bias"].at[throw_row].set(cfg.sigma_throw)
+    if cfg.hostage and cfg.sigma_hostage:   # the hostage numbers (and the extraction's) are the observation's last
+        from ailearns.games.cqb import EXTRACT_OBS, HOSTAGE_OBS, HOSTAGE_SOUND_OBS
+        n = HOSTAGE_OBS + (EXTRACT_OBS if cfg.extract else 0) + (HOSTAGE_SOUND_OBS if cfg.extract and cfg.hostage_noise else 0)
+        sig["body.0.weight"] = sig["body.0.weight"].at[:, -n:].set(cfg.sigma_hostage)
     return sig
 
 
@@ -108,7 +124,7 @@ def _rollout(game: CQBGame, me: int, params: dict, opp, bis, keys, drill):
         st = jax.tree.map(lambda a, b: jnp.where(d, a, b), game.init_stacked(key, bi), game.init(key, bi))
 
         def tick(carry, k):
-            st, thrown, hit_them, hit_me, side, off = carry
+            st, thrown, hit_them, hit_me, side, off, prog = carry
             acts = [None] * game.N
             for op in mine:
                 acts[op] = cqb.full_action(A.best_guess(params, game.observe(st, op)[None, :n_in])[0])
@@ -129,15 +145,16 @@ def _rollout(game: CQBGame, me: int, params: dict, opp, bis, keys, drill):
                 1, new.bumped[mo].sum(), (new.sound_age[eo, 0] == 0).any(),
                 (fell & jnp.isin(new.hit_by[mo], mo)).sum(),
                 ((new.said_age[mo] == 0) & (new.said[mo] > 0)).sum()]).astype(jnp.int32)
+            prog = jnp.maximum(prog, game.hostage_progress(new))   # (ep12) how far the hostage got (secured, out)
             return (new, thrown + (new.bangs[mo] < st.bangs[mo]).sum(),
                     hit_them + (bang & (new.blind[eo] > st.blind[eo]).any()),
-                    hit_me + (bang & (new.blind[mo] > st.blind[mo]).any()), side, jnp.stack(offs)), None
+                    hit_me + (bang & (new.blind[mo] > st.blind[mo]).any()), side, jnp.stack(offs), prog), None
 
         z = jnp.asarray(0)
-        (last, thrown, hit_them, hit_me, side, off), _ = jax.lax.scan(
-            tick, (st, z, z, z, jnp.zeros(5, jnp.int32), jnp.full(len(mine), jnp.pi, jnp.float32)),
+        (last, thrown, hit_them, hit_me, side, off, prog), _ = jax.lax.scan(
+            tick, (st, z, z, z, jnp.zeros(5, jnp.int32), jnp.full(len(mine), jnp.pi, jnp.float32), jnp.asarray(0.0)),
             jax.random.split(jax.random.fold_in(key, 1), game.T))
-        return last.outcome, thrown, hit_them, hit_me, side, off
+        return last.outcome, thrown, hit_them, hit_me, side, off, prog
 
     return jax.vmap(one)(keys, bis, drill)
 
@@ -169,15 +186,17 @@ def make_generation(cfg: CQBESConfig, game: CQBGame, me: int, opponents: list, s
 
     def play(params, groups):
         outs = [_rollout(game, me, params, opp, *g) for opp, g in zip(opponents, groups)]
-        outcome, thrown, hit_them, hit_me, side, off = (jnp.concatenate(x) for x in zip(*outs))
-        return sign * outcome.astype(jnp.float32), thrown, hit_them, hit_me, side, off
+        outcome, thrown, hit_them, hit_me, side, off, prog = (jnp.concatenate(x) for x in zip(*outs))
+        return sign * outcome.astype(jnp.float32), thrown, hit_them, hit_me, side, off, prog
 
     def member(center, k, s, groups):
         eps = noise(k)
         p = dict(center, **{n: center[n] + s * sig[n] * eps[n] for n in names})
-        score, thrown, hit_them, hit_me, _, off = play(p, groups)
+        score, thrown, hit_them, hit_me, _, off, prog = play(p, groups)
         coached = score + cfg.blind_bonus * hit_them - cfg.self_blind_cost * hit_me
         coached = coached + cfg.aim_bonus * jnp.maximum(0.0, 1.0 - off / (jnp.pi / 2)).mean(-1)   # mean: my operators
+        coached = coached + cfg.hostage_bonus * prog * sign   # (ep12) the furthest the hostage got secured: attackers
+                                                             # gain it, defenders lose it (d19 never learned to guard)
         return (coached.mean(), thrown.mean(), hit_them.sum(), hit_me.sum(), thrown.sum(), (score > 0).mean(),
                 _met_off(off))
 
@@ -195,7 +214,7 @@ def make_generation(cfg: CQBESConfig, game: CQBGame, me: int, opponents: list, s
             return {n: acc[n] + wi * eps[n] for n in names}, None
         g, _ = jax.lax.scan(add, {n: jnp.zeros_like(center[n]) for n in names}, (ks, w))
         grad = {n: -g[n] / (pairs * sig[n]) for n in names}      # minus: adam_step descends
-        own, own_thrown, own_them, own_me, side, own_off = play(center, groups)
+        own, own_thrown, own_them, own_me, side, own_off, own_prog = play(center, groups)
         drill = jnp.concatenate([g[2] for g in groups])
         throws = n_thrown.sum()
         stats = {"score": f.mean(), "score_best": f.max(), "won_members": won.mean(),
@@ -208,7 +227,7 @@ def make_generation(cfg: CQBESConfig, game: CQBGame, me: int, opponents: list, s
                  "brain_throws_per_round": own_thrown.mean(),
                  "brain_blinded_enemy": own_them.sum() / jnp.maximum(own_thrown.sum(), 1),
                  "brain_aim_off_deg": _met_off(own_off), "members_aim_off_deg": m_off.mean(),
-                 "brain_met": (own_off < jnp.pi).mean(),
+                 "brain_met": (own_off < jnp.pi).mean(), "brain_secure_progress": own_prog.mean(),
                  # (ep11 10y) watched, not scored: per round, the brain's side
                  "brain_blinded_mine": own_me.mean(), "brain_crashes": side[:, 1].mean(),
                  "brain_heard_share": side[:, 2].sum() / jnp.maximum(side[:, 0].sum(), 1),
@@ -236,6 +255,8 @@ def train(cfg: CQBESConfig, run_dir: str | Path, max_hours: float | None = None,
     from ailearns.checkpoints import pick_checkpoint
     game_cfg = replace(game_cfg, **cqb.HOUSES[cfg.house])
     game_cfg = replace(game_cfg, time_cost=cfg.time_cost, flashbangs=tuple(cfg.flashbangs), magazine=cfg.magazine,
+                       spare_mags=cfg.spare_mags, time_limit=cfg.time_limit, blind_away=cfg.blind_away, hostage=cfg.hostage,
+                       hostage_deep=cfg.hostage_deep, extract=cfg.extract, hostage_noise=cfg.hostage_noise,
                        health=cfg.health, react=cfg.react, route=cfg.route, feed=cfg.feed,
                        team_sizes=tuple(cfg.teams), bump=cfg.bump, ready=cfg.ready, stun=cfg.stun,
                        share_sight=cfg.share_sight, split_entry=cfg.split_entry, radio=tuple(cfg.radio),
@@ -268,7 +289,7 @@ def train(cfg: CQBESConfig, run_dir: str | Path, max_hours: float | None = None,
         params = {k: jnp.asarray(v.numpy()) for k, v in state["model"].items()}
     throw_row = A.N_MOVE + A.SWITCHES.index("throw")
     sig = _sigmas(cfg, params, throw_row)
-    opponents = A.pool_members(cfg.opponent, 1 - me)
+    opponents = A.pool_members(cfg.opponent, 1 - me, game_cfg)
     K = len(opponents)
     if cfg.rounds % K:
         raise SystemExit(f"rounds ({cfg.rounds}) must divide among the {K} opponents")

@@ -334,8 +334,52 @@ def walker_flank(game: CQBGame, st: State, who: int, key=None):
     return _walker_feed(game, st, who, flank=True)
 
 
+def guard(game: CQBGame, st: State, who: int, key=None):
+    """(ep12, with `hostage`) A defender that walks to the hostage and holds beside it like the camper, shooting on
+    sight throughout: the check on whether guarding stops the securing (it does, 45% -> 11%, but two guards side by
+    side lose the fight instead: devlog step 24)."""
+    cells = game.cfg.seen_grid[0] * game.cfg.seen_grid[1]
+    nodes = game.b.nav_nodes[st.building][:cells]
+    _, dist, _ = _routes(game, st, who)
+    goal = jnp.argmin(jnp.where(dist[:cells] < 1e4, jnp.linalg.norm(nodes - st.hostage, axis=1), jnp.inf))
+    there = jnp.linalg.norm(st.pos[who] - st.hostage) < 2.0
+    seen, _, _, _ = contact(game, st, who)
+    act = jnp.where(there, camper(game, st, who), _nav(game, st, who, goal))
+    return _reloading(game, st, who, jnp.where(seen, _shoot_on_sight(game, st, who), act))
+
+
+def interceptor(game: CQBGame, st: State, who: int, key=None):
+    """(ep12, with `hostage_noise`) A defender that holds like the camper until it hears the hostage being moved, then
+    goes to the way out nearest where the sound came from (its distance guessed from how loud: hearing only, no
+    peeking) and holds there; shoots on sight throughout. The check on whether hearing the hostage helps a defence."""
+    cfg = game.cfg
+    hh = st.hostage_heard[who]
+    heard = (hh[2] > 0) & (st.hostage_age[who] < game.sound_steps)
+    guess = st.pos[who] + hh[:2] * (1.0 - hh[2]) * max(cfg.hostage_noise, 1e-6)
+    out = game._exit(st, guess)
+    cells = cfg.seen_grid[0] * cfg.seen_grid[1]
+    nodes = game.b.nav_nodes[st.building][:cells]
+    _, dist, _ = _routes(game, st, who)
+    goal = jnp.argmin(jnp.where(dist[:cells] < 1e4, jnp.linalg.norm(nodes - out, axis=1), jnp.inf))
+    there = jnp.linalg.norm(st.pos[who] - nodes[goal]) < 1.0
+    seen, _, _, _ = contact(game, st, who)
+    turn, _ = _aim(game, st, who, guess)
+    act = jnp.where(heard, jnp.where(there, _act(turn=turn), _nav(game, st, who, goal)), camper(game, st, who))
+    return _reloading(game, st, who, jnp.where(seen, _shoot_on_sight(game, st, who), act))
+
+
+def _pair(first, second):
+    """A side's first operator plays `first`, the others `second` (ep12: an anchor and a roamer)."""
+    def play(game: CQBGame, st: State, who: int, key=None):
+        lead = int(game.side_ops(int(game.team[who]))[0])
+        return jnp.where(who == lead, first(game, st, who, key), second(game, st, who, key))
+    return play
+
+
 SCRIPTS = {"dummy": dummy, "random": random, "camper": camper, "wanderer": wanderer, "walker": walker,
-           "walker_flash": walker_flash, "walker_feed": walker_feed, "walker_flank": walker_flank}
+           "walker_flash": walker_flash, "walker_feed": walker_feed, "walker_flank": walker_flank, "guard": guard,
+           "interceptor": interceptor, "guard+interceptor": _pair(guard, interceptor),
+           "camper+interceptor": _pair(camper, interceptor), "guard+camper": _pair(guard, camper)}
 
 
 def play_rounds(game: CQBGame, assault, defense, buildings, seed: int = 0, record: bool = False,

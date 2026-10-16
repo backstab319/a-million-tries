@@ -363,3 +363,65 @@ def test_asymmetric_critic(tmp_path):
     st = g.init(jax.random.key(0))
     assert np.allclose(np.asarray(g.privileged(st, 0)), np.asarray(
         cqb.CQBGame(g.b, replace(CQBConfig(), feed=1)).observe(st, 0)[-cqb.FEED_OBS:]))   # = what the feed shows
+
+
+def test_guess_head(tmp_path):
+    """ep12 guess_coef: a side head on the brain's body guesses the PRIV numbers (where the nearest enemy really is);
+    it's scored against the truth in training (its error is logged and its weights move), the body learns from it
+    too, and play never reads it: off (0) the brain has no guess head at all."""
+    import json
+    import torch
+    from ailearns.agents import ppo_cqb as A
+    small = dict(n_envs=32, n_steps=16, minibatch=256, hidden=32, buildings=8)
+    run = tmp_path / "guess"
+    train(CQBPPOConfig(**small, total_steps=2 * 32 * 16, guess_coef=1.0), run)
+    ck = [torch.load(run / "checkpoints" / f"u{u:05d}.pt", weights_only=False)["model"] for u in (0, 2)]
+    assert "guess.weight" in ck[0] and not torch.equal(ck[0]["guess.weight"], ck[1]["guess.weight"])
+    rows = [json.loads(line) for line in open(run / "metrics.jsonl")]
+    assert all(np.isfinite(r["guess_err"]) for r in rows)
+    params, _ = A.load(run / "checkpoints" / "u00002.pt")
+    obs = jax.random.normal(jax.random.key(1), (8, CQBConfig().obs_size))
+    assert A.guess(params, obs).shape == (8, A.PRIV)
+    without = {k: v for k, v in params.items() if not k.startswith("guess.")}
+    for a, b in zip(forward(params, obs), forward(without, obs)):                    # play: the same without it
+        assert np.allclose(np.asarray(a), np.asarray(b))
+    off = tmp_path / "off"
+    train(CQBPPOConfig(**small, total_steps=32 * 16), off)
+    assert "guess.weight" not in torch.load(off / "checkpoints" / "u00001.pt", weights_only=False)["model"]
+
+
+def test_fit_adds_team_slots_and_plays_as_before():
+    """ep12 fit/transplant: a 2v2 brain in a 3v2 game reads its old numbers with the same weights (the enemy and
+    teammate slots it knew, which one of its team it is) and zero weights on the new slots, so with the new slots
+    empty it decides exactly as before; and a defender brain already has a throw switch (a never-live placeholder since
+    magazines), so flashbangs for the defence need no widening."""
+    from dataclasses import replace
+    from ailearns.agents import ppo_cqb as A
+    from ailearns.games import cqb
+    small = replace(CQBConfig(), flashbangs=(2, 0), magazine=30, health=100.0, react=0.3)
+    two = replace(small, team_sizes=(2, 2))
+    three = replace(small, team_sizes=(3, 2))
+    params = A.init_params(jax.random.key(0), two.obs_size, 32, -0.5, A.switches_for(two, cqb.ASSAULT))
+    ck = {"cqb": {k: list(v) if isinstance(v, tuple) else v for k, v in two.__dict__.items()}}
+    p3 = A.fit(params, ck, three, cqb.ASSAULT)
+    assert p3["body.0.weight"].shape[1] == three.obs_size
+    # the same situation in both layouts: the 2v2 numbers, and the 3v2 numbers with the extra slots empty
+    obs2 = jax.random.normal(jax.random.key(1), (4, two.obs_size))
+    blocks2, blocks3 = dict(A.obs_blocks(two)), dict(A.obs_blocks(three))
+    parts, at = [], 0
+    for name, n in A.obs_blocks(two):
+        x = obs2[:, at:at + n]
+        if name == "teams":
+            E, M = cqb.ENEMY_OBS, cqb.MATE_OBS
+            x = jnp.concatenate([x[:, :E], jnp.zeros((4, E)), x[:, E:E + M], jnp.zeros((4, M)), x[:, -1:]], 1)
+            assert x.shape[1] == blocks3["teams"]
+        parts.append(x)
+        at += n
+    obs3 = jnp.concatenate(parts, 1)
+    for a, b in zip(forward(params, obs2), forward(p3, obs3)):
+        assert np.allclose(np.asarray(a), np.asarray(b), atol=1e-5)
+    flash = replace(two, flashbangs=(2, 2))
+    d = A.init_params(jax.random.key(2), two.obs_size, 32, -0.5, A.switches_for(two, cqb.DEFENSE))
+    dw = A.fit(d, ck, flash, cqb.DEFENSE)
+    assert A.switches_for(flash, cqb.DEFENSE) == A.switches_for(two, cqb.DEFENSE)
+    assert dw["policy.weight"].shape == d["policy.weight"].shape                # the placeholder becomes live

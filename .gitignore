@@ -12,3 +12,9 @@ out/
 # secrets
 .env
 .youtube-token.json
+
+# Mixamo downloads: baked into the glbs, never committed raw
+assets/cqb/mixamo/
+
+# recorded rounds for the 3D page (scripts/cqb_replay.py): remade from the checkpoints, too big for git
+web/cqb/replays/

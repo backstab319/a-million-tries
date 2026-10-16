@@ -42,6 +42,13 @@ class CQBPPOConfig:
     time_cost: float = 0.0       # Assault pays this per second (the game's CQBConfig.time_cost); Defense earns it
     flashbangs: tuple = (0, 0)   # per round (Assault, Defense): the game's CQBConfig.flashbangs (ep9 3t)
     magazine: int = 0            # rounds per magazine: the game's CQBConfig.magazine (0: no magazines; ep9 3am)
+    spare_mags: int = 3          # magazines carried besides the loaded one: the game's CQBConfig.spare_mags (ep12: 1)
+    time_limit: float = 45.0     # seconds a round lasts: the game's CQBConfig.time_limit (ep12: 90 in big houses)
+    blind_away: float = 1.0      # flashbang blindness when it wasn't in your view, x blind_time (ep12: 0.25)
+    hostage: bool = False        # the game's CQBConfig.hostage (ep12: secure the hostage to win too)
+    hostage_deep: float = 0.0    # the game's CQBConfig.hostage_deep
+    extract: bool = False        # the game's CQBConfig.extract
+    hostage_noise: float = 0.0   # the game's CQBConfig.hostage_noise
     health: float = 0.0          # the game's CQBConfig.health (0: one hit and you're down; ep9 3ar)
     react: float = 0.0           # the game's CQBConfig.react (0: no reaction time; ep9 3aw)
     teams: tuple = (1, 1)        # the game's CQBConfig.team_sizes (ep10): one brain plays every operator of its side
@@ -64,6 +71,9 @@ class CQBPPOConfig:
     signal_coef: float = 0.0     # (radio) a nudge to say different words in different situations: the words' spread
                                  # over a minibatch minus their spread in each situation. 0: none (Eccles et al. 2019)
     listen_cap: float = 1.0      # the listening nudge stops counting past this much difference per decision
+    guess_coef: float = 0.0      # (ep12) the brain also guesses where the nearest enemy really is (the 8 numbers of
+                                 # CQBGame.privileged) from its own view: a side head on its body, scored against the
+                                 # truth in training only (an auxiliary task). Play never reads the guess. 0: off
     critic_priv: bool = False    # (ep11 10zh) an asymmetric critic: a separate value network that also reads where the
                                  # nearest enemy really is (CQBGame.privileged), for training only; the brain plays from
                                  # its own numbers as before. False: the value head on the brain's body, as always
@@ -129,6 +139,9 @@ def obs_blocks(cfg: CQBConfig) -> list:
     out += [("radio", c.radio_obs(max(cfg.radio)))] if any(cfg.radio) else []
     out += [("route", c.ROUTE_OBS)] if cfg.route else []
     out += [("feed", c.FEED_OBS)] if cfg.feed else []
+    out += [("hostage", c.HOSTAGE_OBS)] if cfg.hostage else []
+    out += [("extract", c.EXTRACT_OBS)] if cfg.hostage and cfg.extract else []
+    out += [("hostage_sound", c.HOSTAGE_SOUND_OBS)] if cfg.hostage and cfg.extract and cfg.hostage_noise else []
     assert sum(n for _, n in out) == cfg.obs_size, (out, cfg.obs_size)
     return out
 
@@ -145,7 +158,17 @@ def transplant(params: dict, src: CQBConfig, dst: CQBConfig) -> dict:
         at += n
     cols, at = [], 0
     for name, n in obs_blocks(dst):
-        if name in where:
+        if name == "teams" and name in where and where[name][1] != n:   # (ep12) more operators a side: more slots
+            a, m = where[name]
+            per = cqb.ENEMY_OBS + cqb.MATE_OBS
+            se, de = (m - 1) // per, (n - 1) // per                       # slots in src and dst
+            assert de >= se, "transplant can add team slots, not remove them"
+            z = lambda k: jnp.zeros((w.shape[0], k), w.dtype)            # noqa: E731
+            E, M = cqb.ENEMY_OBS, cqb.MATE_OBS
+            cols += [w[:, a:a + se * E], z((de - se) * E),                  # the enemy slots it knew, then new ones
+                     w[:, a + se * E:a + se * (E + M)], z((de - se) * M),   # the same for teammates
+                     w[:, a + m - 1:a + m]]                                 # which one of my team I am
+        elif name in where:
             a, m = where[name]
             assert m == n, f"{name}: {m} numbers in src, {n} in dst"
             cols.append(w[:, a:a + n])
@@ -153,6 +176,16 @@ def transplant(params: dict, src: CQBConfig, dst: CQBConfig) -> dict:
             cols.append(jnp.zeros((w.shape[0], n), w.dtype))
         at += n
     return {**params, "body.0.weight": jnp.concatenate(cols, 1)}
+
+
+def fit(params: dict, ck: dict, dst: CQBConfig, side: int) -> dict:
+    """(ep12) A saved brain (its params and checkpoint) ready to play `side` in a game with `dst`'s rules: its inputs
+    moved to where dst puts them (more team slots read zero weights) and a throw switch added if dst gives that side
+    flashbangs it never had. Plays exactly as before on everything it knew."""
+    src = CQBConfig(**{k: tuple(v) if isinstance(v, list) else v for k, v in ck["cqb"].items()})
+    if params["body.0.weight"].shape[1] == src.obs_size and obs_blocks(src) != obs_blocks(dst):
+        params = transplant(params, src, dst)
+    return widen(params, dst.obs_size, switches_for(dst, side))
 
 
 def widen(params: dict, obs_size: int, n_switch: int) -> dict:
@@ -215,6 +248,21 @@ def add_critic(params: dict, obs_size: int, key, hidden: int = 256) -> dict:
     p["critic.2.weight"], p["critic.2.bias"] = dense(k[1], hidden, hidden, np.sqrt(2))
     p["critic.out.weight"], p["critic.out.bias"] = dense(k[2], hidden, 1, 1.0)
     return p
+
+
+def add_guess(params: dict, key, hidden: int = 256) -> dict:
+    """(ep12) The guessing head: from the brain's body (its last hidden layer) to the PRIV numbers."""
+    p = dict(params)
+    w = jax.nn.initializers.orthogonal(0.1)(key, (PRIV, params["body.2.weight"].shape[0]))
+    p["guess.weight"], p["guess.bias"] = w, jnp.zeros(PRIV)
+    return p
+
+
+def guess(params: dict, obs):
+    """The brain's guess of where the nearest enemy is: (batch, obs) -> (batch, PRIV). Never used in play."""
+    x = jnp.tanh(obs @ params["body.0.weight"].T + params["body.0.bias"])
+    x = jnp.tanh(x @ params["body.2.weight"].T + params["body.2.bias"])
+    return x @ params["guess.weight"].T + params["guess.bias"]
 
 
 def critic_value(params: dict, obs, priv):
@@ -430,16 +478,23 @@ def load(path) -> tuple[dict, dict]:
     return {k: jnp.asarray(v.numpy()) for k, v in ck["model"].items()}, ck
 
 
-def pool_members(spec: str, who: int) -> list:
-    """The players in a pool spec, "camper,runs/a:175,runs/b:381" (scripts and frozen brains of any size)."""
+def _frozen(spec: str, who: int, game_cfg: CQBConfig | None):
+    """A saved brain "runs/a:175" as a player; with game_cfg, fitted to that game first (`fit`)."""
     from ailearns.checkpoints import pick_checkpoint
+    run, _, ck = spec.partition(":")
+    params, meta = load(pick_checkpoint(run, ck or "last"))
+    return brain(fit(params, meta, game_cfg, who) if game_cfg is not None else params, who)
+
+
+def pool_members(spec: str, who: int, game_cfg: CQBConfig | None = None) -> list:
+    """The players in a pool spec, "camper,runs/a:175,runs/b:381" (scripts and frozen brains of any size); with
+    game_cfg, each brain is fitted to that game (ep12: a 2v2 brain in a 3v2 game)."""
     members = []
     for m in (x.strip() for x in spec.split(",")):
         if m in S.SCRIPTS:
             members.append(S.SCRIPTS[m])
         else:
-            run, _, ck = m.partition(":")
-            members.append(brain(load(pick_checkpoint(run, ck or "last"))[0], who))
+            members.append(_frozen(m, who, game_cfg))
             if getattr(members[-1], "memory", 0):
                 raise SystemExit(f"{m} has a memory: training against one isn't supported yet")
     return members
@@ -471,13 +526,11 @@ def pool_actions(members: list, game: CQBGame, env, who: int, keys):
     return acts
 
 
-def opponent_player(spec: str, who: int):
-    """A script name, or frozen brains "runs/a:175" (the first one plays) -> player."""
+def opponent_player(spec: str, who: int, game_cfg: CQBConfig | None = None):
+    """A script name, or frozen brains "runs/a:175" (the first one plays) -> player (fitted to game_cfg if given)."""
     if spec in S.SCRIPTS:
         return S.SCRIPTS[spec]
-    from ailearns.checkpoints import pick_checkpoint
-    run, _, ck = spec.split(",")[0].strip().partition(":")
-    return brain(load(pick_checkpoint(run, ck or "last"))[0], who)
+    return _frozen(spec.split(",")[0].strip(), who, game_cfg)
 
 
 # ── training ────────────────────────────────────────────────────────────────
@@ -510,10 +563,12 @@ def make_update(cfg: CQBPPOConfig, game: CQBGame, n_local: int, n_dev: int):
     n_mb = (T * rows) // mb
     sign = 1.0 if me == ASSAULT else -1.0          # the game's rewards are Assault's
     W = int(game.words[mine[0]])                   # radio words (ep11; 0: none)
-    members = pool_members(cfg.opponent, 1 - me)
+    members = pool_members(cfg.opponent, 1 - me, game.cfg)
     vobs = jax.vmap(lambda s: jnp.stack([game.observe(s, op) for op in mine]))   # (rounds, K, obs)
     vpriv = jax.vmap(lambda s: jnp.stack([game.privileged(s, op) for op in mine]))   # (rounds, K, PRIV): critic only
     crit = cfg.critic_priv
+    gss = cfg.guess_coef > 0
+    need_priv = crit or gss
     flat = lambda x: x.reshape(rows, *x.shape[2:])                                 # noqa: E731
     n_drill = drill_slots(cfg, n_local)
     vreset = jax.vmap(game.reset_if)
@@ -568,6 +623,13 @@ def make_update(cfg: CQBPPOConfig, game: CQBGame, n_local: int, n_dev: int):
         live = b["live"] * b["acting"][:, None] if game.teams_on else b["live"]
         ent = entropy(logits, log_std, live, W)
         loss = pg + cfg.vf_coef * vl - cfg.ent_coef * ent
+        gstat = {}
+        if gss:   # the guess, scored where the operator is up (a downed one's view says nothing)
+            mask = b["acting"] if game.teams_on else jnp.ones(b["obs"].shape[0])
+            err = ((guess(params, b["obs"]) - b["priv"]) ** 2).mean(-1)
+            g_err = (err * mask).sum() / jnp.maximum(mask.sum(), 1.0)
+            loss = loss + cfg.guess_coef * g_err
+            gstat = {"guess_err": g_err}
         bias = {}
         if W and cfg.listen_coef:   # the same decisions with nothing heard: how much did the word heard change them?
             K1 = W + 1
@@ -598,7 +660,7 @@ def make_update(cfg: CQBPPOConfig, game: CQBGame, n_local: int, n_dev: int):
             words = {f"p_say{k}": pw[k] for k in range(W + 1)}
         return loss, {"pg_loss": pg, "v_loss": vl, "entropy": ent, "std": jnp.exp(log_std).mean(),
                       "clipfrac": (jnp.abs(ratio - 1) > cfg.clip).mean(),
-                      **{f"p_{n}": p[i] for i, n in enumerate(SWITCHES[:p.shape[0]])}, **words, **bias}
+                      **{f"p_{n}": p[i] for i, n in enumerate(SWITCHES[:p.shape[0]])}, **words, **bias, **gstat}
 
     def update(params, opt, env, obs, key, lr, pol, h):
         key, k_roll, k_learn = jax.random.split(key, 3)
@@ -608,8 +670,9 @@ def make_update(cfg: CQBPPOConfig, game: CQBGame, n_local: int, n_dev: int):
         def tick(carry, k):
             env, obs, h = carry
             mean, logits, log_std, value, h_next = forward_mem(params, obs, h)
-            if crit:
+            if need_priv:
                 priv = flat(vpriv(env))
+            if crit:
                 value = critic_value(params, obs, priv)
             ka, ko, kr = jax.random.split(k, 3)
             moves, switches = sample(ka, mean, logits, log_std, W)
@@ -640,7 +703,7 @@ def make_update(cfg: CQBPPOConfig, game: CQBGame, n_local: int, n_dev: int):
             return (env, flat(vobs(env)), h_next), {"obs": obs, "moves": moves, "switches": switches, "live": live,
                                                     "logp": logp, "val": value, "rew": flat(reward), "h": h,
                                                     "term": term, "acting": acting, **out,
-                                                    **({"priv": priv} if crit else {})}
+                                                    **({"priv": priv} if need_priv else {})}
         (env, obs_next, h_end), tr = lax.scan(tick, (env, obs, h), jax.random.split(k_roll, T))
 
         next_value = (critic_value(params, obs_next, flat(vpriv(env))) if crit
@@ -657,7 +720,7 @@ def make_update(cfg: CQBPPOConfig, game: CQBGame, n_local: int, n_dev: int):
                  "logp": tr["logp"], "adv": adv, "ret": adv + tr["val"]}
         if game.teams_on:
             batch["acting"] = tr["acting"]
-        if crit:
+        if need_priv:
             batch["priv"] = tr["priv"]
         if memory:   # pieces of mem_chunk decisions, each replayed in order from the memory it had in play
             L = cfg.mem_chunk
@@ -711,7 +774,7 @@ def train(cfg: CQBPPOConfig, run_dir: str | Path, resume: bool = False, max_hour
     import torch
     game_cfg = replace(game_cfg, **cqb.HOUSES[cfg.house])
     game_cfg = replace(game_cfg, time_cost=cfg.time_cost, flashbangs=tuple(cfg.flashbangs), magazine=cfg.magazine,
-                       health=cfg.health, react=cfg.react, team_sizes=tuple(cfg.teams), bump=cfg.bump,
+                       spare_mags=cfg.spare_mags, time_limit=cfg.time_limit, blind_away=cfg.blind_away, hostage=cfg.hostage, hostage_deep=cfg.hostage_deep, extract=cfg.extract, hostage_noise=cfg.hostage_noise, health=cfg.health, react=cfg.react, team_sizes=tuple(cfg.teams), bump=cfg.bump,
                        ready=cfg.ready, stun=cfg.stun, share_sight=cfg.share_sight, radio=tuple(cfg.radio),
                        split_entry=cfg.split_entry, relay=cfg.relay, intel=cfg.intel,
                        route=cfg.route, feed=cfg.feed, pilot=cfg.pilot, callout=cfg.callout,
@@ -774,6 +837,11 @@ def train(cfg: CQBPPOConfig, run_dir: str | Path, resume: bool = False, max_hour
             if params.get("critic.0.weight", jnp.zeros((0, 0))).shape[1:] != (game_cfg.obs_size + PRIV,):
                 params = {k: v for k, v in params.items() if not k.startswith("critic.")}
                 params = add_critic(params, game_cfg.obs_size, jax.random.key(cfg.seed + 11), cfg.hidden)
+        if cfg.guess_coef > 0:
+            if cfg.memory:
+                raise SystemExit("guess: not with a memory brain")
+            if "guess.weight" not in params:
+                params = add_guess(params, jax.random.key(cfg.seed + 13))
         if cfg.memory and not has_memory(params):
             params = add_memory(params, cfg.memory, jax.random.key(cfg.seed + 7))
         opt = adam_init(params)
@@ -834,7 +902,7 @@ def train(cfg: CQBPPOConfig, run_dir: str | Path, resume: bool = False, max_hour
             "met_rate": rate("met"), "cells_seen": rate("cells"),
             "win_seconds": float(m["win_seconds"]) / int(m["won"]) if int(m["won"]) else None,
             "reward_per_step": float(m["reward"]) / (T * N),
-            **{k: float(m[k]) for k in ("pg_loss", "v_loss", "entropy", "std", "clipfrac")},
+            **{k: float(m[k]) for k in ("pg_loss", "v_loss", "entropy", "std", "clipfrac", "guess_err") if k in m},
             **{f"p_{n}": float(m[f"p_{n}"]) for n in SWITCHES if f"p_{n}" in m},
         }
         if any(game_cfg.radio):   # words started per operator-second, and how likely each choice is (0: silence)
@@ -866,7 +934,9 @@ def train(cfg: CQBPPOConfig, run_dir: str | Path, resume: bool = False, max_hour
                   + f"  met {f(stats['met_rate'])}  seen {f(stats['cells_seen'])}  "
                   f"fire {stats['p_fire']:.2f} run {stats['p_run']:.2f}"
                   + (f" throw {stats['p_throw']:.3f}" if "p_throw" in stats else "")
-                  + f"  std {stats['std']:.2f}  {sps:,.0f} steps/s",
+                  + f"  std {stats['std']:.2f}"
+                  + (f"  guess err {stats['guess_err']:.3f}" if "guess_err" in stats else "")
+                  + f"  {sps:,.0f} steps/s",
                   flush=True)
         if out_of_time:
             print(f"stopped after {max_hours} h at update {update_no}; carry on with --resume", flush=True)

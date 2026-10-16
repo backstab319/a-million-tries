@@ -79,7 +79,7 @@ def test_aim_at_first_sight_matches_the_recorded_round():
     n = 8
     bis, keys, drill = jnp.arange(n) % 4, jax.random.split(jax.random.PRNGKey(5), n), jnp.zeros(n, bool)
     opp = S.SCRIPTS["camper"]
-    *_, off = jax.device_get(ES._rollout(game, cqb.ASSAULT, params, opp, bis, keys, drill))
+    *_, off, _ = jax.device_get(ES._rollout(game, cqb.ASSAULT, params, opp, bis, keys, drill))
     n_in = params["body.0.weight"].shape[1]
     step = jax.jit(lambda st, k: game.step(st, jnp.stack([
         cqb.full_action(A.best_guess(params, game.observe(st, 0)[None, :n_in])[0]),
@@ -97,7 +97,8 @@ def test_aim_at_first_sight_matches_the_recorded_round():
             st = new
         met += want < np.pi
         assert np.isclose(off[i], want, atol=5e-3), (i, off[i], want)       # float noise: batch vs one by one
-    assert met >= 2                                              # some rounds do meet
+    assert met >= 2 or p is None   # some rounds do meet (the trained brain; a fresh one, in the public repo
+                                   # without runs/, may not: every round's reading is still checked above)
 
 
 def test_a_2v1_generation_with_a_radio():
@@ -115,7 +116,7 @@ def test_a_2v1_generation_with_a_radio():
     grad, stats = jax.jit(ES.make_generation(cfg, game, cqb.ASSAULT, [S.SCRIPTS["camper"]], sig))(
         params, jax.random.PRNGKey(2), groups)
     assert set(grad) == set(sig) and all(bool(jnp.isfinite(g).all()) for g in grad.values())
-    *_, off = jax.device_get(ES._rollout(game, cqb.ASSAULT, params, S.SCRIPTS["camper"], *groups[0]))
+    *_, off, _ = jax.device_get(ES._rollout(game, cqb.ASSAULT, params, S.SCRIPTS["camper"], *groups[0]))
     assert off.shape == (2, 2) and ((off >= 0) & (off <= np.pi)).all()
 
 
@@ -132,7 +133,7 @@ def test_side_counts_are_what_the_round_did():
     n = 8
     bis, keys, drill = jnp.arange(n) % 4, jax.random.split(jax.random.PRNGKey(5), n), jnp.ones(n, bool)   # drills: they meet
     opp = S.SCRIPTS["camper"]
-    _, _, _, _, side, _ = jax.device_get(ES._rollout(game, cqb.ASSAULT, params, opp, bis, keys, drill))
+    _, _, _, _, side, _, _ = jax.device_get(ES._rollout(game, cqb.ASSAULT, params, opp, bis, keys, drill))
     step = jax.jit(lambda st, k: game.step(st, jnp.stack([
         cqb.full_action(A.best_guess(params, game.observe(st, 0)[None])[0]),
         cqb.full_action(A.best_guess(params, game.observe(st, 1)[None])[0]),

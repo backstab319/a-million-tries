@@ -2,6 +2,7 @@
 (`batch: [first, n]` replays a round exactly as it was played here; ep9 4a).
 
   uv run --group jax python scripts/cqb_pick.py <assault> <defense> [--sample assault] [--first 64 --n 64 --seed 5000]
+      [--rules runs/x:ck]   # whose rules (cqb_round's rules_from)
   uv run --group jax --group modal --env-file .env ailearns cloud script "scripts/cqb_pick.py ..." --on modal
 
 Per round: building, result, length, who saw whom first (decision), shots fired by each, share of the building
@@ -44,11 +45,12 @@ def main() -> None:
     ap.add_argument("assault")
     ap.add_argument("defense")
     ap.add_argument("--sample", default="")
+    ap.add_argument("--rules", default="", help="whose rules (runs/x:ck), as cqb_round's rules_from (e.g. a script in 2v2)")
     ap.add_argument("--first", type=int, default=64)
     ap.add_argument("--n", type=int, default=64)
     ap.add_argument("--seed", type=int, default=5000)
     a = ap.parse_args()
-    cfg = game_config(a.assault, a.defense)
+    cfg = game_config(a.rules) if a.rules else game_config(a.assault, a.defense)
     seeds = list(cqb.TEST_SEEDS)[a.first:a.first + a.n]
     game = cqb.CQBGame(cqb.make_buildings(seeds, cfg), cfg)
     A = player(a.assault, cqb.ASSAULT, a.sample in ("assault", "both"))

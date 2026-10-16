@@ -558,3 +558,130 @@ def test_callout_way_calls_the_route_not_the_bearing():
         assert int(g.callout_word(st)) == want, k
         differ += int(g.callout_word(st)) != int(bearing.callout_word(st))
     assert differ >= 4, (differ, n)                                                  # not just the bearing again
+
+
+def test_hostage_is_secured_by_staying_beside_it():
+    """ep12 hostage: it starts at an inside spot; an attacker standing beside it with a clear line for secure_time
+    wins the round for Assault; stepping away first resets the count; both sides read where it is (the last
+    HOSTAGE_OBS numbers); off, there's no hostage block and every draw is as before."""
+    from dataclasses import replace
+    from ailearns.games import cqb
+    cfg = replace(cqb.CQBConfig(), team_sizes=(2, 2), hostage=True)
+    g = cqb.CQBGame(cqb.make_buildings(list(cqb.TEST_SEEDS)[:2], cfg), cfg)
+    st = g.init(jax.random.key(3), 0)
+    lo, hi = np.asarray(g.b.foot_lo[0]), np.asarray(g.b.foot_hi[0])
+    assert (np.asarray(st.hostage) > lo).all() and (np.asarray(st.hostage) < hi).all()
+    assert g.observe(st, 0).shape == (cfg.obs_size,)
+    beside = st.hostage + jnp.array([0.4, 0.0])
+    st = st._replace(pos=st.pos.at[0].set(beside))
+    still = jnp.zeros((g.N, cqb.ACTION_SIZE)).at[:, 3:].set(-1.0)        # nobody moves, fires or does anything
+    for k in range(g.secure_steps - 1):
+        st, _ = g.step(st, still)
+        st = st._replace(pos=st.pos.at[0].set(beside))
+        assert not bool(st.done), k
+    st, _ = g.step(st, still)
+    assert bool(st.done) and int(st.outcome) == 1
+    st = g.init(jax.random.key(3), 0)._replace(pos=st.pos)                 # again, but step away half way
+    for k in range(g.secure_steps // 2):
+        st, _ = g.step(st._replace(pos=st.pos.at[0].set(beside)), still)
+    st, _ = g.step(st._replace(pos=st.pos.at[0].set(beside + 3.0)), still)
+    assert int(st.secure) == 0 and not bool(st.done)
+    off = cqb.CQBGame(cqb.make_buildings(list(cqb.TEST_SEEDS)[:2], replace(cfg, hostage=False)), replace(cfg, hostage=False))
+    s0, s1 = off.init(jax.random.key(3), 0), g.init(jax.random.key(3), 0)
+    assert np.allclose(np.asarray(s0.pos), np.asarray(s1.pos)) and np.allclose(np.asarray(s0.hostage), 0)
+    assert off.observe(s0, 0).shape[0] == cfg.obs_size - cqb.HOSTAGE_OBS
+
+
+def test_guard_walks_to_the_hostage():
+    """ep12: the scripted guard ends up beside the hostage (the check that guarding stops the securing)."""
+    from dataclasses import replace
+    from ailearns.games import cqb, cqb_scripts as S
+    cfg = replace(cqb.CQBConfig(), team_sizes=(2, 2), hostage=True)
+    g = cqb.CQBGame(cqb.make_buildings(list(cqb.TEST_SEEDS)[:4], cfg), cfg)
+    r = S.play_rounds(g, "dummy", "guard", np.arange(4), seed=1, record=True)
+    hostage = np.asarray(r["history"].hostage)[:, 0]                        # (rounds, 2): it doesn't move
+    near = np.linalg.norm(np.asarray(r["pos"])[:, g.side_ops(cqb.DEFENSE)] - hostage[:, None], axis=-1)
+    assert (near.min(1) < 3.0).mean() >= 0.75, near
+
+
+def test_deep_hostage_starts_far_from_the_ways_in():
+    """ep12 hostage_deep: the hostage starts at least that far from every entry point (or at the farthest spot)."""
+    from dataclasses import replace
+    from ailearns.games import cqb
+    cfg = replace(cqb.CQBConfig(), team_sizes=(2, 2), hostage=True, hostage_deep=6.0)
+    g = cqb.CQBGame(cqb.make_buildings(list(cqb.TEST_SEEDS)[:8], cfg), cfg)
+    for bi in range(8):
+        b = g.b
+        spots, entry = np.asarray(b.spawn[bi]), np.asarray(b.entry[bi])[:int(b.n_entries[bi])]
+        far = np.linalg.norm(spots[:, None] - entry[None], axis=-1).min(1)
+        for seed in range(4):
+            h = np.asarray(g.init(jax.random.key(seed), bi).hostage)
+            d = np.linalg.norm(entry - h, axis=1).min()
+            assert d >= min(6.0, far.max()) - 1e-4, (bi, seed, d, far)
+
+
+def test_extraction_walks_the_hostage_out():
+    """ep12 extract: secured, the hostage goes with the attacker who secured it (the round goes on); that attacker
+    walks slower; out of the house, Assault wins; the escort down, it stays where it is and must be secured again.
+    Defense knows where it is while it's being moved only when it sees it."""
+    from dataclasses import replace
+    from ailearns.games import cqb
+    cfg = replace(cqb.CQBConfig(), team_sizes=(2, 2), hostage=True, extract=True)
+    g = cqb.CQBGame(cqb.make_buildings(list(cqb.TEST_SEEDS)[:2], cfg), cfg)
+    st = g.init(jax.random.key(3), 0)
+    assert g.observe(st, 0).shape == (cfg.obs_size,) and int(st.escort) == -1
+    beside = st.hostage + jnp.array([0.4, 0.0])
+    still = jnp.zeros((g.N, cqb.ACTION_SIZE)).at[:, 3:].set(-1.0)
+    for _ in range(g.secure_steps):
+        st, _ = g.step(st._replace(pos=st.pos.at[0].set(beside)), still)
+    assert int(st.escort) == 0 and not bool(st.done)                       # secured: not yet a win
+    assert float(g.hostage_progress(st)) >= 0.5
+    D = g.side_ops(cqb.DEFENSE)[0]
+    hidden = st._replace(since=st.since.at[D, 0].set(50))                   # Defense can't see the escort
+    assert np.allclose(np.asarray(g.observe(hidden, D))[-cqb.EXTRACT_OBS - cqb.HOSTAGE_OBS:-cqb.EXTRACT_OBS - 1], 0)
+    # the escort walks slower: same order, less speed
+    go = still.at[:, 0].set(1.0)
+    moved = st
+    for _ in range(6):                                                      # up to speed (0.7 m/s more a decision)
+        moved, _ = g.step(moved, go)
+    v = np.linalg.norm(np.asarray(moved.vel), axis=1)
+    assert v[0] < v[1] - 1e-3, v
+    assert np.allclose(np.asarray(moved.hostage), np.asarray(moved.pos[0]))  # it goes with him
+    # out of the house: the win
+    out = jnp.asarray(g.b.foot_lo[0]) - 2.0
+    st2, _ = g.step(st._replace(pos=st.pos.at[0].set(out)), still)
+    assert bool(st2.done) and int(st2.outcome) == 1
+    # the escort down: it stays, not secured
+    dead = st._replace(alive=st.alive.at[0].set(False))
+    st3, _ = g.step(dead, still)
+    assert int(st3.escort) == -1 and int(st3.secure) == 0 and not bool(st3.done)
+
+
+def test_defense_hears_the_hostage_being_moved():
+    """ep12 hostage_noise: while the hostage is being moved (its escort walking), defenders within range hear it
+    (through walls less far); nobody hears a hostage that isn't moving; Assault hears nothing of it; it's in the
+    defenders' last HOSTAGE_SOUND_OBS inputs."""
+    from dataclasses import replace
+    from ailearns.games import cqb
+    cfg = replace(cqb.CQBConfig(), team_sizes=(2, 2), hostage=True, extract=True, hostage_noise=8.0)
+    g = cqb.CQBGame(cqb.make_buildings(list(cqb.TEST_SEEDS)[:2], cfg), cfg)
+    st = g.init(jax.random.key(3), 0)
+    D = g.side_ops(cqb.DEFENSE)[0]
+    near = st.hostage + jnp.array([0.5, 0.0])
+    st = st._replace(escort=jnp.asarray(0, jnp.int32), secure=jnp.asarray(g.secure_steps),
+                     pos=st.pos.at[0].set(st.hostage).at[D].set(near))
+    still = jnp.zeros((g.N, cqb.ACTION_SIZE)).at[:, 3:].set(-1.0)
+    quiet, _ = g.step(st, still)
+    assert float(quiet.hostage_heard[D, 2]) == 0                           # standing still: silent
+    walk = still.at[0, 0].set(1.0)
+    st2 = st
+    for _ in range(3):
+        st2, _ = g.step(st2, walk)
+    assert float(st2.hostage_heard[D, 2]) > 0                              # moved beside me: heard
+    assert float(st2.hostage_heard[:g.nA, 2].max()) == 0                   # Assault isn't told
+    obs = np.asarray(g.observe(st2, D))
+    assert obs.shape == (cfg.obs_size,) and obs[-1] > 0
+    far = st._replace(pos=st.pos.at[D].set(st.hostage + 30.0))
+    for _ in range(3):
+        far, _ = g.step(far, walk)
+    assert float(far.hostage_heard[D, 2]) == 0                             # 30 m away: not heard

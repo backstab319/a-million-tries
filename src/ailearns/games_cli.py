@@ -79,7 +79,8 @@ def main() -> None:
     sp.add_argument("--resume", action="store_true")
     sp.add_argument("--max-hours", type=float)
 
-    sp = sub.add_parser("train-cqb", help="train a CQB AI (Assault, by default) with PPO (needs --group jax)")
+    sp = sub.add_parser("train-cqb", help="train a CQB AI (Assault, by default) with PPO, or evolution with --es "
+                                          "(needs --group jax)")
     sp.add_argument("run", help="run directory, e.g. runs/cqb-1")
     sp.add_argument("--steps", type=float, default=200e6)
     sp.add_argument("--envs", type=int, default=2048)
@@ -123,6 +124,26 @@ def main() -> None:
     sp.add_argument("--plateau", type=int, default=0, help="stop after this many updates without a new best (0: never)")
     sp.add_argument("--stacked", type=float, default=0.0, help="share of rounds that are entry drills (start beside "
                                                                  "Defense's door)")
+    # episode 12: less ammo, the flashbang fix, the hostage
+    sp.add_argument("--spare-mags", type=int, default=3, help="magazines carried besides the loaded one (ep12: 1)")
+    sp.add_argument("--time-limit", type=float, default=45.0, help="seconds a round lasts")
+    sp.add_argument("--blind-away", type=float, default=1.0, help="flashbang blindness when it wasn't in view, x the full time (ep12: 0.25)")
+    sp.add_argument("--hostage", action="store_true", help="a hostage in the house; securing it wins for Assault (ep12)")
+    sp.add_argument("--hostage-deep", type=float, default=0.0, help="with --hostage: it starts at least this far (m) from every way in (ep12: 6)")
+    sp.add_argument("--extract", action="store_true", help="with --hostage: secured, it must be walked out of the house to win (ep12)")
+    sp.add_argument("--hostage-noise", type=float, default=0.0, help="with --extract: Defense hears it being moved this far, m (ep12: 8)")
+    # evolution strategies (ep9 on; ep12's coached evolution)
+    sp.add_argument("--es", action="store_true", help="evolution strategies instead of PPO")
+    sp.add_argument("--pop", type=int, default=256, help="es: members a generation")
+    sp.add_argument("--rounds", type=int, default=48, help="es: rounds each member plays a generation")
+    sp.add_argument("--sigma", type=float, default=0.005, help="es: size of a member's change to the brain")
+    sp.add_argument("--sigma-throw", type=float, default=0.5, help="es: ... and to its throw output")
+    sp.add_argument("--sigma-hostage", type=float, default=0.0, help="es: ... and to the hostage inputs' weights (0: as --sigma; ep12: 0.05)")
+    sp.add_argument("--lr-rel", type=float, default=0.1, help="es: step per generation, x each weight's sigma")
+    sp.add_argument("--generations", type=int, default=200, help="es: generations")
+    sp.add_argument("--guard", type=int, default=2, help="es: undo a step losing more than this many rounds (-1: off)")
+    sp.add_argument("--aim-bonus", type=float, default=0.0, help="es coaching (ranking only): up to this a round for aim on him at first sight (ep11)")
+    sp.add_argument("--hostage-bonus", type=float, default=0.0, help="es coaching (ranking only): for progress with the hostage (defenders: for denying it; ep12: 0.5)")
     sp.add_argument("--resume", action="store_true")
     sp.add_argument("--max-hours", type=float)
 
@@ -208,6 +229,23 @@ def main() -> None:
                            init_from=args.init_from, remember_heading=args.remember_heading,
                            reset_std=args.reset_std),
               args.run, resume=args.resume, max_hours=args.max_hours)
+    elif args.cmd == "train-cqb" and args.es:   # evolution (episode 12: coached, for the hostage)
+        from ailearns.agents.es_cqb import CQBESConfig
+        from ailearns.agents.es_cqb import train as evolve
+        evolve(CQBESConfig(side=args.side, init_from=args.init_from, opponent=args.opponent, time_cost=args.time_cost,
+                           flashbangs=tuple(int(x) for x in args.flashbangs.split(",")), magazine=args.magazine,
+                           health=args.health, react=args.react, pop=args.pop, rounds=args.rounds, sigma=args.sigma,
+                           sigma_throw=args.sigma_throw, generations=args.generations, seed=args.seed,
+                           lr_rel=args.lr_rel, stacked=args.stacked, guard=args.guard, aim_bonus=args.aim_bonus,
+                           house=args.house, route=args.route, feed=args.feed,
+                           teams=tuple(int(x) for x in args.teams.split(",")), bump=args.bump, ready=args.ready,
+                           stun=args.stun, share_sight=not args.no_share, split_entry=args.split,
+                           radio=tuple(int(x) for x in args.radio.split(",")), pilot=args.pilot,
+                           spare_mags=args.spare_mags, time_limit=args.time_limit, blind_away=args.blind_away,
+                           hostage=args.hostage, hostage_deep=args.hostage_deep, extract=args.extract,
+                           hostage_noise=args.hostage_noise, sigma_hostage=args.sigma_hostage,
+                           hostage_bonus=args.hostage_bonus),
+               args.run, max_hours=args.max_hours, resume=args.resume)
     elif args.cmd == "train-cqb":
         from ailearns.agents.ppo_cqb import CQBPPOConfig, train
         train(CQBPPOConfig(total_steps=int(args.steps), n_envs=args.envs, seed=args.seed, hidden=args.hidden,
@@ -220,7 +258,9 @@ def main() -> None:
                            ready=args.ready, stun=args.stun, share_sight=not args.no_share,
                            radio=tuple(int(x) for x in args.radio.split(",")), split_entry=args.split,
                            listen_coef=args.listen, signal_coef=args.signal, relay=args.relay, intel=args.intel, feed=args.feed, route=args.route, house=args.house, pilot=args.pilot, callout=args.callout, callout_way=args.callout_way, vf_warmup=args.vf_warmup, critic_priv=args.critic_priv,
-                           gamma=args.gamma),
+                           gamma=args.gamma, spare_mags=args.spare_mags, time_limit=args.time_limit,
+                           blind_away=args.blind_away, hostage=args.hostage, hostage_deep=args.hostage_deep,
+                           extract=args.extract, hostage_noise=args.hostage_noise),
               args.run, resume=args.resume, max_hours=args.max_hours)
     elif args.cmd == "eval-cqb":
         from ailearns.agents.ppo_cqb import evaluate

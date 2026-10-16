@@ -25,7 +25,7 @@ for (const ref of data.reference) {
   }
   const ok = st.outcome === ref.outcome && st.t === ref.steps;
   same += ok;
-  if (!ok && ref.steps < 200) shortMiss++;
+  if (ref.steps < 200 && (st.outcome !== ref.outcome || Math.abs(st.t - ref.steps) > 5)) shortMiss++;
   const res = (o) => (o === 1 ? "attacker wins" : "defender wins");
   console.log(`${game.nA}v${game.nD} ${name(ref.attacker)} vs ${name(ref.defender)} house ${ref.house}: JS ${res(st.outcome)} at ${(st.t / 10).toFixed(1)} s, ` +
     `Python ${res(ref.outcome)} at ${(ref.steps / 10).toFixed(1)} s ${ok ? "✓" : "✗"}; ` +
@@ -37,6 +37,9 @@ console.log(`${same}/${data.reference.length} rounds end the same way`);
 // that over 30 s; with three operators edge cases come 50% more often, and in episode 10's rounds we found: house
 // 100078 (2v1) flips "has the defender looked at cell 9" at 1.4 s, the cell 1e-7 rad from its light's edge, and still
 // ends the same; house 100104 (2v1) parts by 0.1 mm at 11.1 s with every input identical (rounding) and ends
-// differently at 21 s. So: a round under 20 s must match.
-console.log(shortMiss ? `${shortMiss} round(s) under 20 s differ: a porting bug` : "every round under 20 s matches");
+// differently at 21 s. So: a round under 20 s must match. Episode 12 (2v2, the hostage): house 100067 parts at 9.9 s
+// when the escort's run switch, a hair from its threshold, flips on a 1e-4 difference in its teammate's bearing
+// (input 137, float32 sin); every hostage input matches; the walk-out ends 0.2 s later. So: a round under 20 s must
+// end the same way and within half a second.
+console.log(shortMiss ? `${shortMiss} round(s) under 20 s differ: a porting bug` : "every round under 20 s ends the same way");
 process.exit(shortMiss ? 1 : 0);

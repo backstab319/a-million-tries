@@ -41,6 +41,9 @@ READY_OBS = 1   # and, last, how far my rifle is up (with `ready`)
 STUN_OBS = 1    # and, after it, how long I'm still stunned (with `stun`)
 ROUTE_OBS = 4   # and, after the radio, the way to the enemy I know of (with `route`)
 FEED_OBS = 8    # and, last, the drone feed (with `feed`, for the operators on it)
+HOSTAGE_OBS = 7  # and, after that, the hostage (with `hostage`, ep12): where (my frame), the way there, securing progress
+EXTRACT_OBS = 6  # and, last, the extraction (with `extract`, ep12): am I the escort, is it being moved, the way out
+HOSTAGE_SOUND_OBS = 3  # and, after that, the hostage being moved, heard (with `hostage_noise`): from where, how loud
 # and, after that, the radio (with `radio`): the last word heard (one-hot) and how fresh it is, the same for my own
 
 
@@ -202,6 +205,23 @@ class CQBConfig:
     # a round
     dt: float = 0.1               # seconds per decision
     time_limit: float = 45.0
+    # (ep12) a hostage in the house: Assault also wins by securing it: an attacker within secure_radius of it, with a
+    # clear line, for secure_time without a break. Both sides know where it is (and the way there). False: no hostage
+    hostage: bool = False
+    secure_radius: float = 1.5
+    secure_time: float = 3.0
+    hostage_deep: float = 0.0     # (ep12) the hostage starts at an inside spot at least this far (m, straight line) from
+                                  # every entry point (no spot that far: the farthest one); 0 = any inside spot
+    # (ep12, owner) extraction: securing isn't the win. The hostage then goes with the attacker who secured it (who
+    # moves at escort_speed), and Assault wins when it's out of the house (escort_out m past the footprint). The escort
+    # down: it stays where it is, to be secured again. Defense knows where it is while nobody moves it, or while it
+    # sees it being moved (not through walls). False: securing wins (as before)
+    extract: bool = False
+    escort_speed: float = 0.6
+    escort_out: float = 0.5
+    # (ep12, owner: "what would a real defender do?") a hostage being moved is heard: scuffling, steps, protests; by
+    # Defense, this many metres, less through walls like footsteps (with `extract`); 0 = silent (as before)
+    hostage_noise: float = 0.0
     win_reward: float = 1.0       # rewards are Assault's; Defense gets the negative
     time_cost: float = 0.0        # Assault, per second. Without it Assault learns to wait outside: with
                                   # discounting, a loss at the time limit weighs ~0.1 of being shot now (ep9 3c)
@@ -215,7 +235,9 @@ class CQBConfig:
                 + (HEALTH_OBS if self.health else 0) + (REACT_OBS if self.react else 0) + self.team_obs
                 + (READY_OBS if self.ready else 0) + (STUN_OBS if self.stun else 0)
                 + (radio_obs(max(self.radio)) if any(self.radio) else 0) + (ROUTE_OBS if self.route else 0)
-                + (FEED_OBS if self.feed else 0))
+                + (FEED_OBS if self.feed else 0) + (HOSTAGE_OBS if self.hostage else 0)
+                + (EXTRACT_OBS if self.hostage and self.extract else 0)
+                + (HOSTAGE_SOUND_OBS if self.hostage and self.extract and self.hostage_noise else 0))
 
     @property
     def team_obs(self) -> int:
@@ -812,6 +834,12 @@ class State(NamedTuple):
     t: jax.Array          # decisions taken
     done: jax.Array
     outcome: jax.Array    # +1 Assault won, -1 Defense won, 0 not over (or both down at once)
+    hostage: jax.Array    # (2,) where the hostage is (ep12, with `hostage`; zeros without)
+    secure: jax.Array     # decisions an attacker has been securing it without a break (with `extract`: secure_steps
+                          # while it's being moved)
+    escort: jax.Array     # (ep12, `extract`) the attacker moving the hostage (-1: nobody)
+    hostage_heard: jax.Array  # (N, 3) (ep12, `hostage_noise`) the hostage being moved, last heard: direction, loudness
+    hostage_age: jax.Array    # (N,) decisions since
 
 
 class CQBGame:
@@ -819,6 +847,7 @@ class CQBGame:
         self.b, self.cfg = buildings, cfg
         self.door_steps = int(round(cfg.door_time / cfg.dt))
         self.T = int(round(cfg.time_limit / cfg.dt))
+        self.secure_steps = max(1, int(round(cfg.secure_time / cfg.dt)))
         self.cell_frac = jnp.asarray(cell_fracs(cfg), jnp.float32)          # cell centres, 0..1 of the footprint
         self.cos_half = float(np.cos(np.deg2rad(cfg.fov / 2)))
         self.cos_aim = float(np.cos(np.deg2rad(cfg.aim)))
@@ -933,8 +962,41 @@ class CQBGame:
                    known_down=jnp.zeros((N, N), bool), hit_by=jnp.full(N, -1, jnp.int32), bumped=jnp.zeros(N, bool),
                    ready_t=jnp.full(N, self.ready_steps, jnp.int32), stun_t=jnp.zeros(N, jnp.int32),
                    said=n1, sent=n1, said_age=jnp.full(N, self.T, jnp.int32), key=key, t=z,
-                   done=jnp.asarray(False), outcome=z)
+                   done=jnp.asarray(False), outcome=z, hostage=self._hostage_spot(key, bi), secure=z,
+                   escort=jnp.asarray(-1, jnp.int32), hostage_heard=jnp.zeros((N, 3)),
+                   hostage_age=jnp.full(N, self.sound_steps, jnp.int32))
         return self._look(st)
+
+    def _hostage_spot(self, key, bi):
+        """(ep12) The hostage: one of the house's inside start spots, drawn from its own fold of the round's key (the
+        draws above stay as they were). Zeros without `hostage`."""
+        if not self.cfg.hostage:
+            return jnp.zeros(2)
+        if not self.cfg.hostage_deep:
+            k = jax.random.randint(jax.random.fold_in(key, 77), (), 0, self.cfg.spawn_points)
+            return self.b.spawn[bi, k]
+        spots, entry = self.b.spawn[bi], self.b.entry[bi]                     # deep: far from every way in
+        valid = jnp.arange(entry.shape[0]) < self.b.n_entries[bi]
+        far = jnp.where(valid[None], jnp.linalg.norm(spots[:, None] - entry[None], axis=-1), jnp.inf).min(1)
+        ok = far >= self.cfg.hostage_deep
+        k = jnp.where(ok.any(), jax.random.categorical(jax.random.fold_in(key, 77), jnp.where(ok, 0.0, -jnp.inf)),
+                      jnp.argmax(far))
+        return spots[k]
+
+    def _exit(self, st: State, p):
+        """(ep12, `extract`) The entry point nearest to p (straight line): the way out."""
+        entry = self.b.entry[st.building]
+        valid = jnp.arange(entry.shape[0]) < self.b.n_entries[st.building]
+        return entry[jnp.argmin(jnp.where(valid, jnp.linalg.norm(entry - p, axis=1), jnp.inf))]
+
+    def hostage_progress(self, st: State):
+        """(ep12, for coaching) How far Assault got with the hostage, 0..1: how far it's secured; with `extract`, half
+        for securing it and half for how near the escort has it to a way out (1 at the entry point, 0 from 10 m)."""
+        sec = st.secure / self.secure_steps
+        if not self.cfg.extract:
+            return sec
+        out = 1.0 - jnp.minimum(jnp.linalg.norm(st.hostage - self._exit(st, st.hostage)), 10.0) / 10.0
+        return 0.5 * jnp.minimum(sec, 1.0) + 0.5 * (st.escort >= 0) * out
 
     def init_stacked(self, key, building=None) -> State:
         """A drill start (ep9 3y, training only): a normal start, then Assault is moved to beside the doorway of
@@ -1074,6 +1136,8 @@ class CQBGame:
         speed = jnp.where(a[:, RUN] > 0, cfg.run, cfg.walk)
         if self.health_on:
             speed = speed * jnp.where(st.hp < cfg.wounded_below, cfg.wounded_speed, 1.0)
+        if cfg.hostage and cfg.extract:   # (ep12) moving the hostage: slower
+            speed = speed * jnp.where(jnp.arange(N) == st.escort, cfg.escort_speed, 1.0)
         want = _rot(m, face) * speed[:, None]
         dv = want - st.vel
         dv = dv * jnp.minimum(1.0, cfg.accel * cfg.dt / jnp.maximum(jnp.linalg.norm(dv, axis=1, keepdims=True), 1e-9))
@@ -1363,18 +1427,32 @@ class CQBGame:
             obs.append(self._radio_obs(st, me))
         if self.cfg.route:  # (after that) the way to the enemy I know of
             obs.append(self._route_obs(st, me, order[0] if self.teams_on else 1 - who))
-        if self.cfg.feed:   # (last) the drone feed, its own numbers
+        if self.cfg.feed:   # (after that) the drone feed, its own numbers
             obs.append(self._feed_obs(st, me))
+        if self.cfg.hostage:   # (ep12) the hostage: where (my frame), the way there, how far it's secured
+            known = jnp.asarray(True)
+            if self.cfg.extract and self.team[me] == DEFENSE:   # being moved: Defense knows where only while it sees it
+                known = (st.escort < 0) | (st.since[me, jnp.maximum(st.escort, 0)] == 0)
+            r = routes(self, st, me)
+            rel = jnp.where(known, _rot(st.hostage - st.pos[me], -st.face[me]) / self.cfg.sight, 0.0)
+            obs.append(jnp.concatenate([rel, self._way(st, me, st.hostage, known, r),
+                                        (st.secure / self.secure_steps)[None].astype(jnp.float32)]))
+            if self.cfg.extract:   # (last) am I moving it, is anyone, and (Assault) the way out from here
+                out = self._way(st, me, self._exit(st, st.pos[me]), jnp.asarray(self.team[me] == ASSAULT), r)
+                obs.append(jnp.concatenate([jnp.stack([st.escort == me, st.escort >= 0]).astype(jnp.float32), out]))
+                if self.cfg.hostage_noise:   # (last) the hostage being moved, heard: where from (my frame), how loud
+                    hh = st.hostage_heard[me]
+                    obs.append(jnp.concatenate([_rot(hh[:2], -st.face[me]) * (hh[2] > 0), hh[2:]]))
         return jnp.concatenate(obs)
 
-    def _way(self, st: State, me: int, spot, known):
+    def _way(self, st: State, me: int, spot, known, r=None):
         """The way from `me` to `spot` (a point it knows of): the direction (my frame) to the next waypoint of the
         shortest walk there (straight at it when nothing's in between), the walking distance (/ 2 x sight, at most 1),
         and a 1 that it knows a way. Zeros unless `known`."""
         b, bi, p = self.b, st.building, st.pos[me]
         nodes = b.nav_nodes[bi]
         lo, hi = _walls_cover(self, bi)
-        vis, dist, via = routes(self, st, me)
+        vis, dist, via = routes(self, st, me) if r is None else r
         last = jnp.where(_clear(spot, nodes, lo, hi) & (nodes[:, 0] > FAR / 2),
                          jnp.linalg.norm(nodes - spot, axis=1), 1e5)       # waypoints in plain view of the spot
         total = dist + last
@@ -1553,6 +1631,28 @@ class CQBGame:
         take = heard[:, 2] > 0
         return st._replace(bang_heard=jnp.where(take[:, None], heard, old), bang_age=jnp.where(take, 0, age))
 
+    def _hear_hostage(self, st: State) -> State:
+        """(ep12, `hostage_noise`) Defense hears the hostage while it's being moved (its escort walking): hostage_noise
+        metres, a third less per wall or shut door, like footsteps; held for sound_memory like other sounds."""
+        cfg = self.cfg
+        k = 2 * jnp.pi / cfg.sound_dirs
+        e = jnp.maximum(st.escort, 0)
+        moving = (st.escort >= 0) & st.alive[e] & (jnp.linalg.norm(st.vel[e]) > cfg.still)
+
+        def listen(w):
+            d = st.hostage - st.pos[w]
+            reach = jnp.where(moving, cfg.hostage_noise, 0.0) * cfg.through_wall ** self.walls_between(st, st.pos[w],
+                                                                                                     st.hostage)
+            loud = jnp.where(reach > 0, jnp.clip(1 - jnp.linalg.norm(d) / jnp.maximum(reach, 1e-6), 0, 1), 0.0)
+            ang = jnp.round(jnp.arctan2(d[1], d[0]) / k) * k
+            return jnp.stack([jnp.cos(ang), jnp.sin(ang), loud])
+
+        heard = jnp.stack([listen(w) for w in range(self.N)]) * jnp.asarray(self.team == DEFENSE)[:, None]
+        age = jnp.minimum(st.hostage_age + 1, self.sound_steps)
+        old = jnp.where((age < self.sound_steps)[:, None], st.hostage_heard, 0.0)
+        take = heard[:, 2] > 0
+        return st._replace(hostage_heard=jnp.where(take[:, None], heard, old), hostage_age=jnp.where(take, 0, age))
+
     def _hear_reload(self, st: State) -> State:
         """A magazine change (an enemy's, starting this decision) is heard like footsteps: hear_reload metres,
         a third less per wall or shut door."""
@@ -1613,9 +1713,38 @@ class CQBGame:
         if self.guns_on:
             new = self._hear_reload(new)
         a_down, d_down = self.sides_out(new.alive)
-        timeout = (new.t >= self.T) & ~a_down & ~d_down
-        outcome = jnp.where(d_down & ~a_down, 1, jnp.where(a_down & ~d_down, -1, jnp.where(timeout, -1, 0)))
-        done = a_down | d_down | timeout
+        secured = jnp.asarray(False)
+        if cfg.hostage:   # (ep12) an attacker beside the hostage, with a clear line, adds a decision; else it resets
+            lo, hi = self.walls(new)
+            ops = jnp.asarray(self.side_ops(ASSAULT))
+            if cfg.extract:   # being moved: it goes where its escort went; the escort down: it stays, not secured
+                e = jnp.maximum(new.escort, 0)
+                lost = (new.escort >= 0) & ~new.alive[e]
+                new = new._replace(escort=jnp.where(lost, -1, new.escort), secure=jnp.where(lost, 0, new.secure),
+                                   hostage=jnp.where((new.escort >= 0) & ~lost, new.pos[e], new.hostage))
+            d = jnp.linalg.norm(new.pos[ops] - new.hostage, axis=1)
+            near = (d <= cfg.secure_radius) & new.alive[ops] & _clear(new.hostage, new.pos[ops], lo, hi)
+            if cfg.extract:   # secured: the nearest attacker beside it takes it; out of the house: the win
+                free = new.escort < 0
+                secure = jnp.where(free, jnp.where(near.any(), new.secure + 1, 0), new.secure)
+                taken = free & (secure >= self.secure_steps)
+                who = ops[jnp.argmin(jnp.where(near, d, jnp.inf))]
+                new = new._replace(secure=secure, escort=jnp.where(taken, who, new.escort).astype(jnp.int32),
+                                   hostage=jnp.where(taken, new.pos[who], new.hostage))
+                bi = new.building
+                out = ((new.hostage < self.b.foot_lo[bi] - cfg.escort_out)
+                       | (new.hostage > self.b.foot_hi[bi] + cfg.escort_out)).any()
+                secured = (new.escort >= 0) & out & ~a_down & ~d_down
+                if cfg.hostage_noise:
+                    new = self._hear_hostage(new)
+            else:
+                secure = jnp.where(near.any(), new.secure + 1, 0)
+                new = new._replace(secure=secure)
+                secured = (secure >= self.secure_steps) & ~a_down & ~d_down
+        timeout = (new.t >= self.T) & ~a_down & ~d_down & ~secured
+        outcome = jnp.where(d_down & ~a_down, 1, jnp.where(a_down & ~d_down, -1,
+                                                           jnp.where(secured, 1, jnp.where(timeout, -1, 0))))
+        done = a_down | d_down | timeout | secured
         reward = cfg.win_reward * outcome - cfg.time_cost * cfg.dt
         new = new._replace(done=done, outcome=outcome)
         new = jax.tree.map(lambda x, y: jnp.where(st.done, x, y), st, new)   # frozen once over
