@@ -13,6 +13,10 @@ FLOOR = (34, 38, 50)
 WALL = (150, 158, 178)
 DOOR = T.AMBER
 COVER = (104, 96, 84)
+# (ep13) homes, as the web game's top-down (web/cqb/app.js): inside walls, furniture under 1 m, windows
+DRYWALL = (108, 116, 137)
+LOW = (75, 73, 84)
+WINDOW = (125, 211, 252)
 ASSAULT = T.BLUE
 DEFENSE = T.RED
 
@@ -38,15 +42,21 @@ class View:
 
 
 def draw_building(surf: pygame.Surface, b: dict, view: View, doors_open=None, starts: bool = False) -> None:
-    """The yard, floors, walls, cover and doors (closed: a bar in the doorway; open: just the gap).
+    """The yard, floors, walls, cover and doors (closed: a bar in the doorway; open: just the gap). Homes (ep13) also
+    draw furniture under 1 m, windows and inside walls (drywall) in their own colours, as the web game's top-down.
     `starts` also marks Assault's entry points (blue arrows) and Defense's start spots (red dots)."""
     surf.fill(YARD, view.box(view.lo, view.lo + np.asarray(view.yard)))
     for lo, hi in b["rooms"]:
         surf.fill(FLOOR, view.box(lo, hi))
+    for lo, hi in zip(b.get("low_lo", ()), b.get("low_hi", ())):
+        surf.fill(LOW, view.box(lo, hi))
     for lo, hi in zip(b["cover_lo"], b["cover_hi"]):
         surf.fill(COVER, view.box(lo, hi))
-    for lo, hi in zip(b["wall_lo"], b["wall_hi"]):
-        surf.fill(WALL, view.box(lo, hi))
+    soft = b.get("wall_soft", np.zeros(len(b["wall_lo"]), bool))
+    for lo, hi, dry in zip(b["wall_lo"], b["wall_hi"], soft):
+        surf.fill(DRYWALL if dry else WALL, view.box(lo, hi))
+    for lo, hi in zip(b.get("win_lo", ()), b.get("win_hi", ())):
+        surf.fill(WINDOW, view.box(lo, hi))
     for i, d in enumerate(b["doors"]):
         if doors_open is None or not doors_open[i]:
             surf.fill(DOOR, view.box(d["lo"], d["hi"]))

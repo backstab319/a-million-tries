@@ -221,7 +221,7 @@ def walker_flash(game: CQBGame, st: State, who: int, key=None):
     near = jnp.linalg.norm(p - jnp.clip(p, dlo, dhi)) <= 2.0
     want = heading & near & unseen & ~flashed & (beyond < R) & (st.bangs[who] > 0)
     live = st.bang_timer[who] > 0
-    lo, hi = game.boxes(st)
+    lo, hi = game.boxes(st, walk=True)
     olo, ohi = game.walls(st._replace(door_open=st.door_open.at[k].set(True)))   # as if the door were open
     # two stack spots, one each side of the doorway (0.5 m out, 0.9 m along the wall), each with a spot further
     # along to wait in; from each, throws aimed at points across the opening that land in the room with a wall
@@ -391,7 +391,8 @@ def play_rounds(game: CQBGame, assault, defense, buildings, seed: int = 0, recor
     D = SCRIPTS.get(defense, defense)
     last, first, hist = jax.jit(lambda b: rounds(game, A, D, b, seed, record, stacked))(jnp.asarray(buildings))
     out = {"outcome": jax.device_get(last.outcome), "t": jax.device_get(last.t), "alive": jax.device_get(last.alive),
-           "pos": jax.device_get(last.pos), "first_seen": jax.device_get(first)}
+           "pos": jax.device_get(last.pos), "first_seen": jax.device_get(first),
+           "hostage_hit_by": jax.device_get(last.hostage_hit_by)}   # (ep13) the side that hit the hostage, -1: nobody
     if record:
         out["history"] = jax.device_get(hist)
     return out

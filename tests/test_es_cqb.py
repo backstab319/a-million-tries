@@ -139,16 +139,47 @@ def test_side_counts_are_what_the_round_did():
         cqb.full_action(A.best_guess(params, game.observe(st, 1)[None])[0]),
         cqb.full_action(opp(game, st, 2, k))]))[0])
     for i in range(n):
-        st, want = game.init_stacked(keys[i], bis[i]), np.zeros(5, int)
+        st, want = game.init_stacked(keys[i], bis[i]), np.zeros(9, int)
+        last_at, since = np.full((2, 2), np.inf), np.full(2, ES.DOOR_LOOP + 1)
+        sw = tuple(jnp.zeros(2, t) for t in (jnp.float32,) * 5 + (bool,))
+        lo, hi = np.asarray(game.b.foot_lo[bis[i]]), np.asarray(game.b.foot_hi[bis[i]])
         for k in jax.random.split(jax.random.fold_in(keys[i], 1), game.T):
             if bool(st.done):
                 break
             new = step(st, k)
             fell = np.asarray(st.alive[:2]) & ~np.asarray(new.alive[:2])
+            sw, back = ES._swing(sw, cqb._wrap(new.face[:2] - st.face[:2]), st.alive[:2])
+            ev, at = np.asarray(new.door_event[:2]), np.asarray(new.door_at[:2])
+            loops = int((ev & (since <= ES.DOOR_LOOP) & (np.abs(at - last_at).max(-1) < 0.05)).sum())
+            last_at = np.where(ev[:, None], at, last_at)
+            since = np.where(ev, 0, np.minimum(since + 1, ES.DOOR_LOOP + 1))
             want += [1, int(np.asarray(new.bumped[:2]).sum()), int(np.asarray(new.sound_age[2, 0]) == 0),
                      int((fell & np.isin(np.asarray(new.hit_by[:2]), [0, 1])).sum()),
-                     int(((np.asarray(new.said_age[:2]) == 0) & (np.asarray(new.said[:2]) > 0)).sum())]
+                     int(((np.asarray(new.said_age[:2]) == 0) & (np.asarray(new.said[:2]) > 0)).sum()),
+                     int(np.asarray(st.alive[:2]).sum()),
+                     int((np.asarray(st.alive[:2]) & ((np.asarray(st.pos[:2]) >= lo) & (np.asarray(st.pos[:2]) <= hi)).all(-1)
+                          & (np.linalg.norm(np.asarray(new.pos[:2]) - np.asarray(st.pos[:2]), axis=-1)
+                             > rules.walk * 1.1 * rules.dt)).sum()), int(back), loops]
             st = new
         assert (side[i] == want).all(), (i, side[i], want)
     assert side[:, 4].sum() > 0 and side[:, 1].sum() > 0                                  # words and crashes happened
     assert (side[:, 0] < game.T).any()                                                    # and some round ended early
+    assert side[:, 6].sum() > 0                                                           # (ep13) and they ran inside
+
+
+def test_swing_counts_back_and_forths():
+    """(ep13 8.15) A turn of 90 then back 70 is one back-and-forth (counted once); wiggles under 30 degrees and a turn
+    back of only 50 are not; nothing counts while he's down."""
+    def run(degs, up=True):
+        sw = tuple(jnp.zeros(1, t) for t in (jnp.float32,) * 5 + (bool,))
+        n = 0
+        for d in degs:
+            sw, b = ES._swing(sw, jnp.radians(jnp.asarray([float(d)])), jnp.asarray([up]))
+            n += int(b)
+        return n
+    assert run([10] * 9 + [-10] * 7) == 1                  # 90 one way, 70 back
+    assert run([10] * 9 + [-10] * 7 + [-10] * 5) == 1      # carrying on the same way doesn't count again
+    assert run([10] * 9 + [-10] * 7 + [10] * 7) == 2       # and forth again: a second one
+    assert run([10] * 9 + [-10] * 5) == 0                  # 50 back: not big enough
+    assert run(([10, 10, -10, -10]) * 10) == 0             # wiggles of 20
+    assert run([10] * 9 + [-10] * 7, up=False) == 0        # down: nothing

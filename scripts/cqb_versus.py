@@ -45,6 +45,10 @@ def main():
     ap.add_argument("--extract", action="store_true")
     ap.add_argument("--hostage-noise", type=float, default=0.0, help="Defense hears the hostage being moved this far (m)")
     ap.add_argument("--flash-defense", type=int, default=0, help="flashbangs for each defender (0: the rules' own)")
+    ap.add_argument("--house", default="", help="a building preset (cqb.HOUSES; ep13: home)")
+    ap.add_argument("--through-drywall", type=float, default=0.0, help="ep13: hit chance kept per drywall layer (0: off)")
+    ap.add_argument("--unseen-hit", type=float, default=0.5, help="ep13: x this for a target the shooter can't see")
+    ap.add_argument("--hostage-hit", action="store_true", help="ep13: the hostage can be hit (the side that hits it loses)")
     ap.add_argument("--houses", default="64-191", help="test house indices a-b")
     ap.add_argument("--seeds", default="5000,5001")
     a = ap.parse_args()
@@ -54,15 +58,18 @@ def main():
                   team_sizes=tuple(int(x) for x in a.teams.split(",")), spare_mags=a.spare, split_entry=a.split,
                   blind_away=a.blind_away, hostage=a.hostage, hostage_deep=a.hostage_deep, extract=a.extract, hostage_noise=a.hostage_noise)
     cfg = replace(cfg, flashbangs=(cfg.flashbangs[0], a.flash_defense or cfg.flashbangs[1]))
+    cfg = replace(cfg, **cqb.HOUSES[a.house], through_drywall=a.through_drywall, unseen_hit=a.unseen_hit,
+                  hostage_hit=a.hostage_hit)
     lo, _, hi = a.houses.partition("-")
     houses = list(cqb.TEST_SEEDS)[int(lo):int(hi or lo) + 1]
     g = cqb.CQBGame(cqb.make_buildings(houses, cfg), cfg)
     seeds = [int(s) for s in a.seeds.split(",")]
     goal = "out" if a.extract else "secured"
     print(f"{a.teams.replace(',', 'v')}, split {a.split}, hostage {a.hostage} (deep {a.hostage_deep}, extract "
-          f"{a.extract}), {len(houses)} houses x {len(seeds)} seeds\n")
-    print(f"| Assault | Defense | Assault wins | hostage {goal} | Defense by kills | time-outs | mean round |\n"
-          "|---|---|---|---|---|---|---|", flush=True)
+          f"{a.extract}), house {a.house or 'kill'}, drywall {a.through_drywall}, hostage hit {a.hostage_hit}, "
+          f"{len(houses)} houses x {len(seeds)} seeds\n")
+    print(f"| Assault | Defense | Assault wins | hostage {goal} | Defense by kills | time-outs | hostage hit (A / D) "
+          "| mean round |\n|---|---|---|---|---|---|---|---|", flush=True)
     for att in a.assault.split(","):
         for dfn in a.defense.split(","):
             res = []
@@ -72,12 +79,14 @@ def main():
                 al, out = np.asarray(r["alive"]), np.asarray(r["outcome"])
                 a_up = al[:, g.side_ops(cqb.ASSAULT)].any(1)
                 d_up = al[:, g.side_ops(cqb.DEFENSE)].any(1)
-                res.append((np.mean(out == 1), np.mean((out == 1) & d_up), np.mean(d_up & ~a_up),
-                            np.mean(a_up & d_up & (out != 1)), np.mean(r["t"]) * cfg.dt))
+                hb = np.asarray(r["hostage_hit_by"])
+                res.append((np.mean(out == 1), np.mean((out == 1) & d_up & (hb < 0)), np.mean(d_up & ~a_up),
+                            np.mean(a_up & d_up & (out != 1) & (hb < 0)), np.mean(hb == cqb.ASSAULT),
+                            np.mean(hb == cqb.DEFENSE), np.mean(r["t"]) * cfg.dt))
             o = np.mean(res, 0)
             name = lambda s: s.split("/")[-1].replace("cqb-", "")   # noqa: E731
-            print(f"| {name(att)} | {name(dfn)} | {o[0]:.0%} | {o[1]:.0%} | {o[2]:.0%} | {o[3]:.0%} | {o[4]:.1f} s |",
-                  flush=True)
+            print(f"| {name(att)} | {name(dfn)} | {o[0]:.0%} | {o[1]:.0%} | {o[2]:.0%} | {o[3]:.0%} | "
+                  f"{o[4]:.0%} / {o[5]:.0%} | {o[6]:.1f} s |", flush=True)
 
 
 if __name__ == "__main__":

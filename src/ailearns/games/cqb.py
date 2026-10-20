@@ -54,6 +54,10 @@ HOUSES = {
     "": {},
     "big": dict(rooms=(8, 12), width=(20.0, 34.0), depth=(12.0, 26.0), yard_w=48.0, yard_h=38.0, cover=(2, 8),
                 max_walls=32, max_doors=16, max_cover=8, max_rooms=12),
+    # (ep13) a realistic single-storey home (games/cqb_home.py): a hallway with the bedrooms and bathroom off it, a
+    # living room and a kitchen; low furniture (blocks movement), tall furniture (the cover), windows
+    "home": dict(layout="home", width=(15.0, 22.0), depth=(9.5, 13.0), max_walls=56, max_doors=12, max_cover=12,
+                 max_low=20, max_windows=14, max_rooms=10),
 }
 
 def radio_obs(words: int) -> int:
@@ -90,7 +94,10 @@ class CQBConfig:
     cover_gap: float = 0.9        # cover stays this far from walls and other cover (no dead ends)
     entry_dist: float = 2.5       # Assault starts this far outside its door
     spawn_points: int = 64        # Defense start points per building
+    layout: str = ""              # (ep13) "" a kill house (make_building); "home" a realistic home (cqb_home.py)
     # padding (fixed shapes for JAX)
+    max_low: int = 0              # (ep13, homes) low furniture: blocks movement, not sight or shots
+    max_windows: int = 0          # (ep13, homes) windows: block movement, not sight or shots
     max_walls: int = 20
     max_doors: int = 8
     max_cover: int = 4
@@ -119,6 +126,11 @@ class CQBConfig:
     move_penalty: float = 0.6     # x(1 - this) while moving at walking speed (and you can't fire running)
     turn_penalty: float = 0.5     # x(1 - this) while turning at full rate
     flash: float = 0.2            # seconds a muzzle flash shows the shooter to anyone with a clear line
+    # (ep13, homes) bullets through drywall: a shot also goes on through inside walls and shut inside doors (drywall,
+    # hollow doors) to the first body on its aim line, at this much of the hit chance per layer; outside walls (brick),
+    # outside doors and tall furniture stop it. 0 = off: a shot only hits someone the shooter sees (the game before)
+    through_drywall: float = 0.0
+    unseen_hit: float = 0.5       # ...and x this for a target the shooter can't see (aimed at a guess, not a body)
     # sound (heard through walls: each wall or shut door in the way cuts the range by a third)
     hear_run: float = 10.0        # metres: running footsteps
     hear_walk: float = 4.0        # walking footsteps (standing still is silent)
@@ -222,6 +234,9 @@ class CQBConfig:
     # (ep12, owner: "what would a real defender do?") a hostage being moved is heard: scuffling, steps, protests; by
     # Defense, this many metres, less through walls like footsteps (with `extract`); 0 = silent (as before)
     hostage_noise: float = 0.0
+    # (ep13) the hostage can be hit: it's a body on a shot's line like an operator (seen, or behind drywall), and a hit
+    # on it ends the round, lost for the side that fired. Being walked out it stays half a metre behind its escort
+    hostage_hit: bool = False
     win_reward: float = 1.0       # rewards are Assault's; Defense gets the negative
     time_cost: float = 0.0        # Assault, per second. Without it Assault learns to wait outside: with
                                   # discounting, a loss at the time limit weighs ~0.1 of being shot now (ep9 3c)
@@ -333,6 +348,15 @@ def _room_at(rooms, p):
         if (p > l).all() and (p < h).all():
             return k
     return -1
+
+
+def house(seed: int, cfg: CQBConfig = CQBConfig()) -> dict:
+    """The building a seed makes under these rules: a home (ep13, cfg.layout "home") or a kill house. For drawing and
+    analysis; the game builds its own the same way (make_buildings)."""
+    if cfg.layout == "home":
+        from ailearns.games.cqb_home import make_home
+        return make_home(seed, cfg)
+    return make_building(seed, cfg)
 
 
 def make_building(seed: int, cfg: CQBConfig = CQBConfig()) -> dict:
@@ -457,8 +481,8 @@ def cell_points(b: dict, cfg: CQBConfig = CQBConfig(), clear: float = 0.45) -> n
     lo, hi = b["lo"], b["hi"]
     size = (hi - lo) / np.array(cfg.seen_grid)
     centres = lo + cell_fracs(cfg) * (hi - lo)
-    blo = np.vstack([b["wall_lo"], b["cover_lo"]])
-    bhi = np.vstack([b["wall_hi"], b["cover_hi"]])
+    blo = np.vstack([b["wall_lo"], b["cover_lo"], b.get("low_lo", np.zeros((0, 2))), b.get("win_lo", np.zeros((0, 2)))])
+    bhi = np.vstack([b["wall_hi"], b["cover_hi"], b.get("low_hi", np.zeros((0, 2))), b.get("win_hi", np.zeros((0, 2)))])
     gap = lambda q: np.linalg.norm(q[:, None] - np.clip(q[:, None], blo[None], bhi[None]), axis=2).min(1)
     out = centres.copy()
     u = np.linspace(-0.45, 0.45, 19)
@@ -536,11 +560,20 @@ def nav_graph(b: dict, cfg: CQBConfig = CQBConfig(), body: float = 0.32, cells=N
             corner_pts += [lo, hi, np.array([lo[0], hi[1]]), np.array([hi[0], lo[1]])]
         else:
             corner_pts += [np.full(2, FAR)] * 4
+    if cfg.layout == "home":   # (ep13) low furniture's corners too
+        for c in range(cfg.max_low):
+            if c < len(b["low_lo"]):
+                lo, hi = b["low_lo"][c] - m, b["low_hi"][c] + m
+                corner_pts += [lo, hi, np.array([lo[0], hi[1]]), np.array([hi[0], lo[1]])]
+            else:
+                corner_pts += [np.full(2, FAR)] * 4
     nodes = np.vstack([cells, np.array(door_pts), np.array(corner_pts)])
     N = len(nodes)
     real = nodes[:, 0] > FAR / 2
-    lo = np.vstack([b["wall_lo"], b["cover_lo"]]) - body
-    hi = np.vstack([b["wall_hi"], b["cover_hi"]]) + body
+    walk = [b["wall_lo"], b["cover_lo"]] + ([b["low_lo"], b["win_lo"]] if cfg.layout == "home" else [])
+    walk_hi = [b["wall_hi"], b["cover_hi"]] + ([b["low_hi"], b["win_hi"]] if cfg.layout == "home" else [])
+    lo = np.vstack(walk) - body
+    hi = np.vstack(walk_hi) + body
     yard = np.array([cfg.yard_w, cfg.yard_h])
     real &= (nodes > cfg.radius).all(1) & (nodes < yard - cfg.radius).all(1)
     real &= ~(((nodes[:, None] > lo[None]) & (nodes[:, None] < hi[None])).all(2)).any(1)  # not in a wall or crate
@@ -593,6 +626,12 @@ class Buildings(NamedTuple):
     nav_door: jnp.ndarray = None     # (B, K) the door a doorway waypoint belongs to (-1 for others)
     nav_dist: jnp.ndarray = None     # (B, K, K) walking distance between waypoints (1e4: no way)
     nav_next: jnp.ndarray = None     # (B, K, K) next waypoint on the way
+    # (ep13, homes) what blocks movement only: low furniture and windows (the tall furniture is the cover)
+    low_lo: jnp.ndarray = None       # (B, L, 2)
+    low_hi: jnp.ndarray = None
+    win_lo: jnp.ndarray = None       # (B, Wn, 2)
+    win_hi: jnp.ndarray = None
+    wall_soft: jnp.ndarray = None    # (B, W) (ep13, homes) an inside wall piece (drywall); outside ones are brick
 
 
 TRAIN_SEEDS = range(0, 1024)          # buildings it learns in
@@ -608,8 +647,16 @@ def _building_arrays(s: int, cfg: CQBConfig) -> dict:
         x = np.asarray(x, float).reshape(len(x), w)
         return np.vstack([x, np.full((n - len(x), x.shape[1]), fill)]) if len(x) < n else x
 
-    b = make_building(s, cfg)
+    if cfg.layout == "home":   # (ep13)
+        from ailearns.games.cqb_home import make_home
+        b = make_home(s, cfg)
+    else:
+        b = make_building(s, cfg)
     D, E, R = cfg.max_doors, cfg.max_entries, cfg.max_rooms
+    for k, n in (("wall_lo", cfg.max_walls), ("cover_lo", cfg.max_cover), ("low_lo", cfg.max_low),
+                 ("win_lo", cfg.max_windows)):
+        assert k not in b or len(b[k]) <= n, f"building {s}: {len(b[k])} {k[:-3]} boxes, room for {n}"
+    assert len(b["doors"]) <= D and len(b["rooms"]) <= R and len(b["entries"]) <= E, s
     cells = cell_points(b, cfg)                                              # worked out once, used three times
     g, nav = room_graph(b, cfg, cells), nav_graph(b, cfg, cells=cells)
     dr = np.full((D, 2), R, np.int32)
@@ -631,6 +678,10 @@ def _building_arrays(s: int, cfg: CQBConfig) -> dict:
         "spawn_room": np.asarray(b["spawn_room"], np.int32),
         "nav_nodes": nav["nodes"], "nav_door": nav["door_of"],
         "nav_dist": np.where(np.isfinite(nav["dist"]), nav["dist"], 1e4), "nav_next": nav["next"],
+        **({"low_lo": pad(b["low_lo"], cfg.max_low), "low_hi": pad(b["low_hi"], cfg.max_low),
+            "win_lo": pad(b["win_lo"], cfg.max_windows), "win_hi": pad(b["win_hi"], cfg.max_windows),
+            "wall_soft": np.concatenate([b["wall_soft"], np.zeros(cfg.max_walls - len(b["wall_soft"]), bool)])}
+           if cfg.layout == "home" else {}),
     }
 
 
@@ -642,6 +693,9 @@ def buildings_key(seeds, cfg: CQBConfig = CQBConfig()) -> str:
     import re
     fns = [_split_rooms, _segments, _place_door, _wall_boxes, _box, _room_at, make_building, cell_fracs, cell_points,
            room_graph, nav_graph, _building_arrays]
+    if cfg.layout == "home":   # (ep13) the home generator too
+        from ailearns.games import cqb_home as H
+        fns += [H._strip, H._furnish, H._connected, H._mirror, H._seen_from, H.make_home]
     src = "".join(inspect.getsource(f) for f in fns)
     used = sorted(set(re.findall(r"cfg\.(\w+)", src)))
     blob = src + repr([(k, getattr(cfg, k)) for k in used]) + repr([int(x) for x in seeds])
@@ -670,7 +724,7 @@ def make_buildings(seeds, cfg: CQBConfig = CQBConfig(), cache: bool = True) -> B
         hit = next((d / name for d in _cache_dirs() if (d / name).exists()), None)
         if hit is not None:
             with np.load(hit) as z:
-                return _to_buildings({k: z[k] for k in Buildings._fields})
+                return _to_buildings({k: z[k] for k in Buildings._fields if k in z})
         path = _cache_dirs()[0] / name
     if len(seeds) >= 128:
         import multiprocessing as mp
@@ -680,7 +734,7 @@ def make_buildings(seeds, cfg: CQBConfig = CQBConfig(), cache: bool = True) -> B
             per = list(ex.map(_building_arrays, seeds, [cfg] * len(seeds), chunksize=16))
     else:
         per = [_building_arrays(s, cfg) for s in seeds]
-    out = {k: np.stack([np.asarray(b[k]) for b in per]) for k in Buildings._fields}
+    out = {k: np.stack([np.asarray(b[k]) for b in per]) for k in Buildings._fields if k in per[0]}
     if path is not None:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -742,7 +796,10 @@ def _clear(p, q, lo, hi):
 def _walls_cover(game, bi):
     """Walls and cover, widened by a bit under an operator's radius (pressed against a wall it's 0.3 m from it)."""
     b, k = game.b, game.cfg.radius - 0.05
-    return (jnp.concatenate([b.wall_lo[bi], b.cover_lo[bi]]) - k, jnp.concatenate([b.wall_hi[bi], b.cover_hi[bi]]) + k)
+    more = game.cfg.layout == "home"   # (ep13) low furniture and windows: in the way of walking too
+    lo = [b.wall_lo[bi], b.cover_lo[bi]] + ([b.low_lo[bi], b.win_lo[bi]] if more else [])
+    hi = [b.wall_hi[bi], b.cover_hi[bi]] + ([b.low_hi[bi], b.win_hi[bi]] if more else [])
+    return jnp.concatenate(lo) - k, jnp.concatenate(hi) + k
 
 
 def routes(game, st, who: int):
@@ -840,6 +897,7 @@ class State(NamedTuple):
     escort: jax.Array     # (ep12, `extract`) the attacker moving the hostage (-1: nobody)
     hostage_heard: jax.Array  # (N, 3) (ep12, `hostage_noise`) the hostage being moved, last heard: direction, loudness
     hostage_age: jax.Array    # (N,) decisions since
+    hostage_hit_by: jax.Array = -1  # (ep13, `hostage_hit`) the side whose shot hit the hostage (-1: nobody)
 
 
 class CQBGame:
@@ -964,7 +1022,7 @@ class CQBGame:
                    said=n1, sent=n1, said_age=jnp.full(N, self.T, jnp.int32), key=key, t=z,
                    done=jnp.asarray(False), outcome=z, hostage=self._hostage_spot(key, bi), secure=z,
                    escort=jnp.asarray(-1, jnp.int32), hostage_heard=jnp.zeros((N, 3)),
-                   hostage_age=jnp.full(N, self.sound_steps, jnp.int32))
+                   hostage_age=jnp.full(N, self.sound_steps, jnp.int32), hostage_hit_by=jnp.asarray(-1, jnp.int32))
         return self._look(st)
 
     def _hostage_spot(self, key, bi):
@@ -1018,7 +1076,7 @@ class CQBGame:
         into = jnp.zeros(2).at[axis].set(jnp.where(b.door_rooms[bi, k, 1] == r, 1.0, -1.0))   # into Defense's room
         across = jnp.stack([-into[1], into[0]])
         back = mid - into * 0.5
-        lo, hi = self.boxes(st)
+        lo, hi = self.boxes(st, walk=True)
         free = _cast(back, jnp.stack([across, -across]), lo, hi, cfg)
         side = jnp.where(free[0] >= free[1], across, -across)
         spot = back + side * jnp.clip(free.max() - cfg.radius - 0.05, 0.0, 0.9)
@@ -1039,12 +1097,16 @@ class CQBGame:
         return self._look(st._replace(seen=jnp.zeros((N, N), bool), since=jnp.full((N, N), self.T),
                                       aim=jnp.zeros((N, N), jnp.int32)))
 
-    def boxes(self, st: State, door_open=None):
-        """Everything solid right now: walls, cover and closed doors (open doors parked far away)."""
+    def boxes(self, st: State, door_open=None, walk: bool = False):
+        """Everything solid right now: walls, cover and closed doors (open doors parked far away). walk: what stops a
+        body, with (ep13, homes) low furniture and windows too, which don't stop sight, light or shots."""
         b, bi = self.b, st.building
         shut = (~(st.door_open if door_open is None else door_open) & b.door_valid[bi])[:, None]
-        lo = jnp.concatenate([b.wall_lo[bi], b.cover_lo[bi], jnp.where(shut, b.door_lo[bi], FAR)])
-        hi = jnp.concatenate([b.wall_hi[bi], b.cover_hi[bi], jnp.where(shut, b.door_hi[bi], FAR)])
+        more = walk and self.cfg.layout == "home"
+        lo = jnp.concatenate([b.wall_lo[bi], b.cover_lo[bi]] + ([b.low_lo[bi], b.win_lo[bi]] if more else [])
+                             + [jnp.where(shut, b.door_lo[bi], FAR)])
+        hi = jnp.concatenate([b.wall_hi[bi], b.cover_hi[bi]] + ([b.low_hi[bi], b.win_hi[bi]] if more else [])
+                             + [jnp.where(shut, b.door_hi[bi], FAR)])
         return lo, hi
 
     def in_cone(self, p, face, q):
@@ -1162,7 +1224,7 @@ class CQBGame:
         yard = jnp.array([cfg.yard_w, cfg.yard_h])
         clipped = jnp.clip(pos, r, yard - r)
         vel = jnp.where(clipped != pos, 0.0, vel)
-        lo, hi = self.boxes(st)
+        lo, hi = self.boxes(st, walk=True)
         before = vel
         pos, vel = jax.vmap(_push_out, in_axes=(0, 0, None, None, None))(clipped, vel, lo, hi, r)
         impact = jnp.linalg.norm(before - vel, axis=1)   # the speed walls took away (straight into them, not along)
@@ -1212,12 +1274,105 @@ class CQBGame:
             p = p * st.ready_t[who] / self.ready_steps
         return jnp.where(on_aim & self.sees(st, who, lo, hi, j), p, 0.0)
 
+    def _pierce(self, st: State):
+        """(ep13, through_drywall) For a shot's line: what stops it (outside walls, tall furniture, shut outside doors)
+        and what it goes through at a cost (inside walls and shut inside doors). -> (hard lo, hi), (soft lo, hi)"""
+        b, bi = self.b, st.building
+        soft = b.wall_soft[bi][:, None]
+        shut = ~st.door_open & b.door_valid[bi]
+        d_soft, d_hard = (shut & ~b.door_outside[bi])[:, None], (shut & b.door_outside[bi])[:, None]
+        hard = (jnp.concatenate([jnp.where(soft, FAR, b.wall_lo[bi]), b.cover_lo[bi], jnp.where(d_hard, b.door_lo[bi], FAR)]),
+                jnp.concatenate([jnp.where(soft, FAR, b.wall_hi[bi]), b.cover_hi[bi], jnp.where(d_hard, b.door_hi[bi], FAR)]))
+        thin = (jnp.concatenate([jnp.where(soft, b.wall_lo[bi], FAR), jnp.where(d_soft, b.door_lo[bi], FAR)]),
+                jnp.concatenate([jnp.where(soft, b.wall_hi[bi], FAR), jnp.where(d_soft, b.door_hi[bi], FAR)]))
+        return hard, thin
+
+    def _through(self, st: State, i: int, j: int, hard, thin):
+        """(ep13) Can i's shot reach j's centre with nothing hard in the way, and through how many soft layers?"""
+        p, q = st.pos[i], st.pos[j][None]
+        clear = _clear(p, q, *hard)[0]
+        t_in, t_out = _slab(p, (q - p)[:, None, :], *thin)
+        layers = ((t_in <= t_out) & (t_out >= 0) & (t_in <= 1)).sum(-1)[0]
+        return clear, layers
+
+    def _led(self, st: State, e):
+        """(ep13) Where the hostage is while `e` walks it out: on him (the game before), or with `hostage_hit` half a
+        metre behind him (so it's a body of its own on a shot's line)."""
+        if not self.cfg.hostage_hit:
+            return st.pos[e]
+        return st.pos[e] - jnp.stack([jnp.cos(st.face[e]), jnp.sin(st.face[e])]) * 0.5
+
+    def _hostage_on_line(self, st: State, who: int, lo, hi, hard, thin):
+        """(ep13) Is the hostage on `who`'s aim line (seen, or behind drywall), the chance a shot hits it, and how far
+        it is. It's never anyone's target: it's hit because it's in the way."""
+        cfg = self.cfg
+        p, q = st.pos[who], st.hostage
+        d = q - p
+        dist = jnp.linalg.norm(d)
+        on_aim = d @ jnp.stack([jnp.cos(st.face[who]), jnp.sin(st.face[who])]) >= self.cos_aim * dist
+        pts = self.body(p, q)
+        seen = (self.in_cone(p, st.face[who], pts) & _clear(p, pts, lo, hi)).any() & (st.blind[who] == 0)
+        base = jnp.clip(cfg.hit_close - cfg.hit_falloff * dist, 0.05, 1.0)
+        base = base * (1 - cfg.move_penalty * jnp.minimum(jnp.linalg.norm(st.vel[who]) / cfg.walk, 1.0))
+        base = base * (1 - cfg.turn_penalty * jnp.abs(st.turn[who]))
+        chance = jnp.where(seen, base, 0.0)
+        line = on_aim & seen
+        if hard is not None:
+            clear = _clear(p, q[None], *hard)[0]
+            t_in, t_out = _slab(p, (q[None] - p)[:, None, :], *thin)
+            layers = ((t_in <= t_out) & (t_out >= 0) & (t_in <= 1)).sum(-1)[0]
+            hidden = ~seen & clear & (layers >= 1)
+            chance = jnp.where(hidden, base * cfg.unseen_hit * cfg.through_drywall ** layers, chance)
+            line = on_aim & (seen | hidden)
+        return line & st.alive[who], chance, dist
+
+    def _unseen_chance(self, st: State, who: int, j, layers):
+        """(ep13) The chance a shot at a body `who` can't see (behind drywall) hits: the usual distance, movement,
+        turning, wounds and rifle-up, x unseen_hit, x through_drywall per layer (no settled aim: it's a guess)."""
+        cfg = self.cfg
+        dist = jnp.linalg.norm(st.pos[j] - st.pos[who])
+        p = jnp.clip(cfg.hit_close - cfg.hit_falloff * dist, 0.05, 1.0)
+        p = p * (1 - cfg.move_penalty * jnp.minimum(jnp.linalg.norm(st.vel[who]) / cfg.walk, 1.0))
+        p = p * (1 - cfg.turn_penalty * jnp.abs(st.turn[who]))
+        if self.health_on:
+            p = p * jnp.where(st.hp[who] < cfg.wounded_below, cfg.wounded_aim, 1.0)
+        if self.ready_on:
+            p = p * st.ready_t[who] / self.ready_steps
+        return p * cfg.unseen_hit * cfg.through_drywall ** layers
+
     def targets(self, st: State, lo=None, hi=None):
         """Where each operator's shot would go: the first body on its aim line, the nearest living operator within the
         aim angle that it sees, teammates included (friendly fire). -> (target (N,), hit chance (N,)); with nobody
-        there the chance is 0. 1v1: always the other one."""
+        there the chance is 0. 1v1: always the other one. (ep13, through_drywall: or one it doesn't see, behind
+        drywall only, at a reduced chance.)"""
         if lo is None:
             lo, hi = self.boxes(st)
+        if self.cfg.through_drywall > 0 or self.cfg.hostage_hit:
+            hard, thin = self._pierce(st) if self.cfg.through_drywall > 0 else (None, None)
+            tgt, chance = [], []
+            for i in range(self.N):
+                others = [j for j in range(self.N) if j != i]
+                dist = jnp.stack([jnp.linalg.norm(st.pos[j] - st.pos[i]) for j in others])
+                seen = jnp.stack([st.seen[i, j] for j in others])
+                aim = jnp.stack([self.on_aim(st, i, j) & st.alive[j] for j in others])
+                if hard is not None:
+                    thr = [self._through(st, i, j, hard, thin) for j in others]
+                    hidden = jnp.stack([c & (n >= 1) for c, n in thr])
+                else:
+                    thr, hidden = [(None, 0)] * len(others), jnp.zeros(len(others), bool)
+                line = aim & (seen | hidden)
+                p = jnp.stack([jnp.where(seen[n], self.hit_chance(st, i, lo, hi, j),
+                                         self._unseen_chance(st, i, j, thr[n][1]) if hard is not None else 0.0)
+                               for n, j in enumerate(others)])
+                ids = jnp.asarray(others)
+                if self.cfg.hostage_hit and self.cfg.hostage:   # the hostage: body N
+                    h_line, h_p, h_d = self._hostage_on_line(st, i, lo, hi, hard, thin)
+                    line, p = jnp.append(line, h_line), jnp.append(p, h_p)
+                    dist, ids = jnp.append(dist, h_d), jnp.append(ids, self.N)
+                k = jnp.argmin(jnp.where(line, dist, jnp.inf))
+                tgt.append(ids[k])
+                chance.append(jnp.where(line.any(), p[k], 0.0))
+            return jnp.stack(tgt), jnp.stack(chance)
         if not self.teams_on:
             return jnp.asarray([1, 0]), jnp.stack([self.hit_chance(st, w, lo, hi) for w in (ASSAULT, DEFENSE)])
         tgt, chance = [], []
@@ -1260,7 +1415,11 @@ class CQBGame:
         if self.guns_on:
             p = p * (1 - self.cfg.recoil * st.kick)
         hits = fire & (jax.random.uniform(k, (N,)) < p)                 # hits[i]: i hit its target
-        H = jax.nn.one_hot(tgt, N, dtype=bool) & hits[:, None]          # (N shooter, N hit)
+        H = jax.nn.one_hot(tgt, N, dtype=bool) & hits[:, None]          # (N shooter, N hit); the hostage (N) isn't one
+        if self.cfg.hostage_hit and self.cfg.hostage:   # (ep13) a hit on the hostage: whose side fired it
+            on_h = hits & (tgt == N)
+            side = jnp.where(on_h[:self.nA].any(), ASSAULT, jnp.where(on_h[self.nA:].any(), DEFENSE, -1))
+            st = st._replace(hostage_hit_by=jnp.where(st.hostage_hit_by >= 0, st.hostage_hit_by, side).astype(jnp.int32))
         if self.health_on:   # where each hit lands, and what it takes
             cfg = self.cfg
             key, kw = jax.random.split(key)
@@ -1298,7 +1457,7 @@ class CQBGame:
         """Distance (metres) to the nearest wall, shut door, cover or yard edge along each laser,
         starting straight ahead and going round to the left; capped at `sight`."""
         if lo is None:
-            lo, hi = self.boxes(st)
+            lo, hi = self.boxes(st, walk=True)
         return _cast(st.pos[who], _rot(self.ray_dirs, st.face[who]), lo, hi, self.cfg)
 
     def _enemy_obs(self, st: State, me: int, j, own, p):
@@ -1535,12 +1694,15 @@ class CQBGame:
         fresh = self.init(key)
         return jax.tree.map(lambda a, b: jnp.where(st.done, a, b), fresh, st)
 
-    def walls(self, st: State):
-        """Walls and shut doors (no cover): what stops sound getting through, a throw, and a bang's light."""
+    def walls(self, st: State, glass: bool = True):
+        """Walls and shut doors (no cover): what stops sound getting through, a throw, and a bang's light. (ep13,
+        homes) windows count as walls for sound, a throw and reaching the hostage; glass=False: not for a bang's
+        light, which gets through glass."""
         b, bi = self.b, st.building
         shut = (~st.door_open & b.door_valid[bi])[:, None]
-        lo = jnp.concatenate([b.wall_lo[bi], jnp.where(shut, b.door_lo[bi], FAR)])
-        hi = jnp.concatenate([b.wall_hi[bi], jnp.where(shut, b.door_hi[bi], FAR)])
+        win = glass and self.cfg.layout == "home"
+        lo = jnp.concatenate([b.wall_lo[bi]] + ([b.win_lo[bi]] if win else []) + [jnp.where(shut, b.door_lo[bi], FAR)])
+        hi = jnp.concatenate([b.wall_hi[bi]] + ([b.win_hi[bi]] if win else []) + [jnp.where(shut, b.door_hi[bi], FAR)])
         return lo, hi
 
     def walls_between(self, st: State, p, q):
@@ -1555,14 +1717,15 @@ class CQBGame:
         lands `throw` metres ahead, or just short of the first wall or shut door (at your feet if you throw
         into one). One live flashbang per operator at a time."""
         cfg = self.cfg
-        lo, hi = self.walls(st)
+        lo, hi = self.walls(st)                                                 # a throw stops at glass...
+        llo, lhi = self.walls(st, glass=False)                                  # ...a bang's light gets through
         timer = jnp.maximum(st.bang_timer - 1, 0)
         now = st.bang_timer == 1                                                # (N,) whose went off
         blind = jnp.maximum(st.blind - 1, 0)
         for src in range(self.N):
             q = st.bang_pos[src]
             d = jnp.linalg.norm(st.pos - q, axis=1)                             # (N,) each operator to it
-            clear = _clear(q, st.pos, lo, hi)
+            clear = _clear(q, st.pos, llo, lhi)
             facing = jax.vmap(lambda p, f: self.in_cone(p, f, q[None])[0])(st.pos, st.face)
             steps = jnp.where(facing, self.blind_steps, int(round(self.blind_steps * cfg.blind_away)))
             hit = now[src] & (d <= cfg.bang_range) & clear & st.alive
@@ -1721,7 +1884,7 @@ class CQBGame:
                 e = jnp.maximum(new.escort, 0)
                 lost = (new.escort >= 0) & ~new.alive[e]
                 new = new._replace(escort=jnp.where(lost, -1, new.escort), secure=jnp.where(lost, 0, new.secure),
-                                   hostage=jnp.where((new.escort >= 0) & ~lost, new.pos[e], new.hostage))
+                                   hostage=jnp.where((new.escort >= 0) & ~lost, self._led(new, e), new.hostage))
             d = jnp.linalg.norm(new.pos[ops] - new.hostage, axis=1)
             near = (d <= cfg.secure_radius) & new.alive[ops] & _clear(new.hostage, new.pos[ops], lo, hi)
             if cfg.extract:   # secured: the nearest attacker beside it takes it; out of the house: the win
@@ -1730,7 +1893,7 @@ class CQBGame:
                 taken = free & (secure >= self.secure_steps)
                 who = ops[jnp.argmin(jnp.where(near, d, jnp.inf))]
                 new = new._replace(secure=secure, escort=jnp.where(taken, who, new.escort).astype(jnp.int32),
-                                   hostage=jnp.where(taken, new.pos[who], new.hostage))
+                                   hostage=jnp.where(taken, self._led(new, who), new.hostage))
                 bi = new.building
                 out = ((new.hostage < self.b.foot_lo[bi] - cfg.escort_out)
                        | (new.hostage > self.b.foot_hi[bi] + cfg.escort_out)).any()
@@ -1741,10 +1904,12 @@ class CQBGame:
                 secure = jnp.where(near.any(), new.secure + 1, 0)
                 new = new._replace(secure=secure)
                 secured = (secure >= self.secure_steps) & ~a_down & ~d_down
-        timeout = (new.t >= self.T) & ~a_down & ~d_down & ~secured
+        shot = new.hostage_hit_by >= 0                                   # (ep13) the hostage hit: that side loses
+        timeout = (new.t >= self.T) & ~a_down & ~d_down & ~secured & ~shot
         outcome = jnp.where(d_down & ~a_down, 1, jnp.where(a_down & ~d_down, -1,
                                                            jnp.where(secured, 1, jnp.where(timeout, -1, 0))))
-        done = a_down | d_down | timeout | secured
+        outcome = jnp.where(shot, jnp.where(new.hostage_hit_by == ASSAULT, -1, 1), outcome)
+        done = a_down | d_down | timeout | secured | shot
         reward = cfg.win_reward * outcome - cfg.time_cost * cfg.dt
         new = new._replace(done=done, outcome=outcome)
         new = jax.tree.map(lambda x, y: jnp.where(st.done, x, y), st, new)   # frozen once over

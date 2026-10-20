@@ -49,6 +49,9 @@ class CQBPPOConfig:
     hostage_deep: float = 0.0    # the game's CQBConfig.hostage_deep
     extract: bool = False        # the game's CQBConfig.extract
     hostage_noise: float = 0.0   # the game's CQBConfig.hostage_noise
+    through_drywall: float = 0.0  # (ep13) the game's CQBConfig.through_drywall (homes: shots through inside walls)
+    unseen_hit: float = 0.5       # (ep13) the game's CQBConfig.unseen_hit
+    hostage_hit: bool = False     # (ep13) the game's CQBConfig.hostage_hit (the side that hits it loses)
     health: float = 0.0          # the game's CQBConfig.health (0: one hit and you're down; ep9 3ar)
     react: float = 0.0           # the game's CQBConfig.react (0: no reaction time; ep9 3aw)
     teams: tuple = (1, 1)        # the game's CQBConfig.team_sizes (ep10): one brain plays every operator of its side
@@ -775,6 +778,7 @@ def train(cfg: CQBPPOConfig, run_dir: str | Path, resume: bool = False, max_hour
     game_cfg = replace(game_cfg, **cqb.HOUSES[cfg.house])
     game_cfg = replace(game_cfg, time_cost=cfg.time_cost, flashbangs=tuple(cfg.flashbangs), magazine=cfg.magazine,
                        spare_mags=cfg.spare_mags, time_limit=cfg.time_limit, blind_away=cfg.blind_away, hostage=cfg.hostage, hostage_deep=cfg.hostage_deep, extract=cfg.extract, hostage_noise=cfg.hostage_noise, health=cfg.health, react=cfg.react, team_sizes=tuple(cfg.teams), bump=cfg.bump,
+                       through_drywall=cfg.through_drywall, unseen_hit=cfg.unseen_hit, hostage_hit=cfg.hostage_hit,
                        ready=cfg.ready, stun=cfg.stun, share_sight=cfg.share_sight, radio=tuple(cfg.radio),
                        split_entry=cfg.split_entry, relay=cfg.relay, intel=cfg.intel,
                        route=cfg.route, feed=cfg.feed, pilot=cfg.pilot, callout=cfg.callout,

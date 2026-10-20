@@ -59,8 +59,16 @@ export class House {
     const box = (lo, hi) => lo.map((l, k) => [l[0], l[1], hi[k][0], hi[k][1]]);
     const real = (b) => b[0] !== FAR || b[2] !== FAR;
     this.seed = h.seed;
-    this.walls = box(h.wall_lo, h.wall_hi).filter(real);
+    const walls = box(h.wall_lo, h.wall_hi);
+    this.walls = walls.filter(real);
     this.cover = box(h.cover_lo, h.cover_hi).filter(real);
+    // (ep13, homes) low furniture and windows stop a body, not sight or shots; inside walls are drywall (wall_soft),
+    // outside ones brick. Kill houses have none of these (empty lists, every wall hard): the game as before.
+    this.low = h.low_lo ? box(h.low_lo, h.low_hi).filter(real) : [];
+    this.win = h.win_lo ? box(h.win_lo, h.win_hi).filter(real) : [];
+    this.wallSoft = walls.map((b, k) => !!(h.wall_soft && h.wall_soft[k])).filter((_, k) => real(walls[k]));
+    this.layout = h.layout || "";                          // for the 3D's looks only: what each piece is, below
+    this.coverKind = h.cover_kind || []; this.lowKind = h.low_kind || [];
     this.doors = box(h.door_lo, h.door_hi);                 // all slots (indices matter); valid says which are doors
     this.doorValid = h.door_valid; this.doorOutside = h.door_outside; this.centerFed = h.door_center_fed;
     this.entries = h.entry.slice(0, h.n_entries); this.entryFace = h.entry_face.slice(0, h.n_entries);
@@ -80,11 +88,11 @@ export class House {
       const n = axis === 0 ? [1, 0] : [0, 1];
       pts.push([mid[0] - n[0] * out, mid[1] - n[1] * out], [mid[0] + n[0] * out, mid[1] + n[1] * out]);
     });
-    for (const c of this.cover) {
+    for (const c of [...this.cover, ...this.low]) {   // (ep13) low furniture's corners too
       const lo = [c[0] - m, c[1] - m], hi = [c[2] + m, c[3] + m];
       pts.push(lo, hi, [lo[0], hi[1]], [hi[0], lo[1]]);
     }
-    const boxes = [...this.walls, ...this.cover].map((b) => [b[0] - body, b[1] - body, b[2] + body, b[3] + body]);
+    const boxes = [...this.walls, ...this.cover, ...this.low, ...this.win].map((b) => [b[0] - body, b[1] - body, b[2] + body, b[3] + body]);
     const yard = [cfg.yard_w, cfg.yard_h];
     const nodes = pts, real = pts.map((p) => p.every((x, ax) => x > cfg.radius && x < yard[ax] - cfg.radius)
       && !boxes.some((b) => p[0] > b[0] && p[0] < b[2] && p[1] > b[1] && p[1] < b[3]));
@@ -141,6 +149,10 @@ export class Game {
     this.hostageOn = !!cfg.hostage; this.extractOn = this.hostageOn && !!cfg.extract;
     this.noiseOn = this.extractOn && (cfg.hostage_noise || 0) > 0;
     this.secureSteps = Math.max(1, Math.round((cfg.secure_time ?? 3) / cfg.dt));
+    // episode 13: bullets through drywall (and a body the shooter can't see is a guess: x unseen_hit)
+    this.pierceOn = (cfg.through_drywall || 0) > 0;
+    // ...and the hostage can be hit: a body on a shot's line, never a target; a hit loses the round for that side
+    this.hostageHitOn = !!cfg.hostage_hit;
   }
 
   sideOps(side) { return side === ASSAULT ? this.ops.slice(0, this.nA) : this.ops.slice(this.nA); }
@@ -185,7 +197,7 @@ export class Game {
       landed: each(() => this.soundSteps), aim: pairs(() => 0), knownDown: pairs(() => false), hitBy: each(() => -1),
       bumped: each(() => false), readyT: each(() => this.readySteps), stunT: each(() => 0),
       t: 0, done: false, outcome: 0,
-      hostage: (given.hostage || [0, 0]).slice(), secure: 0, escort: -1,
+      hostage: (given.hostage || [0, 0]).slice(), secure: 0, escort: -1, hostageHitBy: -1,
       hostageHeard: each(() => [0, 0, 0]), hostageAge: each(() => this.soundSteps),
     };
     return this.look(h, st);
@@ -211,7 +223,7 @@ export class Game {
   // (ep12) games/cqb.py routes: which waypoints `who` can walk straight to, and the walking distance to every one.
   routes(h, st, who) {
     const { nodes, dist } = h.nav(this.cfg), K = nodes.length, p = st.pos[who], k = this.cfg.radius - 0.05;
-    const boxes = [...h.walls, ...h.cover].map((b) => [b[0] - k, b[1] - k, b[2] + k, b[3] + k]);
+    const boxes = [...h.walls, ...h.cover, ...h.low, ...h.win].map((b) => [b[0] - k, b[1] - k, b[2] + k, b[3] + k]);
     const vis = nodes.map((q) => clear(p, q, boxes));
     const first = nodes.map((q, n) => (vis[n] ? Math.fround(norm(q[0] - p[0], q[1] - p[1])) : 1e5));
     const best = new Array(K).fill(Infinity), via = new Array(K).fill(0);
@@ -242,12 +254,17 @@ export class Game {
     return ok ? [u[0], u[1], Math.min(length / (2 * this.cfg.sight), 1), 1] : [0, 0, 0, 0];
   }
 
-  boxes(h, st, doorOpen = st.doorOpen) {   // walls, cover, shut doors (in this order: pushOut's ties follow it)
-    return [...h.walls, ...h.cover, ...h.doors.filter((_, k) => h.doorValid[k] && !doorOpen[k])];
+  // walls, cover, shut doors (in this order: pushOut's ties follow it); walk: what stops a body, with (ep13, homes)
+  // low furniture and windows too, which don't stop sight, light or shots
+  boxes(h, st, doorOpen = st.doorOpen, walk = false) {
+    return [...h.walls, ...h.cover, ...(walk ? [...h.low, ...h.win] : []),
+            ...h.doors.filter((_, k) => h.doorValid[k] && !doorOpen[k])];
   }
 
-  wallsOnly(h, st) {                        // walls and shut doors: what stops sound, a throw and a bang
-    return [...h.walls, ...h.doors.filter((_, k) => h.doorValid[k] && !st.doorOpen[k])];
+  // walls and shut doors: what stops sound, a throw and reaching the hostage; (ep13) windows too, unless glass is
+  // false: a bang's light gets through glass
+  wallsOnly(h, st, glass = true) {
+    return [...h.walls, ...(glass ? h.win : []), ...h.doors.filter((_, k) => h.doorValid[k] && !st.doorOpen[k])];
   }
 
   cast(p, dirs, boxes) {  // distance along each direction to the first box or the yard's edge, capped at sight
@@ -351,7 +368,7 @@ export class Game {
       const d = moves[w].slice(1).reduce((s, m) => [s[0] + m[0], s[1] + m[1]], moves[w][0]);
       return [p[0] + d[0], p[1] + d[1]];
     });
-    const yard = [cfg.yard_w, cfg.yard_h], boxes = this.boxes(h, st), impact = [];
+    const yard = [cfg.yard_w, cfg.yard_h], boxes = this.boxes(h, st, st.doorOpen, true), impact = [];
     for (const w of this.ops) {
       const c = [0, 1].map((ax) => clip(pos[w][ax], r, yard[ax] - r));
       vel[w] = vel[w].map((v, ax) => (c[ax] !== pos[w][ax] ? 0 : v));
@@ -401,7 +418,78 @@ export class Game {
     return onAim && this.sees(st, who, boxes, j) ? p : 0;
   }
 
-  targets(st, boxes) {   // games/cqb.py targets: the first body on each shooter's aim line, teammates included
+  // (ep13, through_drywall) games/cqb.py _pierce: what stops a shot (brick outside walls, tall furniture, shut outside
+  // doors) and what it goes through at a cost (drywall inside walls, shut inside doors)
+  pierce(h, st) {
+    const shut = (k) => h.doorValid[k] && !st.doorOpen[k];
+    return { hard: [...h.walls.filter((_, k) => !h.wallSoft[k]), ...h.cover, ...h.doors.filter((_, k) => shut(k) && h.doorOutside[k])],
+             thin: [...h.walls.filter((_, k) => h.wallSoft[k]), ...h.doors.filter((_, k) => shut(k) && !h.doorOutside[k])] };
+  }
+
+  through(p, q, pr) {   // _through: nothing hard between p and q? and through how many soft layers
+    const dx = q[0] - p[0], dy = q[1] - p[1];
+    const layers = pr.thin.filter((b) => { const [i, o] = slab(p[0], p[1], dx, dy, b); return i <= o && o >= 0 && i <= 1; }).length;
+    return [clear(p, q, pr.hard), layers];
+  }
+
+  // (ep13) _unseen_chance: a shot at a body `who` can't see (behind drywall): the usual distance, movement, turning,
+  // wounds and rifle-up, x unseen_hit, x through_drywall per layer (no settled aim: it's a guess)
+  unseenChance(st, who, j, layers) {
+    const cfg = this.cfg, dist = norm(st.pos[j][0] - st.pos[who][0], st.pos[j][1] - st.pos[who][1]);
+    let p = clip(cfg.hit_close - cfg.hit_falloff * dist, 0.05, 1.0);
+    p *= 1 - cfg.move_penalty * Math.min(norm(...st.vel[who]) / cfg.walk, 1.0);
+    p *= 1 - cfg.turn_penalty * Math.abs(st.turn[who]);
+    if (this.healthOn) p *= st.hp[who] < cfg.wounded_below ? cfg.wounded_aim : 1;
+    if (this.readyOn) p *= st.readyT[who] / this.readySteps;
+    return p * cfg.unseen_hit * cfg.through_drywall ** layers;
+  }
+
+  // (ep13) _led: where the hostage is while `e` walks it out: on him, or with hostage_hit half a metre behind him
+  led(st, e) {
+    if (!this.hostageHitOn) return st.pos[e].slice();
+    return [st.pos[e][0] - Math.cos(st.face[e]) * 0.5, st.pos[e][1] - Math.sin(st.face[e]) * 0.5];
+  }
+
+  // (ep13) _hostage_on_line: is the hostage on `who`'s aim line (seen, or behind drywall), the chance a shot hits it
+  // (distance, movement and turning only), and how far it is
+  hostageOnLine(st, who, boxes, pr) {
+    const cfg = this.cfg, p = st.pos[who], q = st.hostage, dx = q[0] - p[0], dy = q[1] - p[1], dist = norm(dx, dy);
+    const onAim = dx * Math.cos(st.face[who]) + dy * Math.sin(st.face[who]) >= this.cosAim * dist;
+    const seen = this.body(p, q).some((x) => this.inCone(p, st.face[who], x) && clear(p, x, boxes)) && st.blind[who] === 0;
+    let base = clip(cfg.hit_close - cfg.hit_falloff * dist, 0.05, 1.0);
+    base *= 1 - cfg.move_penalty * Math.min(norm(...st.vel[who]) / cfg.walk, 1.0);
+    base *= 1 - cfg.turn_penalty * Math.abs(st.turn[who]);
+    let chance = seen ? base : 0, line = onAim && seen;
+    if (pr) {
+      const [free, layers] = this.through(p, q, pr), hidden = !seen && free && layers >= 1;
+      if (hidden) chance = base * cfg.unseen_hit * cfg.through_drywall ** layers;
+      line = onAim && (seen || hidden);
+    }
+    return [line && st.alive[who], chance, dist];
+  }
+
+  targets(h, st, boxes) {   // games/cqb.py targets: the first body on each shooter's aim line, teammates included
+    if (this.pierceOn || this.hostageHitOn) {   // (ep13) ...or behind drywall only, at a reduced chance; the hostage (N)
+      const pr = this.pierceOn ? this.pierce(h, st) : null, tgt = [], chance = [];
+      for (const i of this.ops) {
+        const others = this.ops.filter((j) => j !== i);
+        let best = Infinity, k = others[0], c = 0;
+        for (const j of others) {
+          const d = norm(st.pos[j][0] - st.pos[i][0], st.pos[j][1] - st.pos[i][1]), seen = st.seen[i][j];
+          const [free, layers] = pr ? this.through(st.pos[i], st.pos[j], pr) : [false, 0];
+          const line = this.onAim(st, i, j) && st.alive[j] && (seen || (free && layers >= 1));
+          if (line && d < best) {
+            best = d; k = j; c = seen ? this.hitChance(st, i, boxes, j) : pr ? this.unseenChance(st, i, j, layers) : 0;
+          }
+        }
+        if (this.hostageHitOn && this.hostageOn) {
+          const [line, p, d] = this.hostageOnLine(st, i, boxes, pr);
+          if (line && d < best) { best = d; k = this.N; c = p; }
+        }
+        tgt.push(k); chance.push(c);
+      }
+      return [tgt, chance];
+    }
     if (!this.teamsOn) return [[1, 0], [0, 1].map((w) => this.hitChance(st, w, boxes))];
     const tgt = [], chance = [];
     for (const i of this.ops) {
@@ -438,10 +526,14 @@ export class Game {
     const cfg = this.cfg, boxes = this.boxes(h, st), ops = this.ops;
     const fire = ops.map((w) => a[w][FIRE] > 0 && a[w][RUN] <= 0 && st.alive[w] && !st.done
                                && (!this.gunsOn || (st.mag[w] > 0 && st.reloadTimer[w] === 0)));
-    const [tgt, chance] = this.targets(st, boxes);
+    const [tgt, chance] = this.targets(h, st, boxes);
     const p = ops.map((w) => chance[w] * (this.gunsOn ? 1 - cfg.recoil * st.kick[w] : 1));
     const hits = ops.map((w) => fire[w] && dice[w] < p[w]);          // hits[w]: w hit its target
-    const H = ops.map((i) => ops.map((j) => hits[i] && tgt[i] === j)); // [shooter][hit]
+    const H = ops.map((i) => ops.map((j) => hits[i] && tgt[i] === j)); // [shooter][hit]; the hostage (N) isn't one
+    if (this.hostageHitOn && this.hostageOn && st.hostageHitBy < 0) {   // (ep13) a hit on the hostage: whose side fired
+      const onH = ops.map((w) => hits[w] && tgt[w] === this.N);
+      st.hostageHitBy = onH.slice(0, this.nA).some((x) => x) ? ASSAULT : onH.slice(this.nA).some((x) => x) ? DEFENSE : -1;
+    }
     let alive;
     if (this.healthOn) {
       const dmg = where.map((u) => (u < cfg.head_share ? cfg.head_damage : u < cfg.head_share + cfg.torso_share ? cfg.torso_damage : cfg.limb_damage));
@@ -541,7 +633,7 @@ export class Game {
   }
 
   flashbangs(h, st, a) {
-    const cfg = this.cfg, walls = this.wallsOnly(h, st);
+    const cfg = this.cfg, walls = this.wallsOnly(h, st), light = this.wallsOnly(h, st, false);   // a throw stops at glass, the light doesn't
     const timer = st.bangTimer.map((x) => Math.max(x - 1, 0)), now = st.bangTimer.map((x) => x === 1);
     let blind = st.blind.map((x) => Math.max(x - 1, 0));
     for (const src of this.ops) {
@@ -549,7 +641,7 @@ export class Game {
       blind = blind.map((b, w) => {
         const d = norm(st.pos[w][0] - q[0], st.pos[w][1] - q[1]);
         const steps = this.inCone(st.pos[w], st.face[w], q) ? this.blindSteps : Math.round(this.blindSteps * cfg.blind_away);
-        return now[src] && d <= cfg.bang_range && clear(q, st.pos[w], walls) && st.alive[w] ? Math.max(b, steps) : b;
+        return now[src] && d <= cfg.bang_range && clear(q, st.pos[w], light) && st.alive[w] ? Math.max(b, steps) : b;
       });
     }
     for (const w of this.ops) {
@@ -601,9 +693,11 @@ export class Game {
     st.kick = st.kick.map(f); st.hp = st.hp.map(f);
     const aDown = !st.alive.slice(0, this.nA).some((x) => x), dDown = !st.alive.slice(this.nA).some((x) => x);
     const secured = this.hostageOn ? this.hostageStep(h, st, aDown, dDown) : false;
-    const timeout = st.t >= this.T && !aDown && !dDown && !secured;
+    const shot = st.hostageHitBy >= 0;   // (ep13) the hostage hit: that side loses
+    const timeout = st.t >= this.T && !aDown && !dDown && !secured && !shot;
     st.outcome = dDown && !aDown ? 1 : aDown && !dDown ? -1 : secured ? 1 : timeout ? -1 : 0;
-    st.done = aDown || dDown || timeout || secured;
+    if (shot) st.outcome = st.hostageHitBy === ASSAULT ? -1 : 1;
+    st.done = aDown || dDown || timeout || secured || shot;
     return st;
   }
 
@@ -614,7 +708,7 @@ export class Game {
     const cfg = this.cfg, walls = this.wallsOnly(h, st), ops = this.sideOps(ASSAULT);
     if (this.extractOn) {
       const e = Math.max(st.escort, 0), lost = st.escort >= 0 && !st.alive[e];
-      if (lost) { st.escort = -1; st.secure = 0; } else if (st.escort >= 0) st.hostage = st.pos[e].slice();
+      if (lost) { st.escort = -1; st.secure = 0; } else if (st.escort >= 0) st.hostage = this.led(st, e);
     }
     const d = ops.map((w) => norm(st.pos[w][0] - st.hostage[0], st.pos[w][1] - st.hostage[1]));
     const near = ops.map((w, k) => d[k] <= cfg.secure_radius && st.alive[w] && clear(st.hostage, st.pos[w], walls));
@@ -625,7 +719,7 @@ export class Game {
       if (free && st.secure >= this.secureSteps) {
         let k = 0;
         ops.forEach((_, n) => { if (near[n] && (!near[k] || d[n] < d[k])) k = n; });
-        st.escort = ops[k]; st.hostage = st.pos[ops[k]].slice();
+        st.escort = ops[k]; st.hostage = this.led(st, ops[k]);
       }
       const out = [0, 1].some((ax) => st.hostage[ax] < h.footLo[ax] - cfg.escort_out || st.hostage[ax] > h.footHi[ax] + cfg.escort_out);
       secured = st.escort >= 0 && out && !aDown && !dDown;
@@ -675,8 +769,8 @@ export class Game {
   observe(h, st, who) {
     const cfg = this.cfg, me = who, p = st.pos[me], face = st.face[me];
     const own = (v) => rot(v, -face), sub = (a, b) => [a[0] - b[0], a[1] - b[1]], sc = (v, k) => [v[0] * k, v[1] * k];
-    const boxes = this.boxes(h, st), obs = [];
-    const lasers = this.cast(p, this.rayDirs.map((d) => rot(d, face)), boxes);
+    const obs = [];
+    const lasers = this.cast(p, this.rayDirs.map((d) => rot(d, face)), this.boxes(h, st, st.doorOpen, true));
     obs.push(...lasers.map((x) => x / cfg.sight));
     const order = this.teamsOn ? this.enemyOrder(st, me) : [1 - who];
     const blank = (j) => this.teamsOn && st.knownDown[me][j];

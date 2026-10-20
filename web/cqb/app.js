@@ -1,6 +1,7 @@
 // The Kill House vs the AI: you clear a dark house against episode 9's trained defender, or hold a room against
 // its trained attacker; or, from episode 10, hold it against the AI pair, or attack with an AI partner; or, from
-// episode 12, two against two with a hostage: walk it out with an AI partner, or hold it with one. Same game,
+// episode 12, two against two with a hostage: walk it out with an AI partner, or hold it with one; or, from episode 13,
+// the same in a real home (furniture, windows, drywall bullets go through, a hostage that can be hit). Same game,
 // same rules, ten decisions a second for everyone; you see what your side sees (your light, your partner's). The AI's
 // moves come from its real trained brains, running here (engine.js, checked against the Python game: node check.mjs).
 import { ASSAULT, Brain, DEFENSE, Game, House } from "./engine.js";
@@ -9,6 +10,7 @@ import { Sound } from "./sound.js";
 // top-down view from the videos). Same game either way: the look only draws engine.js's state.
 
 const C = { bg: "#0d0f16", yard: "#11141c", floor: "#1d2230", wall: "#9aa3b8", door: "#fbbf24", cover: "#6b5d4a",
+            drywall: "#6c7489", low: "#4b4954", window: "#7dd3fc",   // (ep13) homes
             dark: "rgba(5,6,10,0.88)", text: "#e8eaf0", muted: "#787f94", blue: "#60a5fa", red: "#f43f5e",
             amber: "#fbbf24", light: "rgba(255,240,200,0.22)", panel: "#161923", cyan: "#67e8f9" };
 const canvas = document.getElementById("c"), g = canvas.getContext("2d"), glCanvas = document.getElementById("gl");
@@ -29,7 +31,8 @@ async function load3d() {
 const in3d = () => look === "3d" && v3d;
 const [data, buf] = await Promise.all([fetch("cqb.json").then((r) => r.json()), fetch("weights.bin").then((r) => r.arrayBuffer())]);
 const weights = new Float32Array(buf);
-const houses = data.houses.map((h) => new House(h));
+const houses = data.houses.filter((h) => !h.layout).map((h) => new House(h));
+const homes = data.houses.filter((h) => h.layout === "home").map((h) => new House(h));   // (ep13) the home modes'
 const brainOf = (spec) => { const b = data.brains.find((x) => x.spec === spec); return { ...b, brain: new Brain(b.layers, weights) }; };
 const MODES = {
   attack: { me: 0, ai: brainOf("runs/cqb-d5-guns:900"), rules: "runs/cqb-d5-guns:900", color: C.blue,
@@ -70,6 +73,23 @@ const MODES = {
                 "where the hostage is until they move it; after that only while you see it, or hear it.",
           ai_line: "The AI attackers from the end of episode 12, evolved over 21 million practice rounds. Against my " +
                    "best AI defenders they win about 38% of the time, and walk the hostage out in about one in five." },
+  // episode 13: the same two vs two in a real home, under its rules: low furniture and windows stop bodies, not sight
+  // or shots; bullets go through drywall (inside walls) as a guess (x unseen_hit x through_drywall per wall: a
+// quarter through one); hit the hostage and your side loses.
+  home: { me: 0, ai: brainOf("runs/cqb-d24-2v2-home:300"), partner: brainOf("runs/cqb-e17-2v2-home-doors:150"),
+          rules: "runs/cqb-d24-2v2-home:300", color: C.blue, ep: 13, homes: true,
+          goal: "The same rescue in a real home. Beds, sofas, counters and windows stop you but not sight or bullets; " +
+                "bullets go through the thin inside walls (the lighter ones), but blind: a quarter of the usual chance " +
+                "through one wall. Brick outside walls stop them. Hit the hostage and your side loses.",
+          ai_line: "The AI defenders from episode 13, trained in homes. Against my best AI attackers they hold the " +
+                   "house about 38% of the time." },
+  homehold: { me: 2, ai: brainOf("runs/cqb-e17-2v2-home-doors:150"), partner: brainOf("runs/cqb-d24-2v2-home:300"),
+              rules: "runs/cqb-d24-2v2-home:300", color: C.red, ep: 13, homes: true,
+              goal: "Hold a real home with an AI partner for 45 seconds. Furniture and windows stop bodies, not sight " +
+                    "or bullets; the lighter inside walls let bullets through, blind, at a quarter of the chance. Hit the hostage " +
+                    "and your side loses.",
+              ai_line: "The AI attackers from episode 13, trained in homes. Against my best AI defenders they win " +
+                       "about 62% of the time, and walk the hostage out in more than two rounds in five." },
 };
 const NAMES = ["attacker", "defender"];
 
@@ -137,7 +157,8 @@ function next() {
   game = new Game(data.rules[M.rules]);
   side = game.team[me]; team = game.sideOps(side); foes = game.sideOps(1 - side);
   brains = game.ops.map((w) => (w === me ? null : game.team[w] === side ? M.partner.brain : M.ai.brain));
-  house = houses[Math.floor(Math.random() * houses.length)];
+  const pool = M.homes ? homes : houses;
+  house = pool[Math.floor(Math.random() * pool.length)];
   st = prev = game.start(house); acc = 0; countdown = 3; result = null; phase = "countdown";
   glCanvas.hidden = !in3d();
   if (in3d()) {
@@ -184,10 +205,11 @@ function tick() {  // one decision each (10 per second)
     localStorage.setItem(`cqb-score-${mode}`, JSON.stringify([w + won, p + 1]));
     const up = (ops) => ops.some((k) => st.alive[k]), foe = foes.length > 1 ? `the AI ${NAMES[1 - side]}s` : `the AI ${NAMES[1 - side]}`;
     const out = game.extractOn && st.outcome === 1 && up(team) && up(foes);   // (ep12) walked out
-    const how = out ? (side === ASSAULT ? "the hostage is out" : "they walked the hostage out")
+    const hit = st.hostageHitBy >= 0 ? (st.hostageHitBy === side ? "your side hit the hostage" : "they hit the hostage") : null;
+    const how = hit ?? (out ? (side === ASSAULT ? "the hostage is out" : "they walked the hostage out")
       : !up(team) && !up(foes) ? "all down" : up(team) && up(foes) ? "time ran out"
       : up(team) ? (st.alive[me] ? `you took ${foe} down` : `you went down; your partner finished it`)
-      : `${foe} took ${team.length > 1 ? "you both" : "you"} down`;
+      : `${foe} took ${team.length > 1 ? "you both" : "you"} down`);
     result = { won, how, at: performance.now() }; phase = "over";
   }
 }
@@ -273,8 +295,10 @@ function draw(alpha, dt = 0) {
   const [fx, fy] = tf(house.footLo[0], house.footHi[1]);
   g.fillStyle = C.floor; g.fillRect(fx, fy, (house.footHi[0] - house.footLo[0]) * s, (house.footHi[1] - house.footLo[1]) * s);
   const box = (b, color) => { const [x, y] = tf(b[0], b[3]); g.fillStyle = color; g.fillRect(x, y, (b[2] - b[0]) * s, (b[3] - b[1]) * s); };
+  for (const b of house.low) box(b, C.low);   // (ep13) low furniture: stops bodies, not sight or shots
   for (const b of house.cover) box(b, C.cover);
-  for (const b of house.walls) box(b, C.wall);
+  house.walls.forEach((b, k) => box(b, house.wallSoft[k] ? C.drywall : C.wall));   // drywall: bullets go through
+  for (const b of house.win) box(b, C.window);
   house.doors.forEach((b, k) => { if (house.doorValid[k]) box(b, st.doorOpen[k] ? "rgba(251,191,36,0.25)" : C.door); });
 
   // lights: your side's always; an enemy's while your side can see it
@@ -294,7 +318,9 @@ function draw(alpha, dt = 0) {
     dg.globalCompositeOperation = "source-over";
     g.drawImage(darkCanvas, 0, 0, W, H);
     g.globalAlpha = 0.3;   // the layout stays faintly visible in the dark (the AI's lasers feel the walls around it too)
-    for (const b of house.walls) box(b, C.wall);
+    house.walls.forEach((b, k) => box(b, house.wallSoft[k] ? C.drywall : C.wall));
+    for (const b of house.low) box(b, C.low);
+    for (const b of house.win) box(b, C.window);
     house.doors.forEach((b, k) => { if (house.doorValid[k] && !st.doorOpen[k]) box(b, C.door); });
     g.globalAlpha = 1;
   }

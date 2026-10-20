@@ -26,7 +26,8 @@
   button[data-mode="attack"].on { border-color: #60a5fa; color: #60a5fa; }
   button[data-mode="defend"].on, button[data-mode="defend2"].on { border-color: #f43f5e; color: #f43f5e; }
   button[data-mode="attack2"].on, button[data-mode="rescue"].on { border-color: #60a5fa; color: #60a5fa; }
-  button[data-mode="hold"].on { border-color: #f43f5e; color: #f43f5e; }
+  button[data-mode="hold"].on, button[data-mode="homehold"].on { border-color: #f43f5e; color: #f43f5e; }
+  button[data-mode="home"].on { border-color: #60a5fa; color: #60a5fa; }
   button[data-steer].on { border-color: #e8eaf0; }
   #play { background: #fbbf24; color: #0d0f16; border-color: #fbbf24; font-size: 20px; padding: 12px 30px; }
   #info b, #keys b { color: #e8eaf0; }
@@ -56,7 +57,7 @@
   <div class="card">
     <h1>The Kill House vs my AI</h1>
     <p>A dark house you've never seen. You see only what your weapon light shows (and, with a partner, what theirs
-       does) and hear the rest through the walls. The AIs from episodes 9, 10 and 12 play by exactly the same rules,
+       does) and hear the rest through the walls. The AIs from episodes 9, 10, 12 and 13 play by exactly the same rules,
        from their real trained brains, in your browser.</p>
     <div class="label">You play</div>
     <div class="row"><button data-mode="attack">Attacker: clear the house</button><button data-mode="defend">Defender: hold the room</button></div>
@@ -64,6 +65,8 @@
     <div class="row"><button data-mode="defend2">Defender vs the AI pair</button><button data-mode="attack2">Attacker with an AI partner</button></div>
     <div class="label">Two vs two, a hostage to walk out (episode 12)</div>
     <div class="row"><button data-mode="rescue">Rescue it with an AI partner</button><button data-mode="hold">Hold it with an AI partner</button></div>
+    <div class="label">The same in a real home (episode 13)</div>
+    <div class="row"><button data-mode="home">Rescue it in a home</button><button data-mode="homehold">Hold a home</button></div>
     <div class="label">W A S D move</div>
     <div class="row"><button data-steer="screen">On the screen (W is up)</button><button data-steer="face">Where I aim (W is forward)</button></div>
     <p id="goal"></p>

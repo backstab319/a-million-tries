@@ -55,6 +55,9 @@ class CQBESConfig:
     hostage_deep: float = 0.0    # the game's CQBConfig.hostage_deep
     extract: bool = False        # the game's CQBConfig.extract (the coaching then counts the way out too)
     hostage_noise: float = 0.0   # the game's CQBConfig.hostage_noise
+    through_drywall: float = 0.0  # (ep13) the game's CQBConfig.through_drywall (homes: shots through inside walls)
+    unseen_hit: float = 0.5       # (ep13) the game's CQBConfig.unseen_hit
+    hostage_hit: bool = False     # (ep13) the game's CQBConfig.hostage_hit (the side that hits it loses)
     hostage_bonus: float = 0.0   # (ep12, coaching like aim_bonus: the ranking only) up to this a round for how far an
                                  # attacker got securing the hostage (its best stretch beside it, / secure_time); the
                                  # defenders lose the same
@@ -85,6 +88,17 @@ class CQBESConfig:
     # round for having its rifle on him when they first see each other (either way): aim_bonus x (1 - off / 90°),
     # nothing at 90° or more, nothing in rounds where they never meet. Only the ranking score, like blind_bonus
     aim_bonus: float = 0.0
+    # (ep13 8.13, the owner's call: less robotic in the bodycam) a member's score loses this much a round, x the share of
+    # its operators' time up spent running inside the building (faster than 1.1 x a walk, inside the footprint): real
+    # teams clear a home at a walk. Only the ranking score, like aim_bonus
+    run_cost: float = 0.0
+    # (ep13 8.15, the owner: "lots of spinning" in the bodycam) a member's score loses this much a round, x its operators'
+    # back-and-forths per 10 s up: a swing of 60+ degrees one way straight after one of 60+ the other way (a swing ends
+    # when the facing comes back 30 degrees; scripts/cqb_turning.py measures the same). Only the ranking score
+    turn_cost: float = 0.0
+    # (ep13 8.16, the owner: "they open/close doors constantly in a loop") a member's score loses this much a round, x
+    # its operators' door loops per 10 s up: moving the same door again within 3 s of moving it. Only the ranking score
+    door_cost: float = 0.0
     house: str = ""              # the game's settings, as in CQBPPOConfig (ep11)
     route: bool = False
     feed: int = 0
@@ -114,7 +128,8 @@ def _rollout(game: CQBGame, me: int, params: dict, opp, bis, keys, drill):
     """Rounds in buildings bis (the same starts and luck for every member: keys; drill: entry-drill starts),
     `params` playing its best guess as every operator of side `me` against player `opp`. -> per round: outcome,
     throws, throws that blinded an enemy, that blinded one of mine, side counts (decisions played; my crashes; decisions
-    an enemy heard my footsteps; mine downed by mine; words said: for watching, not scored), and per operator of mine how
+    an enemy heard my footsteps; mine downed by mine; words said: for watching, not scored; (ep13) decisions x my operators
+    up, and of those running inside the footprint: run_cost; back-and-forths: turn_cost; door loops: door_cost), and per operator of mine how
     far its aim was off the nearest standing enemy (radians) when it first saw one or was first seen (pi: never met)."""
     n_in = params["body.0.weight"].shape[1]
     mine, theirs = game.side_ops(me), game.side_ops(1 - me)
@@ -124,7 +139,7 @@ def _rollout(game: CQBGame, me: int, params: dict, opp, bis, keys, drill):
         st = jax.tree.map(lambda a, b: jnp.where(d, a, b), game.init_stacked(key, bi), game.init(key, bi))
 
         def tick(carry, k):
-            st, thrown, hit_them, hit_me, side, off, prog = carry
+            st, thrown, hit_them, hit_me, side, off, prog, sw, dl = carry
             acts = [None] * game.N
             for op in mine:
                 acts[op] = cqb.full_action(A.best_guess(params, game.observe(st, op)[None, :n_in])[0])
@@ -141,22 +156,66 @@ def _rollout(game: CQBGame, me: int, params: dict, opp, bis, keys, drill):
                 offs.append(jnp.where(first, jnp.abs(cqb._wrap(jnp.arctan2(d[1], d[0]) - new.face[op])), off[i]))
             on = ~st.done
             fell = st.alive[mo] & ~new.alive[mo]
+            p = st.pos[mo]
+            inside = ((p >= game.b.foot_lo[bi]) & (p <= game.b.foot_hi[bi])).all(-1)
+            ran = jnp.linalg.norm(new.pos[mo] - p, axis=-1) > game.cfg.walk * 1.1 * game.cfg.dt
+            sw, back = _swing(sw, cqb._wrap(new.face[mo] - st.face[mo]), on & st.alive[mo])
+            dl, loops = _door_loops(dl, new.door_event[mo] & on, new.door_at[mo])
             side = side + on * jnp.stack([
                 1, new.bumped[mo].sum(), (new.sound_age[eo, 0] == 0).any(),
                 (fell & jnp.isin(new.hit_by[mo], mo)).sum(),
-                ((new.said_age[mo] == 0) & (new.said[mo] > 0)).sum()]).astype(jnp.int32)
+                ((new.said_age[mo] == 0) & (new.said[mo] > 0)).sum(),
+                st.alive[mo].sum(), (st.alive[mo] & inside & ran).sum(), back, loops]).astype(jnp.int32)
             prog = jnp.maximum(prog, game.hostage_progress(new))   # (ep12) how far the hostage got (secured, out)
             return (new, thrown + (new.bangs[mo] < st.bangs[mo]).sum(),
                     hit_them + (bang & (new.blind[eo] > st.blind[eo]).any()),
-                    hit_me + (bang & (new.blind[mo] > st.blind[mo]).any()), side, jnp.stack(offs), prog), None
+                    hit_me + (bang & (new.blind[mo] > st.blind[mo]).any()), side, jnp.stack(offs), prog, sw, dl), None
 
         z = jnp.asarray(0)
-        (last, thrown, hit_them, hit_me, side, off, prog), _ = jax.lax.scan(
-            tick, (st, z, z, z, jnp.zeros(5, jnp.int32), jnp.full(len(mine), jnp.pi, jnp.float32), jnp.asarray(0.0)),
+        sw0 = tuple(jnp.zeros(len(mine), t) for t in (jnp.float32,) * 5 + (bool,))
+        dl0 = (jnp.full((len(mine), 2), jnp.inf, jnp.float32), jnp.full(len(mine), DOOR_LOOP + 1, jnp.int32))
+        (last, thrown, hit_them, hit_me, side, off, prog, _, _), _ = jax.lax.scan(
+            tick, (st, z, z, z, jnp.zeros(9, jnp.int32), jnp.full(len(mine), jnp.pi, jnp.float32), jnp.asarray(0.0), sw0,
+                   dl0),
             jax.random.split(jax.random.fold_in(key, 1), game.T))
         return last.outcome, thrown, hit_them, hit_me, side, off, prog
 
     return jax.vmap(one)(keys, bis, drill)
+
+
+SWING_HOLD, SWING_BIG = np.radians(30), np.radians(60)
+
+
+def _swing(sw, dface, up):
+    """(ep13 8.15) Each operator's swings, a decision at a time: sw = (facing turned so far, swing start, its furthest
+    point, its direction, the last swing's size, counted), dface: the turn this decision. -> (sw, back-and-forths now:
+    the swing reaching 60 degrees with the one before it 60+ the other way)."""
+    f, start, ext, dirn, prev, counted = sw
+    f = f + jnp.where(up, dface, 0.0)
+    begin = (dirn == 0) & (f != start)
+    dirn = jnp.where(begin, jnp.sign(f - start), dirn)
+    further = (f - ext) * dirn >= 0
+    turn_back = ~further & (jnp.abs(f - ext) > SWING_HOLD)
+    prev = jnp.where(turn_back, jnp.abs(ext - start), prev)
+    start = jnp.where(turn_back, ext, start)
+    dirn = jnp.where(turn_back, -dirn, dirn)
+    counted = counted & ~turn_back
+    ext = jnp.where(further | turn_back, f, ext)
+    back = up & ~counted & (prev >= SWING_BIG) & (jnp.abs(ext - start) >= SWING_BIG)
+    return (f, start, ext, dirn, prev, counted | back), back.sum()
+
+
+DOOR_LOOP = 30   # decisions (3 s): the same door moved again by the same operator this soon is a loop
+
+
+def _door_loops(dl, event, at):
+    """(ep13 8.16) dl = (the door each operator last moved (its middle), decisions since), event: started moving a door
+    now, at: which. -> (dl, loops now: moving the door he moved DOOR_LOOP decisions ago or less)."""
+    last_at, since = dl
+    loop = event & (since <= DOOR_LOOP) & (jnp.abs(at - last_at).max(-1) < 0.05)
+    last_at = jnp.where(event[:, None], at, last_at)
+    since = jnp.where(event, 0, jnp.minimum(since + 1, DOOR_LOOP + 1))
+    return (last_at, since), loop.sum()
 
 
 def centered_ranks(f):
@@ -192,8 +251,11 @@ def make_generation(cfg: CQBESConfig, game: CQBGame, me: int, opponents: list, s
     def member(center, k, s, groups):
         eps = noise(k)
         p = dict(center, **{n: center[n] + s * sig[n] * eps[n] for n in names})
-        score, thrown, hit_them, hit_me, _, off, prog = play(p, groups)
+        score, thrown, hit_them, hit_me, side, off, prog = play(p, groups)
         coached = score + cfg.blind_bonus * hit_them - cfg.self_blind_cost * hit_me
+        coached = coached - cfg.run_cost * side[:, 6] / jnp.maximum(side[:, 5], 1)   # (ep13) running inside
+        coached = coached - cfg.turn_cost * side[:, 7] * 100 / jnp.maximum(side[:, 5], 1)   # back-and-forths a 10 s
+        coached = coached - cfg.door_cost * side[:, 8] * 100 / jnp.maximum(side[:, 5], 1)   # door loops a 10 s
         coached = coached + cfg.aim_bonus * jnp.maximum(0.0, 1.0 - off / (jnp.pi / 2)).mean(-1)   # mean: my operators
         coached = coached + cfg.hostage_bonus * prog * sign   # (ep12) the furthest the hostage got secured: attackers
                                                              # gain it, defenders lose it (d19 never learned to guard)
@@ -231,7 +293,10 @@ def make_generation(cfg: CQBESConfig, game: CQBGame, me: int, opponents: list, s
                  # (ep11 10y) watched, not scored: per round, the brain's side
                  "brain_blinded_mine": own_me.mean(), "brain_crashes": side[:, 1].mean(),
                  "brain_heard_share": side[:, 2].sum() / jnp.maximum(side[:, 0].sum(), 1),
-                 "brain_friendly_downs": side[:, 3].mean(), "brain_words": side[:, 4].mean()}
+                 "brain_friendly_downs": side[:, 3].mean(), "brain_words": side[:, 4].mean(),
+                 "brain_running_inside": side[:, 6].sum() / jnp.maximum(side[:, 5].sum(), 1),
+                 "brain_back_forth_per_min": side[:, 7].sum() * 600 / jnp.maximum(side[:, 5].sum(), 1),
+                 "brain_door_loops_per_min": side[:, 8].sum() * 600 / jnp.maximum(side[:, 5].sum(), 1)}
         return grad, stats
 
     return generation
@@ -257,6 +322,7 @@ def train(cfg: CQBESConfig, run_dir: str | Path, max_hours: float | None = None,
     game_cfg = replace(game_cfg, time_cost=cfg.time_cost, flashbangs=tuple(cfg.flashbangs), magazine=cfg.magazine,
                        spare_mags=cfg.spare_mags, time_limit=cfg.time_limit, blind_away=cfg.blind_away, hostage=cfg.hostage,
                        hostage_deep=cfg.hostage_deep, extract=cfg.extract, hostage_noise=cfg.hostage_noise,
+                       through_drywall=cfg.through_drywall, unseen_hit=cfg.unseen_hit, hostage_hit=cfg.hostage_hit,
                        health=cfg.health, react=cfg.react, route=cfg.route, feed=cfg.feed,
                        team_sizes=tuple(cfg.teams), bump=cfg.bump, ready=cfg.ready, stun=cfg.stun,
                        share_sight=cfg.share_sight, split_entry=cfg.split_entry, radio=tuple(cfg.radio),
@@ -268,6 +334,9 @@ def train(cfg: CQBESConfig, run_dir: str | Path, max_hours: float | None = None,
         state = torch.load(run_dir / "latest.pt", map_location="cpu", weights_only=False)
     elif (run_dir / "metrics.jsonl").exists():
         raise SystemExit(f"{run_dir} already has a run")
+    K = len(cfg.opponent.split(","))                    # checked before the (minutes-long) build
+    if cfg.rounds % K:
+        raise SystemExit(f"rounds ({cfg.rounds}) must divide among the {K} opponents")
     dev = jax.devices()[0]
     if not state:
         (run_dir / "config.json").write_text(json.dumps(
@@ -290,9 +359,6 @@ def train(cfg: CQBESConfig, run_dir: str | Path, max_hours: float | None = None,
     throw_row = A.N_MOVE + A.SWITCHES.index("throw")
     sig = _sigmas(cfg, params, throw_row)
     opponents = A.pool_members(cfg.opponent, 1 - me, game_cfg)
-    K = len(opponents)
-    if cfg.rounds % K:
-        raise SystemExit(f"rounds ({cfg.rounds}) must divide among the {K} opponents")
     generation = jax.jit(make_generation(cfg, game, me, opponents, sig))
     judge = jax.jit(make_judge(game, me, opponents))
     names = _evolved(params)

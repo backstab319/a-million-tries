@@ -6,7 +6,7 @@ colorTo: red
 sdk: static
 pinned: false
 license: mit
-short_description: A dark house vs my AI, 1v1, 2v1 or 2v2 with a hostage
+short_description: A dark house or a home vs my AI, 1v1 to 2v2, a hostage
 ---
 
 # The Kill House vs my AI
@@ -14,15 +14,20 @@ short_description: A dark house vs my AI, 1v1, 2v1 or 2v2 with a hostage
 A dark house you've never seen. Play the attacker against the trained AI defender from episode 9 of
 **A Million Tries**, or hold a room against its trained attacker; from episode 10, hold the room against the AI pair
 or attack with the AI as your partner; and from episode 12, two against two with a hostage: rescue it with an AI
-partner and walk it out of the house, or hold it with one.
+partner and walk it out of the house, or hold it with one; and from episode 13, the same in a real home.
 
 - **The same game the AIs trained in,** ported to JavaScript and checked against the original (`node check.mjs`):
-  every reference round under 20 seconds ends the same way (38 of 44 overall; longer ones can drift apart through
+  every reference round under 20 seconds ends the same way (54 of 60 overall; longer ones can drift apart through
   rounding, as they also do between the Python game on a GPU and on a CPU).
 - **The hostage (episode 12):** stand beside it for 3 seconds with a clear line to secure it, then walk it out of the
   house; you're slower while you lead it, and if you go down it stays where it is. The defenders know where it is
   until it's moved, after that only while they see it; they hear it being moved (8 m, less through walls). It's
-  simplified: it can't be hit.
+  simplified: it can't be hit (it can in a home: below).
+- **A real home (episode 13):** a hallway, bedrooms, a bathroom, a living room and a kitchen, with windows and
+  furniture at two heights: low furniture (a sofa, a table) stops bodies but not sight or shots; tall furniture
+  stops everything. Inside walls and doors are drywall: bullets go through them, but blind (a quarter of the usual
+  chance through one wall); brick outside walls stop them. The hostage can be hit, by either side, and that ends the round.
+  The AIs are episode 13's, trained under these rules: the attackers win about 62% against the defenders.
 - **Two vs one and two vs two:** a sighting by anyone on a team is shared, friendly fire is on, and crashing into a
   wall is loud and stuns you for half a second.
 - **You see what your light shows.** The house's walls show faintly (the AI feels them with its distance lasers);
@@ -35,7 +40,8 @@ partner and walk it out of the house, or hold it with one.
 - **Snapshots.** The game changes between episodes; the modes here are as each episode had them
   ([episode 9's code](https://github.com/backstab319/a-million-tries/tree/episode-9),
   [episode 10's](https://github.com/backstab319/a-million-tries/tree/episode-10),
-  [episode 12's](https://github.com/backstab319/a-million-tries/tree/episode-12)).
+  [episode 12's](https://github.com/backstab319/a-million-tries/tree/episode-12),
+  [episode 13's](https://github.com/backstab319/a-million-tries/tree/episode-13)).
 
 **Controls:** WASD move · mouse aim · click or Space fire · F door · Shift run · G flashbang · R reload · Esc menu.
 Needs a keyboard and a mouse.

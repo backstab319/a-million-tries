@@ -93,7 +93,7 @@ def rollout(assault: str, defense: str, building_seed: int, seed: int = 0, cfg: 
     done = h.done
     last = int(np.argmax(done)) if done.any() else game.T
     h = jax.tree.map(lambda x: x[:last + 1], h)
-    return {"cfg": cfg, "game": game, "building": cqb.make_building(building_seed, cfg), "seed": building_seed,
+    return {"cfg": cfg, "game": game, "building": cqb.house(building_seed, cfg), "seed": building_seed,
             "hist": h, "steps": last, "outcome": int(h.outcome[-1]), "assault": assault, "defense": defense}
 
 
@@ -314,7 +314,7 @@ def played(game: cqb.CQBGame, cfg: cqb.CQBConfig, result: dict, i: int, seeds, a
     h = jax.tree.map(lambda x: np.asarray(x[i]), result["history"])
     last = int(np.argmax(h.done)) if h.done.any() else game.T
     h = jax.tree.map(lambda x: x[:last + 1], h)
-    return {"cfg": cfg, "game": game, "building": cqb.make_building(int(seeds[i]), cfg), "seed": int(seeds[i]),
+    return {"cfg": cfg, "game": game, "building": cqb.house(int(seeds[i]), cfg), "seed": int(seeds[i]),
             "hist": h, "steps": last, "outcome": int(h.outcome[-1]), "assault": assault, "defense": defense}
 
 
@@ -547,7 +547,7 @@ def render_houses(out: str, *, first: int = 0, cols: int = 3, rows: int = 2, sec
             for j, r in enumerate(rects):
                 seed = first + n * len(rects) + j
                 if seed not in houses:
-                    houses[seed] = cqb.make_building(seed, cfg)
+                    houses[seed] = cqb.house(seed, cfg)
                 b = houses[seed]
                 lo, hi = b["lo"] - 3.0, b["hi"] + 3.0   # room for the entry arrows
                 V.draw_building(surf, b, V.View(r, tuple(hi - lo), tuple(lo)), starts=True)
@@ -744,11 +744,36 @@ def render_brain(tr: dict, params: dict, who: int, out: str, *, eyes: str = "all
 BAR_COLORS = {"assault": V.ASSAULT, "defense": V.DEFENSE, "muted": T.MUTED, "amber": T.AMBER}
 
 
+def _frames_under(path: str, start: float, speed: float, size: tuple[int, int]):
+    """(ep13) A video's frames as pygame surfaces at the channel's frame rate, from `start` s, at `speed`, looped,
+    blurred (its own on-screen text must not compete with the chart's)."""
+    import subprocess
+    w, h = size
+    proc = subprocess.Popen(["ffmpeg", "-v", "error", "-stream_loop", "-1", "-ss", f"{start}", "-i", path, "-an", "-vf",
+                             f"setpts=PTS/{speed},scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},"
+                             f"gblur=sigma={UNDER_BLUR},fps={T.FPS}", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE)
+    try:
+        while True:
+            buf = proc.stdout.read(w * h * 3)
+            if len(buf) < w * h * 3:
+                return
+            yield pygame.image.frombuffer(buf, (w, h), "RGB")
+    finally:
+        proc.kill()
+
+
+UNDER_DIM = 170   # alpha of the dark layer between a chart and the round under it: the footage at about a third
+UNDER_BLUR = 7    # gaussian sigma, px at 1080p
+
+
 def render_bars(bars: list[dict], out: str, *, heading: str = "", footnote: str = "", per: float = 0.9,
-                hold: float = 2.5, preset: str = "medium", top: float = 1.0, number: bool = False) -> None:
+                hold: float = 2.5, preset: str = "medium", top: float = 1.0, number: bool = False,
+                under: str = "", under_start: float = 0.0, under_speed: float = 1.0, min_seconds: float = 0.0) -> None:
     """Numbers as horizontal bars that grow one after another (e.g. Assault's win rate as each rule is added).
     bars: [{label, value 0..1, color: assault|defense|muted|amber, note}]; `top`: the value a full bar stands for;
-    `number`: print values as plain numbers (crashes a round: 7.3), not percentages."""
+    `number`: print values as plain numbers (crashes a round: 7.3), not percentages.
+    under (ep13): a video playing behind the chart, dimmed (full-screen charts lose phone viewers), from under_start
+    at under_speed, looped; the chart then runs min_seconds at least (a frozen last frame would freeze it too)."""
     W, H = T.WIDTH, T.HEIGHT
     n = len(bars)
     y0 = 300 if heading else 200
@@ -756,12 +781,19 @@ def render_bars(bars: list[dict], out: str, *, heading: str = "", footnote: str 
     label_w = max(T.font("semibold", 40).size(b["label"])[0] for b in bars) + 60
     x0, full = 120 + label_w, W - 120 - label_w - 340
     start = [0.5 + k * per for k in range(n)]
-    total = start[-1] + 0.6 + hold
+    total = max(start[-1] + 0.6 + hold, min_seconds)
     surf = pygame.Surface((W, H))
+    frames = _frames_under(under, under_start, under_speed, (W, H)) if under else None
+    dim = pygame.Surface((W, H), pygame.SRCALPHA)
+    dim.fill((*T.BG, UNDER_DIM))
     with VideoWriter(out, (W, H), preset=preset) as vw:
         for f in range(int(total * T.FPS)):
             t = f / T.FPS
-            surf.fill(T.BG)
+            if frames is not None:
+                surf.blit(next(frames), (0, 0))
+                surf.blit(dim, (0, 0))
+            else:
+                surf.fill(T.BG)
             if heading:
                 T.text(surf, heading, (120, 110), kind="display", size=60)
             for k, b in enumerate(bars):
@@ -783,3 +815,5 @@ def render_bars(bars: list[dict], out: str, *, heading: str = "", footnote: str 
             if footnote:
                 T.text(surf, footnote, (120, H - 90), kind="regular", size=28, color=T.MUTED)
             vw.write(surf)
+    if frames is not None:
+        frames.close()   # stops its ffmpeg
