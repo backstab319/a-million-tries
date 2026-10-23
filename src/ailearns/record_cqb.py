@@ -807,7 +807,7 @@ def render_bars(bars: list[dict], out: str, *, heading: str = "", footnote: str 
                     pygame.draw.rect(surf, BAR_COLORS.get(b.get("color", "assault"), V.ASSAULT),
                                      (x0, y + 18, w, row - 56), border_radius=12)
                 if grow > 0:
-                    T.text(surf, f"{b['value'] * grow:.2g}" if number else f"{b['value'] * grow:.0%}", (x0 + w + 24, y + row // 2 - 10), kind="bold", size=48,
+                    T.text(surf, (f"{b['value'] * grow:,.0f}" if abs(b['value']) >= 100 else f"{b['value'] * grow:.2g}") if number else f"{b['value'] * grow:.0%}", (x0 + w + 24, y + row // 2 - 10), kind="bold", size=48,
                            anchor="midleft", alpha=int(255 * grow))
                     if b.get("note"):
                         T.text(surf, b["note"], (x0 + w + 150, y + row // 2 - 10), kind="regular", size=30,

@@ -61,6 +61,7 @@ video used them (the model pages on Hugging Face name the tag their brains run w
 | 11, "I Gave My AI a Radio. It Ignored It 10 Times." (the radio) | [`episode-11`](https://github.com/backstab319/a-million-tries/tree/episode-11) | a radio (`--radio 4,0`), no automatic sharing (`--no-share`), two doors (`--split`), the perfect drone feed (`--feed 1`), the route (`--route`), big houses (`--house big`), the drone pilot and its protocol (`--pilot --callout --callout-way`), the asymmetric critic (`--critic-priv`); evolution with an aim bonus (`es_cqb.py`, `aim_bonus`) |
 | 12, "I Gave My AI a Hostage to Rescue" (2 vs 2) | [`episode-12`](https://github.com/backstab319/a-million-tries/tree/episode-12) | 2 vs 2 (`--teams 2,2`), one spare magazine (`--spare-mags 1`), the flashbang that blinds less when you look away (`--blind-away 0.25`), a hostage (`--hostage`), deep (`--hostage-deep 6`), walked out (`--extract`), heard when moved (`--hostage-noise 8`); coached evolution (`es_cqb.py`, `--hostage-bonus 0.5 --sigma-hostage 0.05`); the browser game's 2 vs 2 hostage modes |
 | 13, "My AI Kept Shooting the Hostage" (a home) | [`episode-13`](https://github.com/backstab319/a-million-tries/tree/episode-13) | homes (`--house home`: rooms, windows, furniture at two heights), bullets through drywall (`--through-drywall 0.5`, `--unseen-hit 0.5`), the hostage can be hit (`--hostage-hit`); calm coaching for evolution (`--run-cost 0.5 --turn-cost 0.15 --door-cost 0.05`, ranking only); the browser game's home modes |
+| 14, "My AI Designed a Race Car With No Front Wing" (the race car) | [`episode-14`](https://github.com/backstab319/a-million-tries/tree/episode-14) | a four-tyre race car on real-scale circuits (`games/race_car.py`: grip, downforce, a floor that stalls near the road, tyre heat and wear, fuel, hills and banking; `python -m ailearns.games.race_checks` road-tests it against a 911 and an F1 car); driver school (`agents/ppo_race.py`); the engineer, evolving 13 dials under a $1M price list (`agents/race_engineer.py`); the sweep, the final race and the physics audit (`scripts/race_*.py`); the cars the video raced (`episodes/14-designs-its-own-car/finalists/`). The 3D view stays private for now |
 
 ```
 git checkout episode-9
@@ -77,6 +78,11 @@ uv run games train-cqb runs/extract --es --teams 2,2 --split --spare-mags 1 --ho
 
 git checkout episode-13                                                       # the same, in a home, coached to be calm
 uv run games train-cqb runs/home --es --teams 2,2 --split --spare-mags 1 --hostage --hostage-deep 6     --extract --hostage-noise 8 --house home --through-drywall 0.5 --hostage-hit --hostage-bonus 0.5     --sigma-hostage 0.05 --run-cost 0.5 --turn-cost 0.15 --door-cost 0.05 --blind-away 0.25 --flashbangs 2,0     --magazine 30 --health 100 --react 0.3 --bump 15 --ready 0.3 --stun 0.5 --time-cost 0.01     --init-from runs/<2v2 attackers>:last --opponent camper
+
+git checkout episode-14                                                       # the race car: the whole recipe on one GPU
+uv sync --group jax
+PYTHONPATH=src python scripts/race_pipeline.py v4                             # driver, sweep, engineer, own drivers
+python scripts/race_final.py --general runs/race-v4-1 sweep=runs/race-v4-sweep:episodes/14-designs-its-own-car/finalists/sweep-v4.json     eng=runs/race-v4-eng2:episodes/14-designs-its-own-car/finalists/eng-v4-2.json f1=runs/race-v4-f1:episodes/14-designs-its-own-car/finalists/f1.json
 ```
 
 ## Licence

@@ -103,7 +103,9 @@ def load(path) -> tuple[dict, dict]:
 
 # ── training ────────────────────────────────────────────────────────────────
 
-def make_update(cfg: CarPPOConfig, game: CarGame, n_local: int, n_dev: int):
+def make_update(cfg: CarPPOConfig, game: CarGame, n_local: int, n_dev: int, per_lap: bool = True):
+    """One PPO update (drive, advantages, learn). per_lap=False logs progress in metres instead of laps (the racing
+    sandbox's circuits differ a lot in length, so laps don't compare)."""
     T = cfg.n_steps
     mb = cfg.minibatch // n_dev
     n_mb = (T * n_local) // mb
@@ -134,7 +136,7 @@ def make_update(cfg: CarPPOConfig, game: CarGame, n_local: int, n_dev: int):
             action = mean + jnp.exp(log_std) * jax.random.normal(ka, mean.shape)
             logp = log_prob(mean, log_std, action)
             env, reward = vstep(env, action)
-            laps = env.progress / game.tracks.length[env.track]  # read before the reset
+            laps = env.progress / game.tracks.length[env.track] if per_lap else env.progress  # before the reset
             seconds = env.t * game.cfg.dt
             done, crashed = env.done, env.crashed
             env = vreset(env, jax.random.split(kr, n_local))
