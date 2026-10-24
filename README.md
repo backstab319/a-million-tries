@@ -21,6 +21,7 @@ reinforcement learning (PPO) are built from scratch.
 | `src/ailearns/play.py`, `drive.py`, `play_tag.py` | play Snake, drive the race car, or play tag against a trained AI yourself |
 | `web/` | the browser games: JavaScript ports of the games and the trained AIs, checked against Python (`node web/*/check.mjs`) |
 | `tests/` | the games and trainers, checked against each other |
+| `learn/` | beginner tutorials: `learn/snake-from-zero/` is "AI learns Snake, from zero" (one plain Python file, no AI library; [open the notebook in Colab](https://colab.research.google.com/github/backstab319/a-million-tries/blob/main/learn/snake-from-zero/snake.ipynb), nothing to install) |
 
 ## Run it
 
