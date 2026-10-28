@@ -26,6 +26,8 @@ AMBER = (251, 191, 36)
 BLUE = (96, 165, 250)
 PURPLE = (167, 139, 250)
 ORANGE = (251, 146, 60)
+# (episode 15) one colour per car on a race grid, as distinct as 8 can be on the dark background
+CARS = [GREEN, RED, BLUE, AMBER, PURPLE, ORANGE, (45, 212, 191), (244, 114, 182)]
 
 FONT_FILES = {
     "regular": "Inter-Regular.ttf",

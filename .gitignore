@@ -18,3 +18,14 @@ assets/cqb/mixamo/
 
 # recorded rounds for the 3D page (scripts/cqb_replay.py): remade from the checkpoints, too big for git
 web/cqb/replays/
+
+# live stream: per-session files (docs/stream-plan.md)
+web/race/replays/stream-*.json
+web/race/replays/stream-*.json.tmp
+.stream-*.json
+
+# local run logs and the Playwright MCP scratch folder
+logs/
+.playwright-mcp/
+# race day 3D replays (scripts/race_field_replay.py): ~36 MB a race, rebuilt from out/ep15/*-full.npz
+web/race/replays/ep15-*.json

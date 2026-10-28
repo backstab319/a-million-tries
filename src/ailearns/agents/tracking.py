@@ -53,7 +53,7 @@ def log(run, stats: dict) -> None:
     if run is None:
         return
     try:
-        run.log({k: v for k, v in stats.items() if v is not None}, step=stats["steps"])
+        run.log({k: v for k, v in stats.items() if v is not None}, step=stats.get("steps", stats.get("update")))  # ES logs generations
     except Exception:
         pass
 

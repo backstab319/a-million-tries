@@ -43,6 +43,31 @@ def test_car_at_rest_stays_put_and_straight_line_stays_straight():
     assert abs(float(s.pos[1])) < 1e-3 and abs(float(s.yaw)) < 1e-4
 
 
+def test_reverse_gear_only_from_a_standstill():
+    """F1 cars must carry a reverse gear (to back out of a tangle). Selected at a standstill, the throttle drives the
+    car backwards; the brakes stop it without rolling it forward; released at a standstill, it drives forward again.
+    Asked for at speed it does nothing, and without the input (old drivers: two inputs) there's no reverse at all."""
+    p = rc.derive(*rc.F1_LIKE)
+    run = jax.jit(lambda s, a: rc.drive(p, s, a)[0])
+
+    def hold(s, a, seconds):
+        for _ in range(int(seconds / 0.05)):
+            s = run(s, jnp.array(a))
+        return s
+
+    s = hold(rc.car_at([0, 0], 0.0), [0.0, 1.0, 1.0], 2.0)
+    assert int(s.gear) == 0 and -float(p.gear_top[0]) - 0.5 < float(s.vx) < -3.0 and float(s.pos[0]) < -1.0
+    assert float(s.fuel_used) > 0
+    s = hold(s, [0.0, -1.0, 0.0], 2.0)  # brakes, reverse released: stops dead, still in reverse until it does
+    assert abs(float(s.vx)) < 1e-3
+    s = hold(s, [0.0, 1.0, 0.0], 1.0)  # stopped and released: forward again
+    assert int(s.gear) >= 1 and float(s.vx) > 3.0
+    fast = hold(rc.car_at([0, 0], 0.0, speed=30.0), [0.0, 1.0, 1.0], 0.5)  # at speed the button does nothing
+    assert int(fast.gear) >= 1 and float(fast.vx) > 30.0
+    still = hold(rc.car_at([0, 0], 0.0), [0.0, -1.0], 1.0)  # two inputs: braking at a standstill stays put
+    assert float(still.vx) == 0.0 and int(still.gear) >= 1
+
+
 def test_left_and_right_turns_mirror():
     p = rc.derive(*rc.PORSCHE_911)
     ends = []

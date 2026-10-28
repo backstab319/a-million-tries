@@ -25,6 +25,7 @@ The model (body frame: x forward, y left; SI units throughout):
   same work). Grip fades slowly as the tread goes, then falls off a cliff near the end.
 - Fuel: the car starts with fuel for the run (enough at its engine's burn rate, plus a reserve: bigger engines start
   heavier) and burns it with the power it uses (petrol's energy at a racing engine's efficiency), getting lighter.
+  When the tank is empty the engine stops pushing (it still drags: engine braking).
 - Weight transfer: forward/back under braking and acceleration, left/right in corners (split between the axles by
   the roll-stiffness balance), from the accelerations a moment ago (soft springs settle slower).
 - Aero: drag, and downforce from the front wing, rear wing and floor, all growing with speed squared; the balance
@@ -39,7 +40,8 @@ The model (body frame: x forward, y left; SI units throughout):
 - Engine: constant torque up to 80% of the rev limit, constant power above; an automatic gearbox (always the gear
   with the most push; each change cuts the drive briefly). Spinning parts: the wheels, and through the gears the
   engine, have to be spun up too, so the car accelerates as if heavier, most in first gear (the engine's share grows
-  with the gear ratio squared). Off the throttle the engine holds the driven wheels back (engine braking, growing
+  with the gear ratio squared). A reverse gear (F1 rules require one), selected at a standstill, pushes like first.
+  Off the throttle the engine holds the driven wheels back (engine braking, growing
   with the revs). Front, rear or four-wheel drive (any split), a
   limited-slip differential on each driven axle. Brakes with a front/rear bias. A rate-limited steering rack.
 - Air: drag and downforce multipliers per car (`Air`), so a car in another's wake can get a tow and lose downforce
@@ -187,6 +189,23 @@ ROAD = replace(   # a road sports car (for the reality checks): heavier, road ty
     shift_s=0.2, brake_g=1.4, max_steer=0.6, steer_rate=1.5, engine_inertia=0.12, rev_limit_rpm=7500.0,
     temp_best=80.0, temp_window=60.0, temp_loss=0.1)  # road tyres: a wide, forgiving window
 
+# Race day's tyre compounds (episode 15), on top of a class spec: (grip, wear, best temperature shift in C).
+# Grip: ~0.5-0.7 s a lap between neighbours on a ~90 s lap (Pirelli's usual soft/medium/hard gaps), checked in the
+# devlog. Wear is x the spec's wear_rate (~150 km a set): real F1 sets last ~20-40 laps of a 90 min race, so ours
+# wear ~2-3x faster to give a 25 min race the same choice (softs ~40 km, mediums ~70, hards ~100; Pirelli-like
+# 1 : 1.6 : 2.4). Softer compounds work at lower temperatures (Pirelli's "low" and "high working range" compounds).
+COMPOUNDS = ("soft", "medium", "hard")
+COMPOUND_GRIP = (1.03, 1.0, 0.975)
+COMPOUND_WEAR = (3.6, 2.2, 1.5)
+COMPOUND_TEMP = (-5.0, 0.0, 5.0)
+
+
+def with_compound(p: "CarParams", compound) -> "CarParams":
+    """The car on these tyres (an index into COMPOUNDS)."""
+    pick = lambda xs: jnp.asarray(xs, jnp.float32)[compound]
+    return p._replace(mu=p.mu * pick(COMPOUND_GRIP), wear_rate=p.wear_rate * pick(COMPOUND_WEAR),
+                      temp_best=p.temp_best + pick(COMPOUND_TEMP))
+
 
 class CarParams(NamedTuple):
     """Physics constants of one car (scalars unless noted; vmap over many cars)."""
@@ -249,6 +268,7 @@ class CarParams(NamedTuple):
     wear_loss: jax.Array
     wear_cliff: jax.Array
     fuel_per_j: jax.Array  # kg of fuel per joule at the wheels
+    fuel_tank: jax.Array   # kg of fuel at the start: when it's all burned, the engine stops
 
 
 def _awd(d):
@@ -373,7 +393,7 @@ def derive(d, spec: CarSpec = RACE) -> CarParams:
         temp_air=f(spec.temp_air), tyre_heat_cap=f(spec.tyre_heat_cap), tyre_cool=f(spec.tyre_cool),
         tyre_cool_v=f(spec.tyre_cool_v), heat_share=f(spec.heat_share), wear_rate=f(spec.wear_rate),
         wear_hot=f(spec.wear_hot), wear_loss=f(spec.wear_loss), wear_cliff=f(spec.wear_cliff),
-        fuel_per_j=f(1.0 / (spec.thermal_eff * PETROL_J_PER_KG * spec.drivetrain)))
+        fuel_per_j=f(1.0 / (spec.thermal_eff * PETROL_J_PER_KG * spec.drivetrain)), fuel_tank=fuel_start_kg(d, spec))
 
 
 class Surface(NamedTuple):
@@ -385,10 +405,12 @@ class Surface(NamedTuple):
 
 
 class Air(NamedTuple):
-    """The air the car is in: multipliers on drag and on front/rear downforce (clean air: all 1)."""
+    """The air the car is in: multipliers on drag, on the front and rear wings' downforce and on the floor's (clean
+    air: all 1). Turbulent air hurts wings far more than a ground-effect floor (why F1 went back to floors in 2022)."""
     drag: jax.Array
     down_front: jax.Array
     down_rear: jax.Array
+    floor: jax.Array = 1.0
 
 
 class Slope(NamedTuple):
@@ -400,7 +422,7 @@ class Slope(NamedTuple):
 
 
 TARMAC = Surface(jnp.ones(4), jnp.zeros(4), jnp.full(4, 0.03), jnp.zeros(4))
-CLEAN_AIR = Air(jnp.asarray(1.0), jnp.asarray(1.0), jnp.asarray(1.0))
+CLEAN_AIR = Air(jnp.asarray(1.0), jnp.asarray(1.0), jnp.asarray(1.0), jnp.asarray(1.0))
 FLAT = Slope(jnp.asarray(0.0), jnp.asarray(0.0), jnp.asarray(1.0))
 
 
@@ -413,7 +435,7 @@ class CarState(NamedTuple):
     steer: jax.Array    # road-wheel angle now, radians
     ax: jax.Array       # felt accelerations a moment ago (for weight transfer), m/s^2
     ay: jax.Array
-    gear: jax.Array     # 1-based
+    gear: jax.Array     # 1-based; 0: reverse
     shift: jax.Array    # seconds left of the current gear change (no drive meanwhile)
     ride: jax.Array     # (2,) floor height at the front and rear axle a moment ago, metres (negative: bottomed)
     temp: jax.Array     # (4,) tyre temperatures, C
@@ -479,8 +501,9 @@ def _axle_split(total, cap_l, cap_r, bias):
     return left, total - left
 
 
-def _substep(p: CarParams, s: CarState, steer_in, pedal, surf: Surface, air: Air, slope: Slope, dt):
-    """One physics step. steer_in, pedal in [-1, 1] (pedal > 0 throttle, < 0 brake)."""
+def _substep(p: CarParams, s: CarState, steer_in, pedal, surf: Surface, air: Air, slope: Slope, dt, reverse=0.0):
+    """One physics step. steer_in, pedal in [-1, 1] (pedal > 0 throttle, < 0 brake); reverse > 0.5 asks for
+    reverse gear (see `drive`)."""
     # steering rack: moves toward the asked angle at a limited rate
     want = jnp.clip(steer_in, -1, 1) * p.max_steer
     steer = s.steer + jnp.clip(want - s.steer, -p.steer_rate * dt, p.steer_rate * dt)
@@ -500,8 +523,9 @@ def _substep(p: CarParams, s: CarState, steer_in, pedal, surf: Surface, air: Air
     beta = jnp.arctan2(jnp.abs(s.vy), jnp.maximum(jnp.abs(s.vx), 5.0))  # slide angle (floored at walking pace)
     yaw_keep = jnp.clip(1 - p.yaw_down_loss * beta ** 2, 0.0, 1.0)       # sideways air: less downforce
     floor = q * p.cla_floor * ground * yaw_keep
-    down_f = (floor * p.floor_front + q * p.cla_front * yaw_keep) * air.down_front
-    down_r = (floor * (1 - p.floor_front) + q * p.cla_rear * yaw_keep) * air.down_rear
+    floor = floor * air.floor
+    down_f = floor * p.floor_front + q * p.cla_front * yaw_keep * air.down_front
+    down_r = floor * (1 - p.floor_front) + q * p.cla_rear * yaw_keep * air.down_rear
 
     # axle loads: static (times the road's load factor: crests, dips, banking) + downforce + longitudinal weight
     # transfer (from the accelerations a moment ago)
@@ -535,22 +559,29 @@ def _substep(p: CarParams, s: CarState, steer_in, pedal, surf: Surface, air: Air
 
     # what the driver asks of each tyre: drive (split front/rear by the layout, then across each axle by its
     # differential) or brake (by the bias)
-    push, best = engine_force(p, s.vx, s.gear)
+    push, best = engine_force(p, s.vx, jnp.maximum(s.gear, 1))
+    # reverse gear (F1 cars must have one): selected only at a standstill, and it stays in until the car stops again
+    # with it released. It pushes like first gear (same ratio), backwards.
+    rev = jnp.where(jnp.abs(s.vx) < 1.0, reverse > 0.5, s.gear == 0)
+    back = -s.vx
+    push_r = jnp.where(back <= p.gear_top[0], p.power / jnp.maximum(back, 0.8 * p.gear_top[0]), 0.0)
+    push, best = jnp.where(rev, push_r, push), jnp.where(rev, 0, best).astype(jnp.int32)
     shifting = best != s.gear
     shift = jnp.where(shifting, p.shift_s, jnp.maximum(s.shift - dt, 0.0))
     push = jnp.where(shift > 0, 0.0, push)  # the clutch is open while the gear changes
+    push = jnp.where(s.fuel_used < p.fuel_tank, push, 0.0)  # out of fuel: the engine stops
     throttle, brake = jnp.maximum(pedal, 0.0), jnp.maximum(-pedal, 0.0)
-    gt = p.gear_top[best - 1]
-    engaged = (shift <= 0) & (s.vx > 0.8 * p.gear_top[0])   # clutch closed: not shifting, not slipping at a launch
+    gt = p.gear_top[jnp.maximum(best, 1) - 1]
+    engaged = (shift <= 0) & (s.vx > 0.8 * p.gear_top[0]) & ~rev   # clutch closed: not shifting, not slipping at a launch
     revs = jnp.clip(s.vx / gt, 0.0, 1.0)
     engine_drag = jnp.where(engaged, p.engine_brake * p.power / gt * revs, 0.0)
-    total = throttle * push - (1 - throttle) * engine_drag
+    total = jnp.where(rev, -throttle * push, throttle * push - (1 - throttle) * engine_drag)
     cap = p.mu_long * fmax
     fl, fr = _axle_split(total * p.drive_front, cap[0], cap[1], p.diff_bias)
     rl, rr = _axle_split(total * (1 - p.drive_front), cap[2], cap[3], p.diff_bias)
     drive = jnp.stack([fl, fr, rl, rr])
     bshare = jnp.stack([p.brake_front / 2, p.brake_front / 2, (1 - p.brake_front) / 2, (1 - p.brake_front) / 2])
-    stop_cap = m * jnp.maximum(s.vx, 0.0) / dt                      # brakes can stop the car, never reverse it
+    stop_cap = m * jnp.abs(s.vx) / dt                               # brakes can stop the car, never reverse it
     braking = brake * jnp.minimum(p.brake_force, stop_cap) * bshare
     fx_ask = drive - braking * jnp.sign(u + 1e-6)
 
@@ -560,10 +591,10 @@ def _substep(p: CarParams, s: CarState, steer_in, pedal, surf: Surface, air: Air
     ratio = fx_ask / fmax_x
     sliding = jnp.abs(ratio) > 1.0
     gripping_fy = fy_pure * jnp.sqrt(jnp.maximum(1 - ratio ** 2, 0.0))
-    locked = sliding & (fx_ask < 0)
+    locked = sliding & ((fx_ask < 0) != rev)  # against the gear's drive: braking (in reverse, a push forward)
     vmag = jnp.hypot(u, w) + 1e-3                                   # a locked tyre: friction against its motion
     lock_fx, lock_fy = -p.slide * fmax_x * u / vmag, -p.slide * fmax * w / vmag
-    spin_fx = p.slide * fmax_x                                      # a spinning tyre: most grip goes to pushing
+    spin_fx = p.slide * fmax_x * jnp.sign(fx_ask)                   # a spinning tyre: most grip goes to pushing
     spin_fy = fy_pure * jnp.sqrt(1 - p.slide ** 2)
     fx = jnp.where(sliding, jnp.where(locked, lock_fx, spin_fx), fx_ask)
     fy = jnp.where(sliding, jnp.where(locked, lock_fy, spin_fy), gripping_fy)
@@ -595,7 +626,8 @@ def _substep(p: CarParams, s: CarState, steer_in, pedal, surf: Surface, air: Air
     vx = s.vx + ((fx_tot + m * slope.gx) / m_long + s.r * s.vy) * dt  # gravity along the slope moves the car ...
     vy = s.vy + ((fy_tot + m * slope.gy) / m - s.r * s.vx) * dt     # ... but the springs only feel the tyres
     r = s.r + moment / p.yaw_inertia * dt
-    vx = jnp.where((brake > 0) & (s.vx >= 0) & (vx < 0), 0.0, vx)  # braking to a stop doesn't roll backwards
+    way = jnp.where(rev, -1.0, 1.0)  # braking to a stop doesn't roll the other way (or against the gear from a standstill)
+    vx = jnp.where((brake > 0) & ((s.vx * vx < 0) | ((s.vx == 0) & (vx * way < 0))), 0.0, vx)
 
     # walking pace: blend into the kinematic (no-slip) model
     blend = jnp.clip((jnp.abs(vx) - 3.0) / 3.0, 0.0, 1.0)
@@ -608,7 +640,7 @@ def _substep(p: CarParams, s: CarState, steer_in, pedal, surf: Surface, air: Air
 
     felt_x, felt_y = fx_tot / m_long, fy_tot / m
     k = dt / (dt + p.settle)  # soft springs: the weight takes longer to move
-    burned = p.fuel_per_j * jnp.maximum(total, 0.0) * jnp.maximum(s.vx, 0.0) * dt  # the work at the wheels, as fuel
+    burned = p.fuel_per_j * jnp.maximum(total * s.vx, 0.0) * dt  # the work at the wheels (either way), as fuel
     new = CarState(pos, yaw, vx, vy, r, steer, s.ax + (felt_x - s.ax) * k, s.ay + (felt_y - s.ay) * k, best, shift,
                    ride, temp, wear, s.fuel_used + burned)
     return new, CarInfo(load, sliding, best, felt_x, felt_y, plank, down_f + down_r)
@@ -616,15 +648,17 @@ def _substep(p: CarParams, s: CarState, steer_in, pedal, surf: Surface, air: Air
 
 def drive(p: CarParams, s: CarState, action, surf: Surface = TARMAC, air: Air = CLEAN_AIR, dt: float = 0.05,
           substeps: int = 10, slope: Slope = FLAT):
-    """One decision: action = (steer, pedal), each in [-1, 1], held for dt seconds, on `surf` in `air` on `slope`.
+    """One decision: action = (steer, pedal[, reverse]), each in [-1, 1], held for dt seconds, on `surf` in `air` on
+    `slope`. reverse > 0.5 at a standstill selects reverse gear (then the throttle drives backwards); without it, never.
     Returns the new state and the last substep's CarInfo."""
+    reverse = action[2] if action.shape[0] > 2 else 0.0
 
     def body(_, carry):
         st, _info = carry
-        return _substep(p, st, action[0], action[1], surf, air, slope, dt / substeps)
+        return _substep(p, st, action[0], action[1], surf, air, slope, dt / substeps, reverse)
 
     # the first substep outside the loop gives the loop's carry real (per-device) types under shard_map
-    first = _substep(p, s, action[0], action[1], surf, air, slope, dt / substeps)
+    first = _substep(p, s, action[0], action[1], surf, air, slope, dt / substeps, reverse)
     return jax.lax.fori_loop(1, substeps, body, first)
 
 

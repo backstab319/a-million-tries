@@ -105,6 +105,8 @@ def test_wake_tows_the_car_behind_only():
     assert float(air.drag[1]) < float(air.drag[0]) < 1.0
     assert float(air.drag[2]) > 0.95 and float(air.drag[3]) == 1.0 and float(air.drag[4]) == 1.0
     assert float(air.down_front[1]) < float(air.down_rear[1])  # dirty air hits the front wing hardest
+    train = race.wake(jnp.array([[0.0, 0.0], [-10.0, 0.0], [-20.0, 0.0]]), jnp.zeros(3))
+    assert float(train.drag[2]) < float(train.drag[1])  # two cars ahead tow harder than one
 
 
 def test_designs_near_a_center_stay_near_it():
@@ -124,3 +126,45 @@ def test_circuits_have_hills_and_banking_and_keep_their_layout():
     corner = np.abs(t["curvature"]) > 1 / 60
     assert (np.sign(t["side"][corner]) != np.sign(t["curvature"][corner])).mean() > 0.9 or np.abs(t["side"]).max() < 1e-3
     assert np.allclose(race.make_track(5, CFG)["center"], t["center"])
+
+
+def _lasers_by_gather(g, st):
+    """The lasers as they were before the wall windows (step 8r): 330 segments gathered by index, the pit wall rebuilt."""
+    P = g.cfg.points
+    lo, hi = g.cfg.wall_window
+    near = (st.idx + jnp.arange(lo, hi)) % P
+    seg = jnp.concatenate([near, near + P])
+    a, b = g.tracks.wall_a[st.track, seg], g.tracks.wall_b[st.track, seg]
+    c, h = g.tracks.center[st.track], g.tracks.heading[st.track]
+    nxt = (near + 1) % P
+    at = lambda i: c[i] + g.cfg.pit_wall_lat * jnp.stack([-jnp.sin(h[i]), jnp.cos(h[i])], -1)  # noqa: E731
+    there = ((jnp.abs(g.from_pit(st.track, near)) < g.cfg.pit_wall_len)
+             & (jnp.abs(g.from_pit(st.track, nxt)) < g.cfg.pit_wall_len))[:, None]
+    a = jnp.concatenate([a, jnp.where(there, at(near), 1e6)])
+    b = jnp.concatenate([b, jnp.where(there, at(nxt), 1e6 + 1.0)])
+    ang = st.car.yaw + g.rays
+    d = jnp.stack([jnp.cos(ang), jnp.sin(ang)], -1)[:, None, :]
+    e, w = b - a, a - st.car.pos
+    den = race._cross(d, e)
+    safe = jnp.where(jnp.abs(den) < 1e-9, 1e-9, den)
+    t = race._cross(w, e) / safe
+    u = race._cross(w, d) / safe
+    hit = (jnp.abs(den) >= 1e-9) & (t > 0) & (u >= 0) & (u <= 1)
+    return jnp.minimum(jnp.min(jnp.where(hit, t, jnp.inf), axis=1), g.cfg.ray_range)
+
+
+def test_wall_windows_give_the_same_lasers():
+    cfg = race.RaceConfig(pit_lane=True)
+    g = race.RaceGame(race.make_tracks(range(3), cfg), cfg)
+    P = cfg.points
+    states = []
+    for track in range(3):  # cars all round each lap (the line, the pit lane), across the track, every heading
+        for k, i in enumerate(range(0, P, 7)):
+            st = g.init(jax.random.PRNGKey(k), design=rc.F1_LIKE[0], track=track, start=i)
+            side = jnp.stack([-jnp.sin(g.tracks.heading[track, i]), jnp.cos(g.tracks.heading[track, i])])
+            st = st._replace(car=st.car._replace(pos=st.car.pos + (k % 7 - 4.0) * 2 * side, yaw=st.car.yaw + k * 0.7))
+            states.append(st)
+    sts = jax.tree.map(lambda *x: jnp.stack(x), *states)
+    new = np.asarray(jax.jit(jax.vmap(g.lasers))(sts))
+    old = np.asarray(jax.jit(jax.vmap(lambda s: _lasers_by_gather(g, s)))(sts))
+    np.testing.assert_allclose(new, old, rtol=0, atol=1e-3)  # float rounding only (seen: 0.04 mm on 22 of 5,733)

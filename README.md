@@ -63,6 +63,7 @@ video used them (the model pages on Hugging Face name the tag their brains run w
 | 12, "I Gave My AI a Hostage to Rescue" (2 vs 2) | [`episode-12`](https://github.com/backstab319/a-million-tries/tree/episode-12) | 2 vs 2 (`--teams 2,2`), one spare magazine (`--spare-mags 1`), the flashbang that blinds less when you look away (`--blind-away 0.25`), a hostage (`--hostage`), deep (`--hostage-deep 6`), walked out (`--extract`), heard when moved (`--hostage-noise 8`); coached evolution (`es_cqb.py`, `--hostage-bonus 0.5 --sigma-hostage 0.05`); the browser game's 2 vs 2 hostage modes |
 | 13, "My AI Kept Shooting the Hostage" (a home) | [`episode-13`](https://github.com/backstab319/a-million-tries/tree/episode-13) | homes (`--house home`: rooms, windows, furniture at two heights), bullets through drywall (`--through-drywall 0.5`, `--unseen-hit 0.5`), the hostage can be hit (`--hostage-hit`); calm coaching for evolution (`--run-cost 0.5 --turn-cost 0.15 --door-cost 0.05`, ranking only); the browser game's home modes |
 | 14, "My AI Designed a Race Car With No Front Wing" (the race car) | [`episode-14`](https://github.com/backstab319/a-million-tries/tree/episode-14) | a four-tyre race car on real-scale circuits (`games/race_car.py`: grip, downforce, a floor that stalls near the road, tyre heat and wear, fuel, hills and banking; `python -m ailearns.games.race_checks` road-tests it against a 911 and an F1 car); driver school (`agents/ppo_race.py`); the engineer, evolving 13 dials under a $1M price list (`agents/race_engineer.py`); the sweep, the final race and the physics audit (`scripts/race_*.py`); the cars the video raced (`episodes/14-designs-its-own-car/finalists/`). The 3D view stays private for now |
+| 15, "My AI Race Car Refused to Make a Pit Stop" (race day) | [`episode-15`](https://github.com/backstab319/a-million-tries/tree/episode-15) | eight cars on one circuit (`games/race_field.py`: box bodies that push where they hit, damage only through the physics, dirty air and the tow, soft/medium/hard tyres that fail when worn through, a fuel limit, a pit lane with a limiter, marshals); the race school (`games/race_school.py`, `agents/ppo_field.py`), imitation of a scripted pit driver (`agents/bc_field.py`), evolution on race results (`agents/es_field.py`), the pit-wall strategist (`agents/es_strategist.py`), full races and the strategist comparison (`scripts/race_full.py`, `scripts/strat_compare.py`). The 3D view stays private |
 
 ```
 git checkout episode-9
@@ -84,6 +85,14 @@ git checkout episode-14                                                       # 
 uv sync --group jax
 PYTHONPATH=src python scripts/race_pipeline.py v4                             # driver, sweep, engineer, own drivers
 python scripts/race_final.py --general runs/race-v4-1 sweep=runs/race-v4-sweep:episodes/14-designs-its-own-car/finalists/sweep-v4.json     eng=runs/race-v4-eng2:episodes/14-designs-its-own-car/finalists/eng-v4-2.json f1=runs/race-v4-f1:episodes/14-designs-its-own-car/finalists/f1.json
+
+git checkout episode-15                                                       # race day: the driver's line, then the pit wall
+uv sync --group jax                                                           # (each step's settings: the model cards)
+python -m ailearns.agents.ppo_field runs/school --init-from runs/<ep14 driver>     # the race school (PPO)
+python -m ailearns.agents.bc_field runs/copy --field '{"init_from": "runs/school"}'   # copy the scripted pit driver
+python -m ailearns.agents.es_field runs/finish --field '{"mode": "finish", "init_from": "runs/copy:last"}'
+python -m ailearns.agents.es_strategist runs/pitwall --gens 20                     # the AI pit wall
+python scripts/strat_compare.py runs/pitwall:0 runs/pitwall:20 --races 128         # AI pit wall v the rule
 ```
 
 ## Licence

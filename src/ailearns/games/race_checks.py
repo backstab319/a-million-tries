@@ -14,13 +14,19 @@ from ailearns.games import race_car as rc
 DT = 0.05
 
 
+def _full(p):
+    """A road test measures the car, not its fuel: a tank that never runs dry (a 150 s top-speed run would empty one
+    sized for a 90 s lap)."""
+    return p._replace(fuel_tank=jnp.inf)
+
+
 def _step_all(p, s, actions):
     """Try several actions from the same state: (N, 2) -> N next states."""
-    return jax.vmap(lambda a: rc.drive(p, s, a, dt=DT)[0])(actions)
+    return jax.vmap(lambda a: rc.drive(_full(p), s, a, dt=DT)[0])(actions)
 
 
 _try = jax.jit(_step_all)
-_drive = jax.jit(lambda p, s, a: rc.drive(p, s, a, dt=DT))
+_drive = jax.jit(lambda p, s, a: rc.drive(_full(p), s, a, dt=DT))
 
 
 def zero_to(p, kmh: float = 100.0, limit_s: float = 20.0) -> float:
@@ -75,7 +81,7 @@ def cornering_g(p, kmh: float, steers: int = 48, seconds: float = 8.0) -> float:
         def body(i, carry):
             s, acc = carry
             # the pedal (of a few) that best holds the speed: a heavy foot spins the rear tyres out of the corner
-            outs = jax.vmap(lambda pd: rc.drive(p, s, jnp.stack([steer, pd]), dt=DT))(PEDALS)
+            outs = jax.vmap(lambda pd: rc.drive(_full(p), s, jnp.stack([steer, pd]), dt=DT))(PEDALS)
             k = jnp.argmin(jnp.abs(outs[0].vx - v))
             s, info = jax.tree.map(lambda x: x[k], outs)
             s = s._replace(temp=jnp.full(4, p.temp_best))
@@ -95,7 +101,7 @@ def cornering_g(p, kmh: float, steers: int = 48, seconds: float = 8.0) -> float:
 def downforce(p, kmh: float) -> float:
     """Newtons of downforce at a steady `kmh` in a straight line (the floor settles to its running height)."""
     s = rc.car_at([0, 0], 0.0, speed=kmh / 3.6, ride_height=p.ride_height)
-    hold = jax.jit(lambda s: rc.drive(p, s, jnp.array([0.0, 0.0]), dt=DT))
+    hold = jax.jit(lambda s: rc.drive(_full(p), s, jnp.array([0.0, 0.0]), dt=DT))
     for _ in range(10):
         s, info = hold(s._replace(vx=jnp.asarray(kmh / 3.6, jnp.float32)))
     return float(info.downforce)
@@ -112,16 +118,18 @@ def road_test(d, spec) -> dict:
             **{f"g @ {k}": round(cornering_g(p, k), 2) for k in (100, 200, 250)}}
 
 
-def test_driver(game, st, grip_g=1.4, brake_g=1.5):
-    """A cautious scripted test driver on a circuit (no AI): follows the centreline and slows for the corners
-    ahead. `game` is a race.RaceGame, `st` its State; returns the action. For tests and the debug view."""
+def test_driver(game, st, grip_g=1.4, brake_g=1.5, offset=0.0):
+    """A cautious scripted test driver on a circuit (no AI): follows the centreline (or a line `offset` metres to its
+    left, e.g. the pit lane) and slows for the corners ahead. `game` is a race.RaceGame, `st` its State; returns the
+    action. For tests and the debug view."""
     car = st.car
     p = rc.derive(st.design, game.spec)
     # pure pursuit: steer for a point on the centreline further ahead the faster it goes
     look = jnp.maximum(12.0, 0.6 * car.vx)
     P, L = game.cfg.points, game.tracks.length[st.track]
     k = ((st.lap_pos + look) / L * P).astype(jnp.int32) % P
-    to = game.tracks.center[st.track, k] - car.pos
+    h = game.tracks.heading[st.track, k]
+    to = game.tracks.center[st.track, k] + offset * jnp.stack([-jnp.sin(h), jnp.cos(h)]) - car.pos
     alpha = (jnp.arctan2(to[1], to[0]) - car.yaw + jnp.pi) % (2 * jnp.pi) - jnp.pi
     steer = jnp.arctan(2 * (p.a + p.b) * jnp.sin(alpha) / jnp.linalg.norm(to)) / game.spec.max_steer
     curv_here = game.tracks.curvature[st.track, st.idx]

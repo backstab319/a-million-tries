@@ -55,10 +55,24 @@ class RaceConfig:
     grass_surface: tuple = (0.35, 0.06, 0.30, 0.0)  # dry grass under a slick ~0.3-0.4 of tarmac, bumpier than a kerb
     dirt_grip: float = 0.10      # share of grip a tyre loses with grass and dirt on it ...
     dirt_clear: float = 3.0      # ... wearing off over this many seconds back on tarmac
+    flat_grip: float = 0.4       # a punctured tyre: grip share left on a collapsing carcass (est.) ...
+    flat_rolling: float = 0.10   # ... and the extra rolling resistance as it flaps and the rim drags (est.; grass 0.06)
     tyre_start: float = 70.0     # tyre temperature (C) at the start: out of the blankets (F1 blankets: 70 C)
     hill_range: tuple = (3.0, 40.0)  # metres from a circuit's lowest point to its highest (Monza ~10, Spa ~100)
     max_grade: float = 0.12      # steepest climb or drop (12%: Eau Rouge-steep; most circuits much less)
     bank_deg: tuple = (3.0, 10.0)  # banking in tight corners: most circuits (80%) up to the first, the rest the second
+    # race day's pit lane: tarmac on the right of each circuit's straightest stretch (not always the start line: on
+    # some circuits that's in a chicane), behind a pit wall, with an automatic speed limiter
+    pit_lane: bool = False
+    pit_entry: float = 250.0     # metres before the pit's middle where the lane leaves the track ...
+    pit_exit: float = 250.0      # ... and after it where it rejoins
+    pit_wall_len: float = 150.0  # the pit wall runs this far either side of the middle (the entry and exit are open)
+    pit_wall_lat: float = -7.0   # metres from the centreline (right negative): the wall, 1 m past the track's edge ...
+    pit_outer: float = -14.0     # ... and the lane's outer edge (the lane is 6 m of tarmac; grass, then the wall)
+    pit_limit: float = 80 / 3.6  # m/s: F1's usual pit lane limit
+    pit_governor: float = 5.0    # m/s over the limit at which the limiter brakes its hardest (easing in below) ...
+    pit_brake: float = 0.4       # ... this much pedal: firm, short of locking the wheels (full braking at low
+                                 # downforce locks the fronts and the car can't steer)
 
     @property
     def obs_size(self) -> int:
@@ -170,28 +184,42 @@ def make_tracks(seeds, cfg: RaceConfig = RaceConfig()) -> Tracks:
 @dataclass(frozen=True)
 class WakeConfig:
     """A car leaves a wake behind it: slower air (a tow: less drag for the car behind) that's also turbulent (dirty
-    air: less downforce, the front wing worst hit). First estimates, to be checked against published figures before
-    they're claimed on screen: ~30% less drag right behind, fading over ~25 m; ~40% less front downforce."""
-    reach: float = 80.0          # metres behind a car where its wake still counts
-    fade: float = 25.0           # strength falls by e every this many metres
+    air: the wings lose downforce, the front one worst; a ground-effect floor barely notices).
+
+    Sized against F1's own figures (https://www.formula1.com/en/latest/article/10-things-you-need-to-know-about-the-all-new-2022-f1-car.4OLg8DrXyzHzdoGrbqp6ye):
+    a wing-heavy 2021 car lost 35% of its downforce 20 m behind and 47% 10 m behind. That ratio sets the fade
+    (e^(-10/33) = 0.74); the wing cuts make a wing-only car lose ~47% at 10 m. The F1-like car (54% floor) then loses
+    23% at 10 m (2022 cars: 18%) and 17% at 20 m (2022 cars: 4%: their wake is shaped to go up, ours isn't); the
+    ep14 engineer's small-winged car (67% floor) 16% and 12%.
+    The tow (30% less drag right behind) is an estimate, not sourced yet."""
+    reach: float = 100.0         # metres behind a car where its wake still counts
+    fade: float = 33.0           # strength falls by e every this many metres
     width: float = 1.2           # half-width of the wake right behind the car, metres ...
     spread: float = 0.03         # ... growing this much per metre back
     drag_cut: float = 0.30       # at full strength
-    front_down_cut: float = 0.40
-    rear_down_cut: float = 0.20
+    front_wing_cut: float = 0.70
+    rear_wing_cut: float = 0.55
+    floor_cut: float = 0.05
 
 
-def wake(pos, yaw, cfg: WakeConfig = WakeConfig()) -> rc.Air:
-    """The air each car is in, from the cars around it: pos (N, 2), yaw (N,) of the cars in one race -> rc.Air of
-    (N,) multipliers. The strongest wake a car is in counts (wakes don't stack)."""
+def wake(pos, yaw, speed=None, cfg: WakeConfig = WakeConfig()) -> rc.Air:
+    """The air each car is in, from the cars around it: pos (N, 2), yaw (N,), speed (N,) m/s of the cars in one race
+    -> rc.Air of (N,) multipliers. A wake is as strong as the air its car pushes along: a car going half the speed of
+    the car behind it gives half the effect, a parked car none. Wakes compound (a train of cars tows harder than one
+    car), never past full strength."""
     fwd = jnp.stack([jnp.cos(yaw), jnp.sin(yaw)], -1)                  # (N, 2) each car's heading
     rel = pos[:, None, :] - pos[None, :, :]                            # (i, j): car i relative to car j
     behind = -jnp.sum(rel * fwd[None, :, :], -1)                       # metres car i is behind car j
     side = jnp.abs(rel[..., 0] * fwd[None, :, 1] - rel[..., 1] * fwd[None, :, 0])
     half = cfg.width + cfg.spread * behind
     inside = (behind > 0) & (behind < cfg.reach) & ~jnp.eye(pos.shape[0], dtype=bool)
-    strength = jnp.where(inside, jnp.exp(-behind / cfg.fade) * jnp.exp(-(side / half) ** 2), 0.0).max(axis=1)
-    return rc.Air(1 - cfg.drag_cut * strength, 1 - cfg.front_down_cut * strength, 1 - cfg.rear_down_cut * strength)
+    each = jnp.where(inside, jnp.exp(-behind / cfg.fade) * jnp.exp(-(side / half) ** 2), 0.0)
+    if speed is not None:
+        v = jnp.maximum(speed, 0.0)
+        each = each * jnp.clip(v[None, :] / jnp.maximum(v[:, None], 1.0), 0.0, 1.0)
+    strength = 1 - jnp.prod(1 - each, axis=1)
+    return rc.Air(1 - cfg.drag_cut * strength, 1 - cfg.front_wing_cut * strength, 1 - cfg.rear_wing_cut * strength,
+                  1 - cfg.floor_cut * strength)
 
 
 # ── The game ─────────────────────────────────────────────────────────────────
@@ -214,6 +242,38 @@ class State(NamedTuple):
     done: jax.Array
 
 
+class Damage(NamedTuple):
+    """What contact has broken (race day). Shares lost run 0 (whole) to 1 (gone)."""
+    wing_front: jax.Array  # share of the front wing gone
+    wing_rear: jax.Array
+    floor: jax.Array       # share of the floor's downforce gone (a torn edge leaks the low pressure)
+    toe: jax.Array         # radians a bent steering arm turns the front wheels (left positive): the car pulls
+    puncture: jax.Array    # (4,) bool: that tyre is flat
+
+
+NO_DAMAGE = Damage(jnp.zeros(()), jnp.zeros(()), jnp.zeros(()), jnp.zeros(()), jnp.zeros(4, bool))
+
+
+class Setup(NamedTuple):
+    """What the team put on the car for the race (race day)."""
+    compound: jax.Array    # tyres: an index into rc.COMPOUNDS
+    fuel: jax.Array | None = None  # kg of fuel at the start (race day's fuel limit); None: the class's usual load
+    wear: jax.Array | None = None  # (step 9e) x the compound's wear rate (the race's distance scaling); None: x1
+
+
+def pit_spots(tracks: Tracks, cfg: RaceConfig) -> np.ndarray:
+    """(T,) metres along each circuit to the middle of its pit lane: the middle of its straightest stretch (the
+    least curved, at its most curved point, from the pit entry to the exit)."""
+    curv = np.abs(np.asarray(tracks.curvature))
+    out = []
+    for k, L in enumerate(np.asarray(tracks.length)):
+        P = curv.shape[1]
+        before, after = (int(np.ceil(d / L * P)) for d in (cfg.pit_entry, cfg.pit_exit))
+        worst = np.array([curv[k, (i + np.arange(-before, after + 1)) % P].max() for i in range(P)])
+        out.append(int(np.argmin(worst)) * L / P)
+    return np.array(out)
+
+
 def _cross(a, b):
     return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
 
@@ -224,6 +284,31 @@ class RaceGame:
         self.spec = replace(spec, race_s=cfg.time_limit) if spec.race_s > 0 else spec  # fuel for the run's length
         self.rays = jnp.deg2rad(jnp.asarray(cfg.ray_angles, jnp.float32))
         self.ahead = jnp.asarray(cfg.ahead, jnp.float32)
+        self.pit_at = jnp.asarray(pit_spots(tracks, cfg) if cfg.pit_lane else np.zeros(len(tracks.length)), jnp.float32)
+        self._wall_windows()
+
+    def _wall_windows(self):
+        """(speed, step 8r) The lasers' wall segments laid out once: per circuit and centreline point, the left wall,
+        the right wall and the pit wall (far away where there is none), padded by the window so a car's window is one
+        contiguous slice. Before, each laser call gathered 330 segments by index and rebuilt the pit wall with sin/cos.
+        The same segments either way (tests/test_race.py checks the lasers match)."""
+        cfg, t = self.cfg, self.tracks
+        P = cfg.points
+        lo, hi = cfg.wall_window
+        idx = jnp.arange(P)
+        a = jnp.stack([t.wall_a[:, :P], t.wall_a[:, P:]], 2)  # (T, P, 2 walls, 2)
+        b = jnp.stack([t.wall_b[:, :P], t.wall_b[:, P:]], 2)
+        if cfg.pit_lane:
+            nxt = (idx + 1) % P
+            at = lambda i: t.center[:, i] + cfg.pit_wall_lat * jnp.stack(  # noqa: E731
+                [-jnp.sin(t.heading[:, i]), jnp.cos(t.heading[:, i])], -1)
+            tr = jnp.arange(t.length.shape[0])[:, None]
+            there = ((jnp.abs(self.from_pit(tr, idx[None])) < cfg.pit_wall_len)
+                     & (jnp.abs(self.from_pit(tr, nxt[None])) < cfg.pit_wall_len))[..., None]
+            a = jnp.concatenate([a, jnp.where(there, at(idx), 1e6)[:, :, None]], 2)
+            b = jnp.concatenate([b, jnp.where(there, at(nxt), 1e6 + 1.0)[:, :, None]], 2)
+        pad = lambda x: jnp.concatenate([x, x[:, : hi - lo]], 1)  # noqa: E731  # the window wraps past the line
+        self._win_a, self._win_b = pad(a), pad(b)
 
     # where the car is on the circuit
     def _locate(self, track, idx, pos):
@@ -246,22 +331,50 @@ class RaceGame:
         L = self.tracks.length[track]
         return j, lat, (frac * L / P) % L
 
-    def _surfaces(self, st_car: rc.CarState, p: rc.CarParams, track, idx, lat):
-        """What's under each tyre (rc.Surface), and how far out the furthest tyre is."""
-        cfg = self.cfg
+    def _tyre_lats(self, st_car: rc.CarState, p: rc.CarParams, track, idx, lat):
+        """(4,) each tyre's signed offset from the centreline (left positive)."""
         normal_ang = self.tracks.heading[track, idx] + jnp.pi / 2
         n = jnp.stack([jnp.cos(normal_ang), jnp.sin(normal_ang)])
         wx = jnp.stack([p.a, p.a, -p.b, -p.b])
         wy = jnp.stack([p.track_width / 2, -p.track_width / 2, p.track_width / 2, -p.track_width / 2])
         cy, sy = jnp.cos(st_car.yaw), jnp.sin(st_car.yaw)
         offs = jnp.stack([wx * cy - wy * sy, wx * sy + wy * cy], 1)  # (4, 2) world offsets of the tyres
-        wlat = jnp.abs(lat + offs @ n)
+        return lat + offs @ n
+
+    def from_pit(self, track, idx):
+        """Metres from the middle of the pit lane along the lap, -L/2 to L/2 (negative: still to come)."""
+        L = self.tracks.length[track]
+        return (idx * L / self.cfg.points - self.pit_at[track] + L / 2) % L - L / 2
+
+    def in_pit_zone(self, track, idx):
+        s = self.from_pit(track, idx)
+        return (s > -self.cfg.pit_entry) & (s < self.cfg.pit_exit)
+
+    def in_pit_lane(self, st: State):
+        """The car's centre is past the pit wall's line, between the pit entry and exit (the limiter is on)."""
+        return self.cfg.pit_lane & self.in_pit_zone(st.track, st.idx) & (st.lat < self.cfg.pit_wall_lat)
+
+    def _surfaces(self, st_car: rc.CarState, p: rc.CarParams, track, idx, lat):
+        """What's under each tyre (rc.Surface), and how far out the furthest tyre is."""
+        cfg = self.cfg
+        tl = self._tyre_lats(st_car, p, track, idx, lat)
+        wlat = jnp.abs(tl)
         half = cfg.width / 2
         on_kerb = (wlat > half - cfg.kerb) & (wlat <= half)
         on_grass = wlat > half
+        if cfg.pit_lane:  # the pit lane's tarmac: from the track's edge out to the lane's outer edge
+            on_grass = on_grass & ~(self.in_pit_zone(track, idx) & (tl < -half) & (tl >= cfg.pit_outer))
         pick = [jnp.where(on_grass, g, jnp.where(on_kerb, k, t))
                 for t, k, g in zip(cfg.tarmac_surface, cfg.kerb_surface, cfg.grass_surface)]
         return rc.Surface(*pick), wlat.max()
+
+    def _hits_pit_wall(self, st_car: rc.CarState, p: rc.CarParams, track, idx, lat):
+        """The car's tyres are on both sides of the pit wall (or within 0.3 m of it): the body's in it."""
+        cfg = self.cfg
+        tl = self._tyre_lats(st_car, p, track, idx, lat)
+        w = cfg.pit_wall_lat
+        along = jnp.abs(self.from_pit(track, idx)) < cfg.pit_wall_len
+        return along & (tl.min() < w + 0.3) & (tl.max() > w - 0.3)
 
     def init(self, key, design=None, track=None, start=None, random_start: bool = True) -> State:
         """A car on the centreline, facing along the circuit (at point `start`, else a random point, else the start
@@ -287,24 +400,51 @@ class RaceGame:
                      jnp.zeros(2), jnp.ones(4), jnp.zeros(4), jnp.zeros(4, bool), jnp.zeros(2), jnp.asarray(False),
                      jnp.asarray(False))
 
-    def step(self, st: State, action) -> tuple[State, jax.Array]:
+    def params(self, design, setup: Setup | None = None) -> rc.CarParams:
+        p = rc.derive(design, self.spec)
+        if setup is None:
+            return p
+        p = rc.with_compound(p, setup.compound)
+        if setup.wear is not None:
+            p = p._replace(wear_rate=p.wear_rate * setup.wear)
+        if setup.fuel is not None:  # a different fuel load: a heavier (or lighter) car, a different tank
+            p = p._replace(mass=p.mass - p.fuel_tank + setup.fuel, fuel_tank=jnp.asarray(setup.fuel, jnp.float32))
+        return p
+
+    def step(self, st: State, action, damage: Damage | None = None, air: rc.Air = rc.CLEAN_AIR,
+             setup: Setup | None = None) -> tuple[State, jax.Array]:
         cfg = self.cfg
         action = jnp.clip(jnp.asarray(action, jnp.float32), -1, 1)
-        p = rc.derive(st.design, self.spec)
+        design, wheels = st.design, action
+        if damage is not None:  # broken wings lose their downforce and drag (and weight)
+            design = (design.at[rc.D["wing_front"]].multiply(1 - damage.wing_front)
+                      .at[rc.D["wing_rear"]].multiply(1 - damage.wing_rear))
+        p = self.params(design, setup)
         surf, _ = self._surfaces(st.car, p, st.track, st.idx, st.lat)
         surf = surf._replace(grip=surf.grip * (1 - cfg.dirt_grip * st.dirt))  # dirty tyres grip less
-        car, info = rc.drive(p, st.car, action, surf, dt=cfg.dt, substeps=cfg.substeps, slope=self.slope(st))
+        if cfg.pit_lane:  # the pit limiter: no power over the limit, and it brakes the car down to it
+            v = jnp.hypot(st.car.vx, st.car.vy)
+            over = cfg.pit_brake * jnp.clip((v - cfg.pit_limit) / cfg.pit_governor, 0.0, 1.0)
+            wheels = jnp.where(self.in_pit_lane(st) & (v > cfg.pit_limit), wheels.at[1].set(-over), wheels)
+        if damage is not None:
+            p = p._replace(cla_floor=p.cla_floor * (1 - damage.floor))
+            wheels = wheels.at[0].add(damage.toe / p.max_steer)  # the driver has to hold opposite lock
+            surf = surf._replace(grip=jnp.where(damage.puncture, surf.grip * cfg.flat_grip, surf.grip),
+                                 rolling=surf.rolling + damage.puncture * cfg.flat_rolling)
+        car, info = rc.drive(p, st.car, wheels, surf, air, dt=cfg.dt, substeps=cfg.substeps, slope=self.slope(st))
         idx, lat, lap_pos = self._locate(st.track, st.idx, car.pos)
         surf_now, furthest = self._surfaces(car, p, st.track, idx, lat)
         L = self.tracks.length[st.track]
         moved = (lap_pos - st.lap_pos + L / 2) % L - L / 2
         crashed = furthest > cfg.edge - 0.3  # a tyre at the wall: the body's in it
+        if cfg.pit_lane:
+            crashed = crashed | self._hits_pit_wall(car, p, st.track, idx, lat)
         t = st.t + 1
         done = crashed | (t * cfg.dt >= cfg.time_limit)
         reward = moved * cfg.progress_reward - crashed * cfg.crash_penalty
         on_grass = surf_now.grip <= cfg.grass_surface[0]
         dirt = jnp.where(on_grass, 1.0, jnp.maximum(st.dirt - cfg.dt / cfg.dirt_clear, 0.0))
-        new = State(car, st.design, st.track, idx, lat, lap_pos, st.progress + moved, t, action, surf_now.grip, dirt,
+        new = State(car, st.design, st.track, idx, lat, lap_pos, st.progress + moved, t, action[:2], surf_now.grip, dirt,
                     info.sliding, info.plank, crashed, done)
         return new, reward
 
@@ -325,11 +465,10 @@ class RaceGame:
 
     def lasers(self, st: State) -> jax.Array:
         """Metres to the nearest wall along each laser, capped at ray_range (walls near the car only)."""
-        P = self.cfg.points
         lo, hi = self.cfg.wall_window
-        near = (st.idx + jnp.arange(lo, hi)) % P
-        seg = jnp.concatenate([near, near + P])
-        a, b = self.tracks.wall_a[st.track, seg], self.tracks.wall_b[st.track, seg]
+        start = (st.idx + lo) % self.cfg.points
+        a, b = (jax.lax.dynamic_slice(w, (st.track, start, 0, 0), (1, hi - lo) + w.shape[2:]).reshape(-1, 2)
+                for w in (self._win_a, self._win_b))  # left, right (and pit) wall of each point in the window
         ang = st.car.yaw + self.rays
         d = jnp.stack([jnp.cos(ang), jnp.sin(ang)], -1)[:, None, :]
         e, w = b - a, a - st.car.pos
@@ -354,8 +493,10 @@ class RaceGame:
         k = ((st.lap_pos + self.ahead) / L * P).astype(jnp.int32) % P
         return jnp.concatenate([self.tracks.grade[st.track, k], self.tracks.side[st.track, k]])
 
-    def observe(self, st: State) -> jax.Array:
+    def observe(self, st: State, setup: Setup | None = None) -> jax.Array:
         cfg, car = self.cfg, st.car
+        temp_best = self.spec.temp_best + (0.0 if setup is None else jnp.asarray(rc.COMPOUND_TEMP)[setup.compound])
+        tank = rc.fuel_start_kg(st.design, self.spec) if setup is None or setup.fuel is None else setup.fuel
         heading_err = (car.yaw - self.tracks.heading[st.track, st.idx] + jnp.pi) % (2 * jnp.pi) - jnp.pi
         motion = jnp.stack([car.vx / 100.0, car.vy / 10.0, car.r / 2.0, car.ax / 50.0, car.ay / 50.0,
                             st.lat / (cfg.width / 2), heading_err, car.steer / self.spec.max_steer,
@@ -367,9 +508,9 @@ class RaceGame:
             motion,
             st.surface * (1 - cfg.dirt_grip * st.dirt),  # the grip each tyre has (dirt included)
             st.sliding.astype(jnp.float32),
-            (car.temp - self.spec.temp_best) / self.spec.temp_window,
+            (car.temp - temp_best) / self.spec.temp_window,  # how far from these tyres' best
             car.wear,
-            (1 - car.fuel_used / rc.fuel_start_kg(st.design, self.spec))[None],  # share of the fuel left
+            (1 - car.fuel_used / tank)[None],  # share of the fuel left
             rc.normalise(st.design),
         ])
 
