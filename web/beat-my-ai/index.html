@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>Beat my AI · A Million Tries</title>
-<meta name="description" content="Race one lap against an AI that taught itself to drive, build a car under a $1M budget and race the AI engineer's, or watch the finalists race.">
+<meta name="description" content="Race one lap against an AI that taught itself to drive, build a car under a $1M budget and race the AI engineer's, watch the finalists race, watch race day, or be the pit wall.">
 <style>
   html, body { margin: 0; height: 100%; background: #0d0f16; color: #e8eaf0; overflow: hidden;
     font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; touch-action: none; user-select: none; }
@@ -16,8 +16,10 @@
   .touch button.on { background: #262b3a; }
   @media (pointer: coarse) { .lap .touch { display: flex; } }
   a { color: #4ade80; }
-  #menu { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
-    gap: 18px; padding: 24px; box-sizing: border-box; text-align: center; }
+  #menu { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+    gap: 18px; padding: 24px; box-sizing: border-box; text-align: center; overflow-y: auto; touch-action: pan-y; }
+  /* auto margins centre it and, unlike justify-content: center, let a phone scroll to the top when it doesn't fit */
+  #menu > :first-child { margin-top: auto; } #menu > :last-child { margin-bottom: auto; }
   #menu h1 { margin: 0 0 4px; font-size: clamp(28px, 6vw, 48px); }
   #menu p { margin: 0; color: #787f94; }
   #menu button { width: min(440px, 100%); padding: 18px 20px; border-radius: 16px; border: 2px solid #262b3a;
@@ -33,10 +35,12 @@
   <p>From the YouTube channel <a href="https://www.youtube.com/@amilliontries" target="_blank">A Million Tries</a></p>
   <button data-mode="lap"><b>Race my AI</b><span>Episodes 4-5 · drive one lap yourself against the AI driver</span></button>
   <button data-mode="engineer"><b>Beat the engineer</b><span>Episode 14 · design a car under a $1M budget and race the AI engineer's car</span></button>
+  <button data-mode="pitwall"><b>Be the pit wall</b><span>Episode 15 · the race runs live: you call car 1's pit stops against the AI pit wall</span></button>
+  <button data-mode="raceday"><b>Watch race day</b><span>Episode 15 · the episode's final race, replayed: 8 cars, 25 laps, the AI pit wall v the rule</span></button>
   <button data-mode="watch"><b>Watch the final race</b><span>Episode 14 · the finalists race each other, each with its own AI driver</span></button>
 </div>
 <script type="module">
-  // the games share this page: each mode loads only its own files (?mode=lap|engineer|watch skips the menu)
+  // the games share this page: each mode loads only its own files (?mode=lap|engineer|watch|raceday|pitwall skips the menu)
   const start = (mode) => {
     document.getElementById("menu").remove();
     if (mode === "lap") {
@@ -45,11 +49,15 @@
         <div class="touch left"><button data-k="left">◀</button><button data-k="right">▶</button></div>
         <div class="touch right"><button data-k="brake">■</button><button data-k="gas">▲</button></div>`);
       import("./app.js");
-    } else { window.raceMode = mode; import("./race-app.js"); }
+    } else if (mode === "raceday" || mode === "pitwall") {
+      window.racedayMode = mode === "pitwall" ? "live" : "replay";
+      import("./raceday-app.js");
+    }
+    else { window.raceMode = mode; import("./race-app.js"); }
   };
   for (const b of document.querySelectorAll("#menu button")) b.onclick = () => start(b.dataset.mode);
   const mode = new URLSearchParams(location.search).get("mode");
-  if (["lap", "engineer", "watch"].includes(mode)) start(mode);
+  if (["lap", "engineer", "watch", "raceday", "pitwall"].includes(mode)) start(mode);
 </script>
 </body>
 </html>

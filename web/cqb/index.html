@@ -13,7 +13,8 @@
   canvas[hidden] { display: none; }
   button[data-look].on { border-color: #e8eaf0; }
   #credits { font-size: 12px; color: #787f94; margin: 10px 0 0; line-height: 1.4; }
-  #menu { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; overflow: auto; }
+  #menu { position: fixed; inset: 0; display: flex; overflow-y: auto; touch-action: pan-y; }
+  #menu > .card { margin: auto; }   /* centred, and scrollable to the top on a phone (justify-content: center isn't) */
   #menu[hidden] { display: none; }
   .card { background: #161923; border: 2px solid #262b3a; border-radius: 22px; padding: 24px 28px; max-width: 600px;
     width: calc(100vw - 80px); margin: 16px; }

@@ -9,7 +9,8 @@
   html, body { margin: 0; height: 100%; background: #0d0f16; color: #e8eaf0; overflow: hidden;
     font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; touch-action: none; user-select: none; }
   canvas { display: block; width: 100vw; height: 100vh; }
-  #menu { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  #menu { position: fixed; inset: 0; display: flex; overflow-y: auto; touch-action: pan-y; }
+  #menu > .card { margin: auto; }   /* centred, and scrollable to the top on a phone (justify-content: center isn't) */
   #menu[hidden] { display: none; }
   .card { background: #161923; border: 2px solid #262b3a; border-radius: 22px; padding: 26px 28px; max-width: 560px;
     width: calc(100vw - 80px); }

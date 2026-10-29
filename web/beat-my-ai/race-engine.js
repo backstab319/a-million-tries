@@ -116,7 +116,7 @@ export class Car {
       temp_loss: sp.temp_loss, temp_floor: sp.temp_floor, temp_air: sp.temp_air, tyre_heat_cap: sp.tyre_heat_cap,
       tyre_cool: sp.tyre_cool, tyre_cool_v: sp.tyre_cool_v, heat_share: sp.heat_share, wear_rate: sp.wear_rate,
       wear_hot: sp.wear_hot, wear_loss: sp.wear_loss, wear_cliff: sp.wear_cliff,
-      fuel_per_j: 1 / (sp.thermal_eff * this.PETROL * sp.drivetrain),
+      fuel_per_j: 1 / (sp.thermal_eff * this.PETROL * sp.drivetrain), fuel_tank: this.fuelStart(d),
     };
   }
 
@@ -155,9 +155,11 @@ function axleSplit(total, capL, capR, bias) {  // a limited-slip differential: (
   return [left, total - left];
 }
 
-// One physics step. steerIn, pedal in [-1, 1]. surf: {grip, rolling, rough, lift} (4 each); slope {gx, gy, load}.
-// Returns [new state, info].
-function substep(G, RHO, p, s, steerIn, pedal, surf, slope, dt) {
+export const CLEAN_AIR = { drag: 1, down_front: 1, down_rear: 1, floor: 1 };
+
+// One physics step. steerIn, pedal in [-1, 1]. surf: {grip, rolling, rough, lift} (4 each); slope {gx, gy, load};
+// air: drag and downforce multipliers (another car's wake); reverse > 0.5 asks for reverse gear. Returns [new state, info].
+function substep(G, RHO, p, s, steerIn, pedal, surf, slope, dt, air = CLEAN_AIR, reverse = 0) {
   const want = clip(steerIn, -1, 1) * p.max_steer;
   const steer = s.steer + clip(want - s.steer, -p.steer_rate * dt, p.steer_rate * dt);
   const speed = Math.hypot(s.vx, s.vy);
@@ -171,9 +173,9 @@ function substep(G, RHO, p, s, steerIn, pedal, surf, slope, dt) {
   if (floorH < p.ground_peak) ground = (1 + p.ground_gain) * (p.ground_stall + (1 - p.ground_stall) * near ** 2);
   const beta = Math.atan2(Math.abs(s.vy), Math.max(Math.abs(s.vx), 5));
   const yawKeep = clip(1 - p.yaw_down_loss * beta ** 2, 0, 1);
-  const floor = q * p.cla_floor * ground * yawKeep;
-  const downF = floor * p.floor_front + q * p.cla_front * yawKeep;   // clean air: the game has no wakes
-  const downR = floor * (1 - p.floor_front) + q * p.cla_rear * yawKeep;
+  const floor = q * p.cla_floor * ground * yawKeep * air.floor;
+  const downF = floor * p.floor_front + q * p.cla_front * yawKeep * air.down_front;
+  const downR = floor * (1 - p.floor_front) + q * p.cla_rear * yawKeep * air.down_rear;
 
   // axle loads
   const staticF = m * G * p.b / L, staticR = m * G * p.a / L;
@@ -207,22 +209,28 @@ function substep(G, RHO, p, s, steerIn, pedal, surf, slope, dt) {
   }
 
   // drive or brake
-  const [push0, best] = engineForce(p, s.vx, s.gear);
+  let [push0, best] = engineForce(p, s.vx, Math.max(s.gear, 1));
+  // reverse gear: selected only at a standstill, and it stays in until the car stops again with it released;
+  // it pushes like first gear, backwards
+  const rev = Math.abs(s.vx) < 1 ? reverse > 0.5 : s.gear === 0;
+  const back = -s.vx;
+  if (rev) { push0 = back <= p.gear_top[0] ? p.power / Math.max(back, 0.8 * p.gear_top[0]) : 0; best = 0; }
   const shifting = best !== s.gear;
   const shift = shifting ? p.shift_s : Math.max(s.shift - dt, 0);
-  const push = shift > 0 ? 0 : push0;
+  let push = shift > 0 ? 0 : push0;
+  if (!(s.fuel_used < p.fuel_tank)) push = 0;   // out of fuel: the engine stops
   const throttle = Math.max(pedal, 0), brake = Math.max(-pedal, 0);
-  const gt = p.gear_top[best - 1];
-  const engaged = shift <= 0 && s.vx > 0.8 * p.gear_top[0];
+  const gt = p.gear_top[Math.max(best, 1) - 1];
+  const engaged = shift <= 0 && s.vx > 0.8 * p.gear_top[0] && !rev;
   const revs = clip(s.vx / gt, 0, 1);
   const engineDrag = engaged ? p.engine_brake * p.power / gt * revs : 0;
-  const total = throttle * push - (1 - throttle) * engineDrag;
+  const total = rev ? -throttle * push : throttle * push - (1 - throttle) * engineDrag;
   const cap = fmax.map((f) => p.mu_long * f);
   const [fl, fr] = axleSplit(total * p.drive_front, cap[0], cap[1], p.diff_bias);
   const [rl, rr] = axleSplit(total * (1 - p.drive_front), cap[2], cap[3], p.diff_bias);
   const driveF = [fl, fr, rl, rr];
   const bshare = [p.brake_front / 2, p.brake_front / 2, (1 - p.brake_front) / 2, (1 - p.brake_front) / 2];
-  const stopCap = m * Math.max(s.vx, 0) / dt;
+  const stopCap = m * Math.abs(s.vx) / dt;
 
   const sliding = [], fx = [], fy = [], temp = [], wear = [], rollCoef = [];
   let fxTot = 0, fyTot = 0, moment = 0, rollSum = 0;
@@ -234,12 +242,12 @@ function substep(G, RHO, p, s, steerIn, pedal, surf, slope, dt) {
     const ratio = fxAsk / fmaxX;
     const sl = Math.abs(ratio) > 1;
     const gripFy = fyPure * Math.sqrt(Math.max(1 - ratio ** 2, 0));
-    const locked = sl && fxAsk < 0;
+    const locked = sl && ((fxAsk < 0) !== rev);   // against the gear's drive (in reverse, a push forward)
     const vmag = Math.hypot(u[i], w[i]) + 1e-3;
     let X, Y;
     if (!sl) { X = fxAsk; Y = gripFy; }
     else if (locked) { X = -p.slide * fmaxX * u[i] / vmag; Y = -p.slide * fmax[i] * w[i] / vmag; }
-    else { X = p.slide * fmaxX; Y = fyPure * Math.sqrt(1 - p.slide ** 2); }
+    else { X = p.slide * fmaxX * sign(fxAsk); Y = fyPure * Math.sqrt(1 - p.slide ** 2); }
     sliding.push(sl); fx.push(X); fy.push(Y);
     const bfx = X * c[i] - Y * sn[i], bfy = X * sn[i] + Y * c[i];
     fxTot += bfx; fyTot += bfy; moment += wx[i] * bfy - wy[i] * bfx;
@@ -257,7 +265,7 @@ function substep(G, RHO, p, s, steerIn, pedal, surf, slope, dt) {
     const hot = 2 ** (Math.max(s.temp[i] - p.temp_best, 0) / p.wear_hot);
     wear.push(Math.min(s.wear[i] + p.wear_rate * work * hot / p.tyre_size[i] * dt, 1));
   }
-  const cda = p.cda + p.cda_side * Math.sin(beta) ** 2;
+  const cda = p.cda * air.drag + p.cda_side * Math.sin(beta) ** 2;
   const resist = rollSum + q * cda + p.plank_mu * (plank[0] + plank[1]);
   fxTot -= resist * s.vx / (speed + 0.5);
   fyTot -= resist * s.vy / (speed + 0.5);
@@ -267,7 +275,8 @@ function substep(G, RHO, p, s, steerIn, pedal, surf, slope, dt) {
   let vx = s.vx + ((fxTot + m * slope.gx) / mLong + s.r * s.vy) * dt;
   let vy = s.vy + ((fyTot + m * slope.gy) / m - s.r * s.vx) * dt;
   let r = s.r + moment / p.yaw_inertia * dt;
-  if (brake > 0 && s.vx >= 0 && vx < 0) vx = 0;
+  const way = rev ? -1 : 1;   // braking to a stop doesn't roll the other way (or against the gear from a standstill)
+  if (brake > 0 && (s.vx * vx < 0 || (s.vx === 0 && vx * way < 0))) vx = 0;
 
   const blend = clip((Math.abs(vx) - 3) / 3, 0, 1);
   vy = blend * vy + (1 - blend) * vx * Math.tan(steer) * p.b / L;
@@ -279,7 +288,7 @@ function substep(G, RHO, p, s, steerIn, pedal, surf, slope, dt) {
 
   const feltX = fxTot / mLong, feltY = fyTot / m;
   const k = dt / (dt + p.settle);
-  const burned = p.fuel_per_j * Math.max(total, 0) * Math.max(s.vx, 0) * dt;
+  const burned = p.fuel_per_j * Math.max(total * s.vx, 0) * dt;   // the work at the wheels (either way)
   const ns = { x, y, yaw, vx, vy, r, steer, ax: s.ax + (feltX - s.ax) * k, ay: s.ay + (feltY - s.ay) * k, gear: best,
                shift, ride, temp, wear, fuel_used: s.fuel_used + burned };
   return [ns, { load, sliding, gear: best, ax: feltX, ay: feltY, plank, downforce: downF + downR }];
@@ -309,13 +318,30 @@ export class Circuit {
         this.wallB[2 * (o + i)] = b[0]; this.wallB[2 * (o + i) + 1] = b[1];
       }
     }
+    // race day's pit lane (race.RaceGame._wall_windows): the pit wall's segment at each centreline point, or none
+    this.pitAt = c.pit_at ?? 0;
+    this.pitWall = null;
+    if (cfg.pit_lane) {
+      this.pitWall = new Float64Array(4 * P).fill(NaN);
+      const at = (i) => [this.center[2 * i] - Math.sin(this.heading[i]) * cfg.pit_wall_lat,
+                         this.center[2 * i + 1] + Math.cos(this.heading[i]) * cfg.pit_wall_lat];
+      for (let i = 0; i < P; i++) {
+        const j = (i + 1) % P;
+        if (Math.abs(this.fromPit(i, cfg)) < cfg.pit_wall_len && Math.abs(this.fromPit(j, cfg)) < cfg.pit_wall_len)
+          this.pitWall.set([...at(i), ...at(j)], 4 * i);
+      }
+    }
   }
+
+  // metres from the middle of the pit lane along the lap, -L/2 to L/2 (negative: still to come)
+  fromPit(idx, cfg) { const L = this.length; return mod(idx * L / cfg.points - this.pitAt + L / 2, L) - L / 2; }
 }
 
 export class RaceGame {
   constructor(data) {
     this.cfg = data.cfg;
     this.car = new Car(data);
+    this.compounds = data.compounds;   // race day: {grip, wear, temp} per compound
     this.circuits = data.circuits.map((c) => new Circuit(c, data.cfg));
     this.rays = data.cfg.ray_angles.map((a) => a * Math.PI / 180);
   }
@@ -352,20 +378,47 @@ export class RaceGame {
     return [j, lat, mod(frac * tr.length / P, tr.length)];
   }
 
-  surfaces(car, p, tr, idx, lat) {  // what's under each tyre, and how far out the furthest tyre is
-    const cfg = this.cfg, na = tr.heading[idx] + Math.PI / 2, nx = Math.cos(na), ny = Math.sin(na);
+  tyreLats(car, p, tr, idx, lat) {  // each tyre's signed offset from the centreline (left positive)
+    const na = tr.heading[idx] + Math.PI / 2, nx = Math.cos(na), ny = Math.sin(na);
     const wx = [p.a, p.a, -p.b, -p.b], wy = [p.track_width / 2, -p.track_width / 2, p.track_width / 2, -p.track_width / 2];
-    const cy = Math.cos(car.yaw), sy = Math.sin(car.yaw), half = cfg.width / 2;
+    const cy = Math.cos(car.yaw), sy = Math.sin(car.yaw);
+    return wx.map((x, i) => lat + (x * cy - wy[i] * sy) * nx + (x * sy + wy[i] * cy) * ny);
+  }
+
+  inPitZone(tr, idx) { const s = tr.fromPit(idx, this.cfg); return s > -this.cfg.pit_entry && s < this.cfg.pit_exit; }
+
+  // the car's centre is past the pit wall's line, between the pit entry and exit (the limiter is on)
+  inPitLane(st) { return !!this.cfg.pit_lane && this.inPitZone(st.tr, st.idx) && st.lat < this.cfg.pit_wall_lat; }
+
+  surfaces(car, p, tr, idx, lat) {  // what's under each tyre, and how far out the furthest tyre is
+    const cfg = this.cfg, half = cfg.width / 2, tl = this.tyreLats(car, p, tr, idx, lat);
+    const lane = cfg.pit_lane && this.inPitZone(tr, idx);
     const surf = { grip: [], rolling: [], rough: [], lift: [] };
     let furthest = 0;
     for (let i = 0; i < 4; i++) {
-      const ox = wx[i] * cy - wy[i] * sy, oy = wx[i] * sy + wy[i] * cy;
-      const wl = Math.abs(lat + ox * nx + oy * ny);
+      const wl = Math.abs(tl[i]);
       furthest = Math.max(furthest, wl);
-      const s = wl > half ? cfg.grass_surface : wl > half - cfg.kerb ? cfg.kerb_surface : cfg.tarmac_surface;
+      const grass = wl > half && !(lane && tl[i] < -half && tl[i] >= cfg.pit_outer);   // the pit lane's tarmac
+      const s = grass ? cfg.grass_surface : wl > half - cfg.kerb ? cfg.kerb_surface : cfg.tarmac_surface;
       surf.grip.push(s[0]); surf.rolling.push(s[1]); surf.rough.push(s[2]); surf.lift.push(s[3]);
     }
     return [surf, furthest];
+  }
+
+  hitsPitWall(car, p, tr, idx, lat) {  // tyres on both sides of the pit wall (or within 0.3 m of it): the body's in it
+    const cfg = this.cfg, tl = this.tyreLats(car, p, tr, idx, lat), w = cfg.pit_wall_lat;
+    return Math.abs(tr.fromPit(idx, cfg)) < cfg.pit_wall_len && Math.min(...tl) < w + 0.3 && Math.max(...tl) > w - 0.3;
+  }
+
+  // the car's physics on its race setup ({compound, fuel, wear}; race.RaceGame.params)
+  params(design, setup) {
+    const p = this.car.derive(design);
+    if (!setup) return p;
+    const C = this.compounds, k = setup.compound;
+    p.mu *= C.grip[k]; p.wear_rate *= C.wear[k]; p.temp_best += C.temp[k];
+    if (setup.wear != null) p.wear_rate *= setup.wear;
+    if (setup.fuel != null) { p.mass = p.mass - p.fuel_tank + setup.fuel; p.fuel_tank = setup.fuel; }
+    return p;
   }
 
   slope(st) {  // gravity along the road (car frame) and the load factor
@@ -380,23 +433,47 @@ export class RaceGame {
              load: Math.max(load, 0) };
   }
 
-  step(st, steerIn, pedalIn) {
-    const cfg = this.cfg, steer = clip(steerIn, -1, 1), pedal = clip(pedalIn, -1, 1), p = st.p, tr = st.tr;
+  step(st, steerIn, pedalIn) { return this.stepRace(st, [steerIn, pedalIn]); }
+
+  // race.RaceGame.step: action [steer, pedal(, reverse)]; damage {wing_front, wing_rear, floor, toe, puncture[4]}
+  // (null: none), air (CLEAN_AIR), setup {compound, fuel, wear} (null: the class's usual car, st.p)
+  stepRace(st, action, damage = null, air = CLEAN_AIR, setup = null) {
+    const cfg = this.cfg, tr = st.tr, a = action.map((x) => clip(x, -1, 1));
+    const steer = a[0], pedal = a[1];
+    let p = st.p, wheelSteer = steer, wheelPedal = pedal;
+    if (damage || setup) {
+      let design = st.design;
+      if (damage) {   // broken wings lose their downforce and drag (and weight)
+        design = design.slice();
+        design[this.car.D.wing_front] *= 1 - damage.wing_front;
+        design[this.car.D.wing_rear] *= 1 - damage.wing_rear;
+      }
+      p = this.params(design, setup);
+    }
     const [surf] = this.surfaces(st.car, p, tr, st.idx, st.lat);
     surf.grip = surf.grip.map((g, i) => g * (1 - cfg.dirt_grip * st.dirt[i]));
-    const slope = this.slope(st), dt = cfg.dt / cfg.substeps;
+    if (cfg.pit_lane) {   // the pit limiter: no power over the limit, and it brakes the car down to it
+      const v = Math.hypot(st.car.vx, st.car.vy);
+      if (this.inPitLane(st) && v > cfg.pit_limit) wheelPedal = -cfg.pit_brake * clip((v - cfg.pit_limit) / cfg.pit_governor, 0, 1);
+    }
+    if (damage) {
+      p.cla_floor *= 1 - damage.floor;
+      wheelSteer += damage.toe / p.max_steer;   // the driver has to hold opposite lock
+      for (let i = 0; i < 4; i++) if (damage.puncture[i]) { surf.grip[i] *= cfg.flat_grip; surf.rolling[i] += cfg.flat_rolling; }
+    }
+    const slope = this.slope(st), dt = cfg.dt / cfg.substeps, rev = a.length > 2 ? a[2] : 0;
     let car = st.car, info;
     for (let k = 0; k < cfg.substeps; k++)
-      [car, info] = substep(this.car.G, this.car.RHO, p, car, steer, pedal, surf, slope, dt);
+      [car, info] = substep(this.car.G, this.car.RHO, p, car, wheelSteer, wheelPedal, surf, slope, dt, air, rev);
     const [idx, lat, lapPos] = this.locate(tr, st.idx, car.x, car.y);
     const [surfNow, furthest] = this.surfaces(car, p, tr, idx, lat);
     const L = tr.length;
     const moved = mod(lapPos - st.lap_pos + L / 2, L) - L / 2;
-    const crashed = furthest > cfg.width / 2 + cfg.grass - 0.3;
+    const crashed = furthest > cfg.width / 2 + cfg.grass - 0.3 || (!!cfg.pit_lane && this.hitsPitWall(car, p, tr, idx, lat));
     const t = st.t + 1;
     const done = crashed || t * cfg.dt >= cfg.time_limit;
     const dirt = surfNow.grip.map((g, i) => (g <= cfg.grass_surface[0] ? 1 : Math.max(st.dirt[i] - cfg.dt / cfg.dirt_clear, 0)));
-    return { car, design: st.design, p, tr, idx, lat, lap_pos: lapPos, progress: st.progress + moved, t,
+    return { car, design: st.design, p: st.p, tr, idx, lat, lap_pos: lapPos, progress: st.progress + moved, t,
              last: [steer, pedal], surface: surfNow.grip, dirt, sliding: info.sliding, plank: info.plank,
              crashed, done, info };
   }
@@ -404,19 +481,25 @@ export class RaceGame {
   lasers(st) {  // metres to the nearest wall along each laser, capped at ray_range
     const tr = st.tr, P = tr.P, [lo, hi] = this.cfg.wall_window, out = [];
     const px = st.car.x, py = st.car.y;
+    // the wall segments near the car (left, right, and the pit wall where there is one), gathered once for all rays
+    const A = tr.wallA, B = tr.wallB, pw = tr.pitWall, seg = this._seg ??= new Float64Array(4 * 3 * (hi - lo));
+    let m = 0;
+    const add = (ax, ay, bx, by) => { seg[m++] = ax - px; seg[m++] = ay - py; seg[m++] = bx - ax; seg[m++] = by - ay; };
+    for (let o = lo; o < hi; o++) {
+      const n = mod(st.idx + o, P);
+      add(A[2 * n], A[2 * n + 1], B[2 * n], B[2 * n + 1]);
+      add(A[2 * (n + P)], A[2 * (n + P) + 1], B[2 * (n + P)], B[2 * (n + P) + 1]);
+      if (pw && !isNaN(pw[4 * n])) add(pw[4 * n], pw[4 * n + 1], pw[4 * n + 2], pw[4 * n + 3]);
+    }
     for (const ray of this.rays) {
       const dx = Math.cos(st.car.yaw + ray), dy = Math.sin(st.car.yaw + ray);
       let best = Infinity;
-      for (let o = lo; o < hi; o++) {
-        const n = mod(st.idx + o, P);
-        for (const s of [n, n + P]) {
-          const ax = tr.wallA[2 * s], ay = tr.wallA[2 * s + 1];
-          const ex = tr.wallB[2 * s] - ax, ey = tr.wallB[2 * s + 1] - ay, wx = ax - px, wy = ay - py;
-          const den = cross(dx, dy, ex, ey);
-          if (Math.abs(den) < 1e-9) continue;
-          const t = cross(wx, wy, ex, ey) / den, u = cross(wx, wy, dx, dy) / den;
-          if (t > 0 && u >= 0 && u <= 1 && t < best) best = t;
-        }
+      for (let q = 0; q < m; q += 4) {
+        const wx = seg[q], wy = seg[q + 1], ex = seg[q + 2], ey = seg[q + 3];
+        const den = dx * ey - dy * ex;
+        if (Math.abs(den) < 1e-9) continue;
+        const t = (wx * ey - wy * ex) / den, u = (wx * dy - wy * dx) / den;
+        if (t > 0 && u >= 0 && u <= 1 && t < best) best = t;
       }
       out.push(Math.min(best, this.cfg.ray_range));
     }
@@ -428,8 +511,10 @@ export class RaceGame {
     return this.cfg.ahead.map((a) => mod(Math.trunc((st.lap_pos + a) / tr.length * P), P));
   }
 
-  observe(st) {
+  observe(st, setup = null) {
     const cfg = this.cfg, car = st.car, tr = st.tr, sp = this.car.spec;
+    const tempBest = sp.temp_best + (setup ? this.compounds.temp[setup.compound] : 0);
+    const tank = setup && setup.fuel != null ? setup.fuel : this.car.fuelStart(st.design);
     const ks = this.ahead(st);
     const headingErr = mod(car.yaw - tr.heading[st.idx] + Math.PI, 2 * Math.PI) - Math.PI;
     return [
@@ -440,9 +525,9 @@ export class RaceGame {
       car.steer / sp.max_steer, st.last[1],
       ...st.surface.map((g, i) => g * (1 - cfg.dirt_grip * st.dirt[i])),
       ...st.sliding.map(Number),
-      ...car.temp.map((t) => (t - sp.temp_best) / sp.temp_window),
+      ...car.temp.map((t) => (t - tempBest) / sp.temp_window),   // how far from these tyres' best
       ...car.wear,
-      1 - car.fuel_used / this.car.fuelStart(st.design),
+      1 - car.fuel_used / tank,   // share of the fuel left
       ...this.car.normalise(st.design),
     ];
   }
@@ -454,22 +539,24 @@ export class Driver {
   constructor(brain) {
     this.L = ["body.0", "body.2", "policy"].map((n) => {
       const w = decode(brain[n + ".weight"]);
-      return { w: w.data, out: w.shape[0], inp: w.shape[1], b: decode(brain[n + ".bias"]).data };
+      return { w: Float64Array.from(w.data), out: w.shape[0], inp: w.shape[1], b: decode(brain[n + ".bias"]).data,
+               y: new Float64Array(w.shape[0]) };
     });
   }
 
+
   act(obs) {
     let x = obs;
-    this.L.forEach((l, li) => {
-      const y = new Array(l.out);
+    for (let li = 0; li < this.L.length; li++) {   // (typed arrays: a holey `new Array(n)` made this 3x slower)
+      const l = this.L[li], w = l.w, inp = l.inp, y = l.y;
       for (let o = 0; o < l.out; o++) {
         let s = l.b[o];
-        const row = o * l.inp;
-        for (let i = 0; i < l.inp; i++) s += l.w[row + i] * x[i];
+        const row = o * inp;
+        for (let i = 0; i < inp; i++) s += w[row + i] * x[i];
         y[o] = li < 2 ? Math.tanh(s) : clip(s, -1, 1);
       }
       x = y;
-    });
-    return x;  // [steer, pedal]
+    }
+    return Array.from(x);  // [steer, pedal(, reverse)]
   }
 }
