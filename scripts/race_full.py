@@ -42,11 +42,16 @@ ap.add_argument("--strategist", default="", help="runs/x:N: cars 1-4 run by this
 ap.add_argument("--save", action="store_true")
 ap.add_argument("--full", type=int, default=None, help="with --save: also every car's whole motion on this circuit "
                 "(index, 0-7) every 0.1 s, for the 3D race (scripts/race_field_replay.py)")
+ap.add_argument("--ep15-lane", action="store_true", help="episode 15's pit lane (one 7 m lane, boxes 12 m apart, "
+                "a stop anywhere across it), for drivers that never saw the working lane (ep16 step 3's measurement)")
 a = ap.parse_args()
 
-cfg = race.RaceConfig(time_limit=a.minutes * 60, pit_lane=True)
+lane = dict(pit_outer=-14.0, pit_fast=-7.0) if a.ep15_lane else {}
+boxes = dict(box_gap=12.0, box_side=10.0) if a.ep15_lane else {}
+cfg = race.RaceConfig(time_limit=a.minutes * 60, pit_lane=True, **lane)
 seeds = list(race.TEST_SEEDS)[:a.n]
-F = race_field.RaceField(race.make_tracks(seeds, cfg), laps=a.laps, cfg=cfg, gp_km=a.gp_km, tyre_cal=a.tyre_cal)
+F = race_field.RaceField(race.make_tracks(seeds, cfg), laps=a.laps, cfg=cfg, gp_km=a.gp_km, tyre_cal=a.tyre_cal,
+                         **boxes)
 path, _, ck = a.driver.partition(":")
 params = None if a.compare else load(pick_checkpoint(path, ck or "last"))[0]  # (compare loads its own)
 K, N, steps = len(seeds), F.n, int(cfg.time_limit / cfg.dt)
@@ -164,6 +169,19 @@ for k in range(K):
           f"stops {stops[k, end].sum()}, out: wall {walled[k, end].sum()}, wrecked {wrecked[k, end].sum()}, "
           f"dry {(dry[k, end] & ~fin).sum()}  |  "
           + " ".join(f"P{int(order[k, end, i]) + 1}:{how[i][:3]}/{stops[k, end, i]}st" for i in np.argsort(order[k, end])))
+# (ep16 step 1) the pit-lane tangles: each car's longest unbroken stay in the lane while still on the circuit (a normal
+# stop is under a minute)
+stay = np.zeros((K, N))
+for k in range(K):
+    for i in range(N):
+        run_len = 0
+        for x in pit[k, :, i] & ~gone[k, :, i] & ~finished[k, :, i]:  # a recovered car is a ghost where it stopped
+            run_len = run_len + 1 if x else 0
+            stay[k, i] = max(stay[k, i], run_len)
+stay *= cfg.dt / 60
+print("longest stay in the pit lane (min), per circuit: "
+      + " ".join(f"{stay[k].max():.1f}" for k in range(K))
+      + f"  |  circuits with a car in the lane over 3 min: {(stay.max(-1) > 3).sum()}/{K}")
 o = finished[:, -1]
 print(f"all: {o.mean():.0%} finished, {wrecked[:, -1].mean():.0%} wrecked, {walled[:, -1].mean():.0%} wall, "
       f"{(dry[:, -1] & ~o).mean():.0%} stranded dry, {stops[:, -1].mean():.2f} stops per car")
@@ -181,6 +199,7 @@ if a.save:
         name += "-" + a.strategist.split("/")[-1].replace(":", "-")
     np.savez_compressed(dest / f"race-{name}.npz", seeds=np.array(seeds), dt=cfg.dt * EVERY, laps=a.laps, team=np.asarray(mine),
                         length=np.asarray(F.tracks.length), finish_t=finish_t,
+                        box_gap=float(F.box_s[1] - F.box_s[0]), pit_outer=cfg.pit_outer, pit_fast=cfg.pit_fast,
                         **{n: v[:, s] for n, v in dict(pos=pos, yaw=yaw, progress=prog, order=order, finished=finished,
                                                        walled=walled, wrecked=wrecked, dry=dry, pit=pit, stops=stops,
                                                        wear=wear, fuel=fuel, bump=bump, compound=compound,
@@ -197,5 +216,6 @@ if a.save:
                             progress=prog[k, sl], order=order[k, sl], finished=finished[k, sl], walled=walled[k, sl],
                             wrecked=wrecked[k, sl], dry=dry[k, sl], pit=pit[k, sl], stops=stops[k, sl], wear=wear[k, sl],
                             fuel=fuel[k, sl], bump=bump[k, sl], compound=compound[k, sl], gone=gone[k, sl],
+                            box_gap=float(F.box_s[1] - F.box_s[0]), pit_outer=cfg.pit_outer, pit_fast=cfg.pit_fast,
                             **{n: np.asarray(v)[k, sl] for n, v in motion.items()})
         print(f"-> {full} ({(end - 1) // 2 + 1} frames)")

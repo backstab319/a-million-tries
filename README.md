@@ -64,6 +64,7 @@ video used them (the model pages on Hugging Face name the tag their brains run w
 | 13, "My AI Kept Shooting the Hostage" (a home) | [`episode-13`](https://github.com/backstab319/a-million-tries/tree/episode-13) | homes (`--house home`: rooms, windows, furniture at two heights), bullets through drywall (`--through-drywall 0.5`, `--unseen-hit 0.5`), the hostage can be hit (`--hostage-hit`); calm coaching for evolution (`--run-cost 0.5 --turn-cost 0.15 --door-cost 0.05`, ranking only); the browser game's home modes |
 | 14, "My AI Designed a Race Car With No Front Wing" (the race car) | [`episode-14`](https://github.com/backstab319/a-million-tries/tree/episode-14) | a four-tyre race car on real-scale circuits (`games/race_car.py`: grip, downforce, a floor that stalls near the road, tyre heat and wear, fuel, hills and banking; `python -m ailearns.games.race_checks` road-tests it against a 911 and an F1 car); driver school (`agents/ppo_race.py`); the engineer, evolving 13 dials under a $1M price list (`agents/race_engineer.py`); the sweep, the final race and the physics audit (`scripts/race_*.py`); the cars the video raced (`episodes/14-designs-its-own-car/finalists/`). The 3D view stays private for now |
 | 15, "My AI Race Car Refused to Make a Pit Stop" (race day) | [`episode-15`](https://github.com/backstab319/a-million-tries/tree/episode-15) | eight cars on one circuit (`games/race_field.py`: box bodies that push where they hit, damage only through the physics, dirty air and the tow, soft/medium/hard tyres that fail when worn through, a fuel limit, a pit lane with a limiter, marshals); the race school (`games/race_school.py`, `agents/ppo_field.py`), imitation of a scripted pit driver (`agents/bc_field.py`), evolution on race results (`agents/es_field.py`), the pit-wall strategist (`agents/es_strategist.py`), full races and the strategist comparison (`scripts/race_full.py`, `scripts/strat_compare.py`). The 3D view stays private |
+| 16, "My AI Wouldn't Pit Under the Safety Car. So I Checked." (the Safety Car) | [`episode-16`](https://github.com/backstab319/a-million-tries/tree/episode-16) | race control (`games/race_control.py`: marshalling sectors, yellow flags, a Safety Car that leads the field, cars that break down and stop on track); the scripted experts and the driver that learned from them under race control (`agents/race_experts.py`, `agents/bc_control.py`); the pit wall widened to see race control (`agents/es_strategist.py --race-control`); the acceptance test (`scripts/race_accept.py`). The 3D view stays private |
 
 ```
 git checkout episode-9
@@ -93,6 +94,12 @@ python -m ailearns.agents.bc_field runs/copy --field '{"init_from": "runs/school
 python -m ailearns.agents.es_field runs/finish --field '{"mode": "finish", "init_from": "runs/copy:last"}'
 python -m ailearns.agents.es_strategist runs/pitwall --gens 20                     # the AI pit wall
 python scripts/strat_compare.py runs/pitwall:0 runs/pitwall:20 --races 128         # AI pit wall v the rule
+
+git checkout episode-16                                                       # the Safety Car: drive under race control
+uv sync --group jax                                                           # (each step's settings: the model cards)
+python -m ailearns.agents.bc_control runs/control --field '{"init_from": "runs/<ep15 driver>"}'   # learn from the experts
+python scripts/race_accept.py --drivers runs/control:last                     # whole races with race control
+python -m ailearns.agents.es_strategist runs/pitwall16 --init runs/pitwall:20 --driver runs/control:last     --race-control --incidents 2 --cap-s 4800                                 # the pit wall, with Safety Cars
 ```
 
 ## Licence

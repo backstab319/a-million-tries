@@ -30,7 +30,7 @@ from ailearns.agents.ppo import _git_version
 from ailearns.agents.ppo_car import forward, load
 from ailearns.agents.ppo_jax import adam_init, adam_step, to_torch
 from ailearns.games import race, race_field, race_school
-from ailearns.games.race_checks import test_driver
+from ailearns.games.race_checks import look_ahead, test_driver
 
 EVOLVED = ("body.0.weight", "body.0.bias", "body.2.weight", "body.2.bias", "policy.weight", "policy.bias")
 
@@ -63,34 +63,75 @@ def expert(F: race_field.RaceField, f: race_field.Field, approach_m: float, brai
     and the script only adds the pit work: a speed cap to 80 km/h by the entry, the line into the lane from
     `turn_m` before the entry, the stop on the mark, and the lane to the exit."""
     g, cfg = F.game, F.cfg
-    lane_lat = (cfg.pit_wall_lat + cfg.pit_outer) / 2
     turn_m = 50.0
 
     def one(st, called, box_s, mine):
         s = g.from_pit(st.track, st.idx)
         in_lane = g.in_pit_lane(st)
-        follow = (called & (s > -cfg.pit_entry - turn_m) & (s < cfg.pit_exit)) | in_lane
+        # into the lane only through the opening before the pit wall (ep16 step 9d: a car called while already beside
+        # the pits, past the entry, was steered across into the wall; left to itself the ep15 brain dived for the lane
+        # and hit the wall too), and one called inside the opening after the braking ends turned in at 120 km/h on the
+        # throttle into the lane's outer wall. Past the braking, only a car already slowed (`slow`) carries on into the
+        # lane (one turning in isn't "in the lane" yet there: holding every car back from that point made them miss the
+        # entry lap after lap); the rest are held on the centreline to the pit exit: the next entry
+        v0 = jnp.hypot(st.car.vx, st.car.vy)
+        slow = v0 < 1.3 * cfg.pit_limit
+        # (run 3: a car the brain had already turned off the tarmac towards the lane was pulled back across the track at
+        # 30 m/s into the far wall: one off the tarmac on the lane's side carries on in, the limiter slows it)
+        half = cfg.width / 2
+        committed = st.lat < -half
+        # (step 9f) and a slowed car only if it's already heading for the lane: under the Safety Car every car slows,
+        # and cars called just past the entry, still on the racing line, were let in from there and crossed 10 m at
+        # 13-15 m/s into the lane's outer edge (3 of the 5 pit-entry crashes in 48 races)
+        late = (slow & (st.lat < -1.0)) | committed
+        opening = (s > -cfg.pit_entry - turn_m) & ((s < -cfg.pit_entry + 30) | (late & (s < -cfg.pit_wall_len - 20.0)))
+        follow = (called & opening) | in_lane
+        beside = called & ~follow & (s >= -cfg.pit_entry + 30) & (s < cfg.pit_exit)
         ease = jnp.clip(jnp.minimum((s + cfg.pit_entry) / 60.0, (cfg.pit_exit - s) / 100.0), 0.0, 1.0)  # in, out
-        act = test_driver(g, st, offset=jnp.where(follow, lane_lat * ease, 0.0))
         v = jnp.hypot(st.car.vx, st.car.vy)
         to_box = box_s - s
         stop_v = jnp.sqrt(2 * 4.0 * jnp.maximum(to_box, 0.0))  # ease to a stop on the mark (4 m/s^2)
         stopping = called & in_lane & (to_box < 60)
+        line = F.pit_line(to_box - look_ahead(st.car), stopping)  # down the fast lane, across into the box (ep16's working lane)
+        act = test_driver(g, st, offset=jnp.where(follow, line * ease, 0.0))
         # 80 km/h before the turn-in starts, and no more than a breath of throttle through it to the lane (traced:
         # turning in at 100-120 km/h on the throttle spun the car, power oversteer)
         turn_at = -cfg.pit_entry - turn_m
         entry_v = jnp.sqrt(cfg.pit_limit ** 2 + 2 * 6.0 * jnp.maximum(turn_at - s, 0.0))
-        braking = called & (s < -cfg.pit_entry + 30) & (s > -cfg.pit_entry - approach_m)
+        braking = called & (((s < -cfg.pit_entry + 30) & (s > -cfg.pit_entry - approach_m)) | (follow & ~in_lane))
         turning = called & ~in_lane & (s >= turn_at) & (s < -cfg.pit_entry + 30)
-        steer = jnp.where(follow, act[0], mine[0])
-        own = jnp.where(follow, act[1], mine[1])
+        # held: eased towards the centreline, aiming at 70% of its offset (run 5: aimed at the centreline itself, a car
+        # 4-5 m off it at 25-30 m/s got full lock and swerved into the cars beside it, all called at once as the
+        # Safety Car came out; aimed at its own line, run 3, it drifted wide in a corner)
+        held = test_driver(g, st, offset=jnp.clip(0.7 * st.lat, -half + 1.5, half - 1.5))
+        # (at the script's racing speed: the called brain lifted for the lane it can't take,
+        steer = jnp.where(follow, act[0], jnp.where(beside, held[0], mine[0]))  # and at 58 km/h a car leaving the
+        own = jnp.where(follow, act[1], jnp.where(beside, held[1], mine[1]))  # pits hit it)
         pedal = jnp.where(braking, jnp.minimum(own, jnp.clip(0.5 * (entry_v - v), -0.5, 1.0)), own)
         pedal = jnp.where(turning, jnp.minimum(pedal, 0.1), pedal)
         pedal = jnp.where(stopping, jnp.clip(0.5 * (stop_v - v), -0.5, 0.3), pedal)
-        zone = (called & (s > -cfg.pit_entry - approach_m) & (s < cfg.pit_exit)) | in_lane
+        # back onto the tarmac after the pit exit (run 3: a car still off it on the lane's side 110 m past the exit was
+        # steered into the wall by the brain)
+        rejoin = ~in_lane & (s >= cfg.pit_exit - 20.0) & (s < cfg.pit_exit + 200.0) & (st.lat < -half + 1.0)
+        steer = jnp.where(rejoin, test_driver(g, st, offset=-half + 2.0)[0], steer)
+        zone = (called & (s > -cfg.pit_entry - approach_m) & (s < cfg.pit_exit)) | in_lane | rejoin
         return jnp.stack([steer, pedal, -1.0]), zone  # reverse off
 
-    return jax.vmap(one)(f.cars, f.box_call, F.box_s, brain_act)
+    act, zone = jax.vmap(one)(f.cars, f.box_call, F.box_s, brain_act)
+    # (ep16 step 9f) behind the car ahead in its line, in the zone: under the Safety Car almost the whole field boxes
+    # on the same lap, and following only the line and its speed they touched in the lane 67 times in 352 stops.
+    # Slowing at 3 m/s^2 behind it, half a second back at speed (the red flag script's rule, step 9e)
+    cars = f.cars
+    v = jnp.hypot(cars.car.vx, cars.car.vy)
+    L = F.tracks.length[cars.track[0]]
+    gap = (cars.lap_pos[None, :] - cars.lap_pos[:, None]) % L  # (i, j) metres car j is ahead of car i
+    there = ~(cars.crashed | f.finished | f.wrecked)
+    ahead = (there[None, :] & ~jnp.eye(F.n, dtype=bool) & (gap < 80.0)
+             & (jnp.abs(cars.lat[None, :] - cars.lat[:, None]) < 2.4))
+    room = jnp.maximum(gap - 7.0 - 0.5 * v[:, None], 0.0)
+    keep = jnp.where(ahead, v[None, :] + jnp.sqrt(2 * 3.0 * room), 999.0).min(1)
+    pedal = jnp.where(zone, jnp.minimum(act[:, 1], jnp.clip(0.5 * (keep - v), -0.5, 1.0)), act[:, 1])
+    return act.at[:, 1].set(pedal), zone
 
 
 def make_school(cfg: FieldBCConfig, seeds) -> race_school.RaceSchool:

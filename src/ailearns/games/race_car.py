@@ -659,7 +659,10 @@ def drive(p: CarParams, s: CarState, action, surf: Surface = TARMAC, air: Air = 
 
     # the first substep outside the loop gives the loop's carry real (per-device) types under shard_map
     first = _substep(p, s, action[0], action[1], surf, air, slope, dt / substeps, reverse)
-    return jax.lax.fori_loop(1, substeps, body, first)
+    # (ep16 9g) unrolled on a GPU: the compiler can fuse across substeps (a loop's turns can't be), fewer small
+    # kernels; a T4 generation -4 to -8%, compiles no slower (unroll=3: nothing). Not on a CPU: XLA's CPU compiler
+    # aborted on the unrolled field (Kaggle, tests/test_race_physics.py; the loop passes)
+    return jax.lax.fori_loop(1, substeps, body, first, unroll=jax.default_backend() == "gpu")
 
 
 # Reference cars for the reality checks (built from published specs, see the episode 14 devlog).

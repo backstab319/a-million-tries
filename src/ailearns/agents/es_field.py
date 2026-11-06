@@ -41,9 +41,11 @@ import numpy as np
 
 from ailearns.agents.es_cqb import centered_ranks
 from ailearns.agents.ppo import _git_version
-from ailearns.agents.ppo_car import forward, load
+from ailearns.agents.ppo_car import forward, forward16, half, load
 from ailearns.agents.ppo_jax import adam_init, adam_step, to_torch
-from ailearns.games import race, race_field, race_school
+from ailearns.agents.bc_control import breakdown
+from ailearns.agents.ppo_field import widen_senses
+from ailearns.games import race, race_control, race_field, race_school
 
 EVOLVED = ("body.0.weight", "body.0.bias", "body.2.weight", "body.2.bias", "policy.weight", "policy.bias")
 PIT_OBS = 5  # the observation's last numbers: called in, in the lane, its box, the entry ahead, the stop's time left
@@ -99,25 +101,45 @@ class FieldESConfig:
     # (step 9f, owner: "variable drivers") the rival cars' drivers: each rival car drawn per round from this pool
     # (comma-separated runs/x[:N], same senses); empty: init_from drives them all
     rivals: str = ""
+    # (ep16 step 8b) race control in every round: flags, the director, the Safety Car, the stewards. Finish mode scores
+    # the race time after penalties, and a disqualified car (one compound) as not finishing. A 115-sense brain is
+    # widened to race control's 127 (zero weights on the new senses), and those get `sigma_rc`
+    race_control: bool = False
+    sigma_rc: float = 0.05
+    # (ep16 step 13, plan section 4: the incident school) finish mode: in this share of rounds one rival car (never a
+    # learner's) breaks down at a random second in `incident_s` (`bc_control.breakdown`: dead on the spot, or a dead
+    # engine), so most races have a yellow, a VSC or a Safety Car to learn from, not one in two
+    incident: float = 0.0
+    incident_s: tuple = (60.0, 1200.0)
+    # (step 9g, owner) the brains' multiplies in 16-bit while training (ppo_car.forward16: a T4's brains 2.9x faster,
+    # ~15% of a generation; actions within 0.0022 of 32-bit). Evaluation, footage and the browser games stay 32-bit.
+    brain16: bool = True
+
+
+_forward32 = forward
 
 
 def make_school(cfg: FieldESConfig, seeds) -> race_school.RaceSchool:
     rcfg = race.RaceConfig(time_limit=3600.0, pit_lane=True)
     field = race_field.RaceField(race.make_tracks(list(seeds), rcfg), n_cars=cfg.n_cars, laps=cfg.laps, cfg=rcfg,
                                  gp_km=cfg.gp_km, tyre_cal=cfg.tyre_cal)
+    ctl = race_control.RaceControl(field) if cfg.race_control else None
     if cfg.mode == "finish":  # the end of a race: no lessons, no calls but the team's (in the rollout)
         return race_school.RaceSchool(field, race_school.SchoolConfig(
             stretch_s=cfg.finish_cap_s, grid_share=0.0, call_rate_s=1e9, pit_share=0.0, called=0.0,
-            last_laps=cfg.last_laps, fuel_spread=cfg.fuel_spread))
+            last_laps=cfg.last_laps, fuel_spread=cfg.fuel_spread), ctl)
     # coach 0 in the school: the rollout scores the coach itself (whole-stretch potential, see the docstring)
     return race_school.RaceSchool(field, race_school.SchoolConfig(
         stretch_s=cfg.stretch_s, grid_share=0.0, call_rate_s=cfg.call_rate_s, pit_share=cfg.pit_share,
-        pit_car=cfg.pit_car, pit_approach=cfg.pit_approach, coach_gamma=cfg.gamma))
+        pit_car=cfg.pit_car, pit_approach=cfg.pit_approach, coach_gamma=cfg.gamma), ctl)
 
 
-def _sigmas(cfg: FieldESConfig, params: dict) -> dict:
+def _sigmas(cfg: FieldESConfig, params: dict, field_obs: int) -> dict:
+    """Each weight's sigma: `sigma`, the pit senses (the field's last `PIT_OBS`) `sigma_pit`, and race control's senses
+    (after the field's) `sigma_rc`."""
     sig = {k: jnp.full(params[k].shape, cfg.sigma) for k in EVOLVED}
-    sig["body.0.weight"] = sig["body.0.weight"].at[:, -PIT_OBS:].set(cfg.sigma_pit)
+    w = sig["body.0.weight"].at[:, field_obs - PIT_OBS:field_obs].set(cfg.sigma_pit)
+    sig["body.0.weight"] = w.at[:, field_obs:].set(cfg.sigma_rc)
     return sig
 
 
@@ -126,10 +148,14 @@ def make_play(cfg: FieldESConfig, school: race_school.RaceSchool, rival: dict):
     learner's cars)."""
     F, K = school.field, cfg.n_learn
     T = int(round(cfg.stretch_s / F.cfg.dt))
+    forward = forward16 if cfg.brain16 else _forward32
+    ready = half if cfg.brain16 else (lambda p: p)  # 16-bit weights made once a round, not every decision
+    rival = ready(rival)
     lane = jax.vmap(F.game.in_pit_lane)
 
     def one(params, key):
         k0, k1 = jax.random.split(key)
+        params = ready(params)
         les = school.start(k0)
         f0 = les.field
         phi0 = school.potential(f0)[:K]
@@ -166,29 +192,41 @@ def make_play_finish(cfg: FieldESConfig, school: race_school.RaceSchool, rival: 
     brain, or a pool (every weight with a leading pool axis, `rival["pool"]` set): each rival car draws its driver."""
     F, K = school.field, cfg.n_learn
     T = int(round(cfg.finish_cap_s / F.cfg.dt))
+    forward = forward16 if cfg.brain16 else _forward32
+    ready = half if cfg.brain16 else (lambda p: p)  # 16-bit weights made once a round, not every decision
     lane = jax.vmap(F.game.in_pit_lane)
 
     def one(params, key):
+        params = ready(params)
         k0, k1 = jax.random.split(key)
         les = school.start(k0)
         f0 = les.field
+        ki, ka, kt = jax.random.split(jax.random.fold_in(key, 11), 3)
+        lo, hi = (int(round(s / F.cfg.dt)) for s in cfg.incident_s)
+        at = jnp.where(jax.random.uniform(ka) < cfg.incident, jax.random.randint(kt, (), lo, hi), -1)
+        rivals = jnp.arange(F.n) >= K
         D = F.laps * F.tracks.length[f0.cars.track[:K]]  # race distance
         if "pool" in rival:  # (step 9f) every rival car its own driver from the pool, for this round
             n_pool = rival["body.0.weight"].shape[0]
             pick = jax.random.randint(jax.random.fold_in(key, 9), (F.n - K,), 0, n_pool)
-            theirs = {n: v[pick] for n, v in rival.items() if n != "pool"}
+            # (ep16 step 13) each driver's 16-bit weights made on its own: `half` on the stacked pool transposed the
+            # pool axis into the weights (the pool, step 9f, came before 16-bit brains, 9g)
+            theirs = jax.vmap(ready)({n: v[pick] for n, v in rival.items() if n != "pool"})
             drive_rivals = lambda o: jax.vmap(lambda p, x: forward(p, x[None])[0][0])(theirs, o)  # noqa: E731
         else:
-            drive_rivals = lambda o: forward(rival, o)[0]  # noqa: E731
+            mates = ready(rival)
+            drive_rivals = lambda o: forward(mates, o)[0]  # noqa: E731
 
         def tick(carry, k):
             les, on, asked, entered, paid = carry
-            f = les.field
+            f = jax.lax.cond(les.field.t - les.t0 == at, lambda f: breakdown(F, f, ki, rivals)[0], lambda f: f,
+                             les.field)
+            les = les._replace(field=f)
             wear = f.cars.car.wear.max(-1) if cfg.call_worst else f.cars.car.wear.mean(-1)
             call = school.racing(f) & ~f.box_call & (wear >= cfg.call_wear)  # the team
             f = f._replace(box_call=f.box_call | call, plan=jnp.where(call, cfg.plan, f.plan))
             asked = asked | (on & call[:K] & ~lane(f.cars)[:K])  # called from the track: it has to turn in
-            obs = F.observe(f)
+            obs = school.observe(les._replace(field=f))
             acts = jnp.concatenate([forward(params, obs[:K])[0], drive_rivals(obs[K:])])
             les, _, _, _, over = school.step(les._replace(field=f), acts, k)
             new = les.field
@@ -202,11 +240,17 @@ def make_play_finish(cfg: FieldESConfig, school: race_school.RaceSchool, rival: 
         f = les.field
         prog = f.cars.progress[:K]
         left = jnp.maximum(D - prog, 0.0)
-        done = f.finished[:K]
+        ctl, c = school.control, les.control
+        pen = ctl.penalty_s(c)[:K] if ctl else jnp.zeros(K)  # the stewards (ep16 step 7)
+        dsq = ctl.disqualified(f, c)[:K] if ctl else jnp.zeros(K, bool)
+        done = f.finished[:K] & ~dsq  # disqualified: as if it hadn't finished
         race_s = jnp.where(done, f.finish_t[:K] - f0.t * F.cfg.dt + left / cfg.v_ref,
-                           cfg.finish_cap_s + cfg.dnf_s + left / cfg.v_ref) - F.stop_pay_s * paid
+                           cfg.finish_cap_s + cfg.dnf_s + left / cfg.v_ref) + pen - F.stop_pay_s * paid
         dry = (f.cars.car.fuel_used >= f.setup.fuel)[:K]
+        z = jnp.asarray(0)
         return {"reward": -race_s.sum(), "coach": jnp.asarray(0.0), "race_s": race_s.sum(), "finished": done.sum(),
+                "penalty_s": pen.sum(), "dsq": dsq.sum(), "vsc": c.vsc_n if ctl else z, "sc": c.sc_n if ctl else z,
+                "red": c.red_n if ctl else z,
                 "metres": (prog - les.start[:K]).sum(), "stops": f.stops[:K].sum(), "called_out": asked.sum(),
                 "turned_in": (asked & entered).sum(), "wall": (f.cars.crashed & ~f.wrecked)[:K].sum(),
                 "wrecked": f.wrecked[:K].sum(), "dry": dry.sum(),
@@ -230,14 +274,26 @@ def make_generation(cfg: FieldESConfig, play, sig: dict):
     def member(center, ks, keys):
         k, s = ks
         eps = noise(k)
-        out = play(dict(center, **{n: center[n] + s * sig[n] * eps[n] for n in names}), keys)
-        return {"score": (out["reward"] + out["coach"]).mean(), "reward": out["reward"].mean(),
-                "stops": out["stops"].sum(), "turned_in": out["turned_in"].sum()}
+        return play(dict(center, **{n: center[n] + s * sig[n] * eps[n] for n in names}), keys)
+
+    # (step 9g) all members at once: the centre brain's own rounds ride along as one more member with no noise (0 x
+    # the noise: exactly the centre), not as a batch of 24 races after them, which took 41 s of a T4's ~710 s
+    fold = cfg.chunk >= cfg.pop
 
     def generation(center, key, keys):
         ks = jax.random.split(key, pairs)
         signs = jnp.concatenate([jnp.ones(pairs), -jnp.ones(pairs)])
-        m = jax.lax.map(lambda x: member(center, x, keys), (jnp.concatenate([ks, ks]), signs), batch_size=cfg.chunk)
+        if fold:
+            outs = jax.vmap(lambda x: member(center, x, keys))((jnp.concatenate([ks, ks, ks[:1]]),
+                                                                 jnp.concatenate([signs, jnp.zeros(1)])))
+            own = jax.tree.map(lambda v: v[-1], outs)
+            outs = jax.tree.map(lambda v: v[:-1], outs)
+        else:
+            outs = jax.lax.map(lambda x: member(center, x, keys), (jnp.concatenate([ks, ks]), signs),
+                               batch_size=cfg.chunk)
+            own = play(center, keys)
+        m = {"score": (outs["reward"] + outs["coach"]).mean(1), "reward": outs["reward"].mean(1),
+             "stops": outs["stops"].sum(1), "turned_in": outs["turned_in"].sum(1)}
         ranks = centered_ranks(m["score"])
         w = ranks[:pairs] - ranks[pairs:]
 
@@ -247,7 +303,6 @@ def make_generation(cfg: FieldESConfig, play, sig: dict):
             return {n: acc[n] + wi * eps[n] for n in names}, None
         g, _ = jax.lax.scan(add, {n: jnp.zeros_like(center[n]) for n in names}, (ks, w))
         grad = {n: -g[n] / (pairs * sig[n]) for n in names}  # minus: adam_step descends
-        own = play(center, keys)
         R = keys.shape[0]
         stats = {"score": m["score"].mean(), "score_best": m["score"].max(), "reward_members": m["reward"].mean(),
                  "members_stops_per_stretch": m["stops"].mean() / R,
@@ -261,6 +316,16 @@ def make_generation(cfg: FieldESConfig, play, sig: dict):
         return grad, stats
 
     return generation
+
+
+def _fit(brain: dict, name: str, school: race_school.RaceSchool) -> dict:
+    """A brain for the school's senses: a field brain widened to race control's (zero weights on the new senses)."""
+    have, want = brain["body.0.weight"].shape[1], school.obs_size
+    if have == school.field.obs_size and want > have:
+        return widen_senses(brain, want)
+    if have != want:
+        raise SystemExit(f"{name} has {have} senses, the school {want}")
+    return brain
 
 
 def train(cfg: FieldESConfig, run_dir: str | Path, max_hours: float | None = None, resume: bool = False) -> None:
@@ -285,29 +350,30 @@ def train(cfg: FieldESConfig, run_dir: str | Path, max_hours: float | None = Non
     if not state:
         (run_dir / "config.json").write_text(json.dumps(
             {**asdict(cfg), "game": "race_field", "race": asdict(F.cfg), "school": asdict(school.cfg),
-             "obs_size": F.obs_size, "git": _git_version(), "backend": "jax", "device": f"1 x {dev.device_kind}"},
+             "obs_size": school.obs_size, "git": _git_version(), "backend": "jax", "device": f"1 x {dev.device_kind}"},
             indent=2))
     path, _, ck = cfg.init_from.partition(":")
-    rival, _ = load(pick_checkpoint(path, ck or "last"))
-    if rival["body.0.weight"].shape[1] != F.obs_size:
-        raise SystemExit(f"{cfg.init_from} has {rival['body.0.weight'].shape[1]} senses, the field {F.obs_size}")
+    rival = _fit(load(pick_checkpoint(path, ck or "last"))[0], cfg.init_from, school)
     params = {k: jnp.asarray(v.numpy()) for k, v in state["model"].items()} if state else dict(rival)
-    sig = _sigmas(cfg, params)
+    sig = _sigmas(cfg, params, F.obs_size)
     if cfg.rivals:  # (step 9f) a pool of drivers for the rival cars
         if cfg.mode != "finish":
             raise SystemExit("rivals: finish mode only")
         pool = []
         for r in cfg.rivals.split(","):
             rp, _, rk = r.strip().partition(":")
-            b, _ = load(pick_checkpoint(rp, rk or "last"))
+            b = _fit(load(pick_checkpoint(rp, rk or "last"))[0], r, school)
             if b["body.0.weight"].shape != rival["body.0.weight"].shape:
                 raise SystemExit(f"{r} isn't shaped like {cfg.init_from}")
             pool.append(b)
         rival = {n: jnp.stack([b[n] for b in pool]) for n in rival} | {"pool": jnp.asarray(len(pool))}
     play = (make_play_finish if cfg.mode == "finish" else make_play)(cfg, school, rival)
     generation = jax.jit(make_generation(cfg, play, sig))
-    judge = jax.jit(lambda p, keys: (lambda o: (o["reward"] + o["coach"]).mean())(play(p, keys)))
     bench_keys = jax.random.split(jax.random.PRNGKey(cfg.seed + 3000), max(cfg.bench, 1))
+    # (step 9g) the guard's rounds and the bench's in one play of the new brain: two small batches one after the
+    # other took 137 s of a T4's ~710 s generation, together 83. A step turned down leaves the brain as it was, so
+    # its bench is the last one.
+    judge = jax.jit(lambda p, keys: play(p, jnp.concatenate([keys, bench_keys]) if cfg.bench else keys))
     bench = jax.jit(lambda p: {k: v.sum() for k, v in play(p, bench_keys).items()})
     opt = jax.tree.map(jnp.asarray, state["optimizer"]) if state else adam_init({n: params[n] for n in EVOLVED})
     first = state["update"] + 1 if state else 1
@@ -324,21 +390,28 @@ def train(cfg: FieldESConfig, run_dir: str | Path, max_hours: float | None = Non
     log = open(run_dir / "metrics.jsonl", "a")
     tracker = tracking.start(run_dir, json.loads((run_dir / "config.json").read_text()))
     start = time.time()
+    best_bench = -float("inf")  # the best bench score so far (saved when beaten)
+    last_bench = None
     for g in range(first, cfg.generations + 1):  # each generation's luck from its number (the same after a resume)
         k_gen, k_rounds = jax.random.split(jax.random.fold_in(jax.random.PRNGKey(cfg.seed + 2000), g))
         keys = jax.random.split(k_rounds, cfg.rounds)
         grad, m = generation(params, k_gen, keys)
         new, opt_new = adam_step({n: params[n] for n in EVOLVED}, opt, grad, 1.0)  # linear in lr: scale per weight
         new = dict(params, **{n: params[n] + cfg.lr_rel * sig[n] * (new[n] - params[n]) for n in EVOLVED})
-        kept = True
+        kept, b, R = True, None, cfg.rounds
         if cfg.guard >= 0:  # the step stands only if the brain still scores on these rounds (within `guard`)
-            kept = float(judge(new, keys)) >= float(m["brain_score"]) - cfg.guard
+            o = jax.device_get(judge(new, keys))
+            kept = float((o["reward"][:R] + o["coach"][:R]).mean()) >= float(m["brain_score"]) - cfg.guard
+            if cfg.bench and kept:
+                b = {k: v[R:].sum() for k, v in o.items()}
         if kept:
             params, opt = new, opt_new
         stats = {"update": g, "time": round(time.time() - start, 1), "step_kept": kept,
                  **{k: float(v) for k, v in jax.device_get(m).items()}}
         if cfg.bench:  # the brain after this generation, on the same rounds every time: its real curve
-            b = jax.device_get(bench(params))
+            if b is None:
+                b = last_bench if not kept and last_bench is not None else jax.device_get(bench(params))
+            last_bench = b
             per_car = cfg.bench * cfg.n_learn
             stats.update({f"bench_{k}": float(v) for k, v in b.items()})
             stats["bench_score"] = float(b["reward"] + b["coach"]) / cfg.bench
@@ -347,14 +420,21 @@ def train(cfg: FieldESConfig, run_dir: str | Path, max_hours: float | None = Non
         log.write(json.dumps(stats) + "\n")
         log.flush()
         tracking.log(tracker, stats)
-        if g % cfg.checkpoint_every == 0 or g == cfg.generations:
+        # (ep16 13e) and whenever the bench sets a new best: d2-3's best (gen 66) came between saves and was lost
+        new_best = cfg.bench and stats["bench_score"] > best_bench
+        if new_best:
+            best_bench = stats["bench_score"]
+        if g % cfg.checkpoint_every == 0 or g == cfg.generations or new_best:
             save(g, stats)
         s = stats
         if cfg.mode == "finish":
             print(f"gen {g:4d}/{cfg.generations}  brain: {s['brain_race_s_per_car']:.1f} s/car, finished "
                   f"{s['brain_finished']:.0f}/{cfg.rounds * cfg.n_learn}, stops {s['brain_stops']:.0f}, turned in "
                   f"{s['brain_turned_in']:.0f}/{s['brain_called_out']:.0f}, wall {s['brain_wall']:.0f}, wrecked "
-                  f"{s['brain_wrecked']:.0f}, dry {s['brain_dry']:.0f}  members: score {s['score']:.1f} (best "
+                  f"{s['brain_wrecked']:.0f}, dry {s['brain_dry']:.0f}"
+                  + (f", penalties {s['brain_penalty_s']:.0f} s, dsq {s['brain_dsq']:.0f}, VSC {s['brain_vsc']:.0f}, "
+                     f"SC {s['brain_sc']:.0f}, red {s['brain_red']:.0f}" if cfg.race_control else "")
+                  + f"  members: score {s['score']:.1f} (best "
                   f"{s['score_best']:.1f})" + ("" if kept else "  step undone")
                   + (f"  bench: {s['bench_race_s_per_car']:.1f} s/car, finished {s['bench_finished']:.0f}/"
                      f"{cfg.bench * cfg.n_learn}, dry {s['bench_dry']:.0f}, wrecked {s['bench_wrecked']:.0f}, stops "

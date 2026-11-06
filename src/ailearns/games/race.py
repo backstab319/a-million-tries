@@ -68,7 +68,12 @@ class RaceConfig:
     pit_exit: float = 250.0      # ... and after it where it rejoins
     pit_wall_len: float = 150.0  # the pit wall runs this far either side of the middle (the entry and exit are open)
     pit_wall_lat: float = -7.0   # metres from the centreline (right negative): the wall, 1 m past the track's edge ...
-    pit_outer: float = -14.0     # ... and the lane's outer edge (the lane is 6 m of tarmac; grass, then the wall)
+    pit_outer: float = -16.0     # ... and the lane's outer edge: tarmac out to the garages (the circuit's wall). Before
+                                 # episode 16: -14.0 (one 7 m lane, then grass)
+    pit_fast: float = -11.5      # (ep16, F1 B1.6) the fast lane runs from the pit wall to here; beyond it, the working
+                                 # lane where the boxes are, so a car in its box isn't in anyone's way
+    wall_line_scripts: bool = False  # (ep16 16e) footage only: the scripts drive the pit wall's line on episode 15's
+                                     # lane again, the bug 9c fixed (cars driven into the wall's end under a red flag)
     pit_limit: float = 80 / 3.6  # m/s: F1's usual pit lane limit
     pit_governor: float = 5.0    # m/s over the limit at which the limiter brakes its hardest (easing in below) ...
     pit_brake: float = 0.4       # ... this much pedal: firm, short of locking the wheels (full braking at low
@@ -77,6 +82,26 @@ class RaceConfig:
     @property
     def obs_size(self) -> int:
         return len(self.ray_angles) + 3 * len(self.ahead) + 9 + 4 + 4 + 4 + 4 + 1 + len(rc.DESIGN)
+
+    @property
+    def fast_lat(self) -> float:
+        """The middle of the pit lane's fast lane (where cars drive through)."""
+        return (self.pit_wall_lat + self.pit_fast) / 2
+
+    @property
+    def drive_lat(self) -> float:
+        """The line a script drives down the pit lane (the Safety Car, the red flag's queue, a car pulling off): the
+        fast lane's middle; with no fast lane (episode 15's lane: `pit_fast` at the wall) the whole lane's middle.
+        (Ep16 step 9: on episode 15's lane `fast_lat` is the pit wall's own line, and the red flag's script drove
+        cars into the wall's end.)"""
+        if self.wall_line_scripts or self.pit_fast < self.pit_wall_lat - 1.0:
+            return self.fast_lat
+        return (self.pit_wall_lat + self.pit_outer) / 2
+
+    @property
+    def box_lat(self) -> float:
+        """The middle of the working lane: every box's point across the lane."""
+        return (self.pit_fast + self.pit_outer) / 2
 
     @property
     def edge(self) -> float:
@@ -278,6 +303,21 @@ def _cross(a, b):
     return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
 
 
+LASER_KERNEL = "auto"  # (step 9g) "auto": the Warp kernel on a GPU (when warp is installed), JAX otherwise; "jax"; "warp"
+
+
+def _laser_kernel() -> str:
+    if LASER_KERNEL != "auto":
+        return LASER_KERNEL
+    if jax.default_backend() != "gpu":
+        return "jax"
+    try:
+        import warp  # noqa: F401
+    except ImportError:
+        return "jax"
+    return "warp"
+
+
 class RaceGame:
     def __init__(self, tracks: Tracks, cfg: RaceConfig = RaceConfig(), spec: rc.CarSpec = rc.RACE):
         self.tracks, self.cfg = tracks, cfg
@@ -291,24 +331,22 @@ class RaceGame:
         """(speed, step 8r) The lasers' wall segments laid out once: per circuit and centreline point, the left wall,
         the right wall and the pit wall (far away where there is none), padded by the window so a car's window is one
         contiguous slice. Before, each laser call gathered 330 segments by index and rebuilt the pit wall with sin/cos.
-        The same segments either way (tests/test_race.py checks the lasers match)."""
+        The same segments either way (tests/test_race.py checks the lasers match). (step 9g) Each wall is a chain, a
+        segment's end the next one's start, so only the starts are kept: half the memory a laser call reads. The pit
+        wall's start is far away where there's none; a segment counts if both its ends are real."""
         cfg, t = self.cfg, self.tracks
         P = cfg.points
         lo, hi = cfg.wall_window
         idx = jnp.arange(P)
-        a = jnp.stack([t.wall_a[:, :P], t.wall_a[:, P:]], 2)  # (T, P, 2 walls, 2)
-        b = jnp.stack([t.wall_b[:, :P], t.wall_b[:, P:]], 2)
+        a = jnp.stack([t.wall_a[:, :P], t.wall_a[:, P:]], 2)  # (T, P, 2 walls, 2); wall_b is wall_a one point on
         if cfg.pit_lane:
-            nxt = (idx + 1) % P
-            at = lambda i: t.center[:, i] + cfg.pit_wall_lat * jnp.stack(  # noqa: E731
-                [-jnp.sin(t.heading[:, i]), jnp.cos(t.heading[:, i])], -1)
+            at = t.center + cfg.pit_wall_lat * jnp.stack([-jnp.sin(t.heading), jnp.cos(t.heading)], -1)
             tr = jnp.arange(t.length.shape[0])[:, None]
-            there = ((jnp.abs(self.from_pit(tr, idx[None])) < cfg.pit_wall_len)
-                     & (jnp.abs(self.from_pit(tr, nxt[None])) < cfg.pit_wall_len))[..., None]
-            a = jnp.concatenate([a, jnp.where(there, at(idx), 1e6)[:, :, None]], 2)
-            b = jnp.concatenate([b, jnp.where(there, at(nxt), 1e6 + 1.0)[:, :, None]], 2)
-        pad = lambda x: jnp.concatenate([x, x[:, : hi - lo]], 1)  # noqa: E731  # the window wraps past the line
-        self._win_a, self._win_b = pad(a), pad(b)
+            there = (jnp.abs(self.from_pit(tr, idx[None])) < cfg.pit_wall_len)[..., None]
+            a = jnp.concatenate([a, jnp.where(there, at, 1e6)[:, :, None]], 2)
+        self._win = jnp.concatenate([a, a[:, : hi - lo + 1]], 1)  # the window wraps past the line, + the last end
+        T, L, W, _ = self._win.shape  # and as rows (circuits, walls x 2, points): the Warp kernel's layout
+        self._win_rows = self._win.transpose(0, 2, 3, 1).reshape(T, W * 2, L)
 
     # where the car is on the circuit
     def _locate(self, track, idx, pos):
@@ -426,6 +464,8 @@ class RaceGame:
             v = jnp.hypot(st.car.vx, st.car.vy)
             over = cfg.pit_brake * jnp.clip((v - cfg.pit_limit) / cfg.pit_governor, 0.0, 1.0)
             wheels = jnp.where(self.in_pit_lane(st) & (v > cfg.pit_limit), wheels.at[1].set(-over), wheels)
+            if wheels.shape[0] > 2:  # (ep16, F1 B1.6.3b) no reversing in the pit lane under the car's own power
+                wheels = jnp.where(self.in_pit_lane(st), wheels.at[2].set(-1.0), wheels)
         if damage is not None:
             p = p._replace(cla_floor=p.cla_floor * (1 - damage.floor))
             wheels = wheels.at[0].add(damage.toe / p.max_steer)  # the driver has to hold opposite lock
@@ -467,8 +507,13 @@ class RaceGame:
         """Metres to the nearest wall along each laser, capped at ray_range (walls near the car only)."""
         lo, hi = self.cfg.wall_window
         start = (st.idx + lo) % self.cfg.points
-        a, b = (jax.lax.dynamic_slice(w, (st.track, start, 0, 0), (1, hi - lo) + w.shape[2:]).reshape(-1, 2)
-                for w in (self._win_a, self._win_b))  # left, right (and pit) wall of each point in the window
+        if _laser_kernel() == "warp":  # (step 9g) the same sums as one GPU kernel: race_warp
+            from ailearns.games import race_warp
+            return race_warp.wall_lasers(self._win_rows, st.track, start, st.car.pos, st.car.yaw, nseg=hi - lo,
+                                         rays=tuple(np.asarray(self.rays).tolist()), ray_range=self.cfg.ray_range)
+        win = jax.lax.dynamic_slice(self._win, (st.track, start, 0, 0), (1, hi - lo + 1) + self._win.shape[2:])[0]
+        a, b = win[:-1].reshape(-1, 2), win[1:].reshape(-1, 2)  # left, right (and pit) wall of each point in the window
+        real = (a[:, 0] < 1e5) & (b[:, 0] < 1e5)  # (no pit wall here: its ends are far away)
         ang = st.car.yaw + self.rays
         d = jnp.stack([jnp.cos(ang), jnp.sin(ang)], -1)[:, None, :]
         e, w = b - a, a - st.car.pos
@@ -476,7 +521,7 @@ class RaceGame:
         safe = jnp.where(jnp.abs(den) < 1e-9, 1e-9, den)
         t = _cross(w, e) / safe
         u = _cross(w, d) / safe
-        hit = (jnp.abs(den) >= 1e-9) & (t > 0) & (u >= 0) & (u <= 1)
+        hit = real & (jnp.abs(den) >= 1e-9) & (t > 0) & (u >= 0) & (u <= 1)
         return jnp.minimum(jnp.min(jnp.where(hit, t, jnp.inf), axis=1), self.cfg.ray_range)
 
     def road_ahead(self, st: State) -> jax.Array:

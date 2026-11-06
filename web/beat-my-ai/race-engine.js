@@ -399,7 +399,8 @@ export class RaceGame {
       const wl = Math.abs(tl[i]);
       furthest = Math.max(furthest, wl);
       const grass = wl > half && !(lane && tl[i] < -half && tl[i] >= cfg.pit_outer);   // the pit lane's tarmac
-      const s = grass ? cfg.grass_surface : wl > half - cfg.kerb ? cfg.kerb_surface : cfg.tarmac_surface;
+      // the kerb stops at the track's edge: past it, in the pit lane, is tarmac (ep16 step 10: the lane was kerb here)
+      const s = grass ? cfg.grass_surface : wl > half - cfg.kerb && wl <= half ? cfg.kerb_surface : cfg.tarmac_surface;
       surf.grip.push(s[0]); surf.rolling.push(s[1]); surf.rough.push(s[2]); surf.lift.push(s[3]);
     }
     return [surf, furthest];
@@ -461,7 +462,9 @@ export class RaceGame {
       wheelSteer += damage.toe / p.max_steer;   // the driver has to hold opposite lock
       for (let i = 0; i < 4; i++) if (damage.puncture[i]) { surf.grip[i] *= cfg.flat_grip; surf.rolling[i] += cfg.flat_rolling; }
     }
-    const slope = this.slope(st), dt = cfg.dt / cfg.substeps, rev = a.length > 2 ? a[2] : 0;
+    // (ep16, F1 B1.6.3b) no reversing in the pit lane under the car's own power
+    const slope = this.slope(st), dt = cfg.dt / cfg.substeps;
+    const rev = a.length > 2 ? (cfg.pit_lane && this.inPitLane(st) ? -1 : a[2]) : 0;
     let car = st.car, info;
     for (let k = 0; k < cfg.substeps; k++)
       [car, info] = substep(this.car.G, this.car.RHO, p, car, wheelSteer, wheelPedal, surf, slope, dt, air, rev);

@@ -16,6 +16,11 @@ called cars at their marks with potential-based shaping (step 8f: lesson starts 
 
 A car's run ends when it hits the wall, is wrecked, finishes, or the stretch ends; the stretch ends at `stretch_s`, when
 the race is over, or when no car is racing. Pure functions over `race_field.Field`, nothing drawn here.
+
+With race control (episode 16 step 8b, `control`: a `race_control.RaceControl`), a stretch runs under the flags, the
+race director, the Safety Car and the stewards: the lesson carries race control's state, the cars step through it and
+see its 12 senses after the field's. Mid-race, race control starts green with no penalties (a fresh director), and
+`two_used` of the cars have already raced on a second compound (their stop was before the stretch).
 """
 
 from dataclasses import dataclass
@@ -60,6 +65,9 @@ class SchoolConfig:
     approach_before: float = 300.0
     # (step 8k) mid-race stretches start the leader this many laps from the flag (0: on a random lap)
     last_laps: int = 0
+    # (ep16 step 8b) with race control, the share of cars in a mid-race stretch that have already used two compounds
+    # (1: the two-compound rule is never the driver's problem; the strategist's school lowers it)
+    two_used: float = 1.0
     # the pit coach (step 8f; owner OK'd coaching in CQB: "a soldier in training is shown the ropes"; say so on screen):
     # while a car is called in, a potential that's highest stopped on its mark, paid as gamma x phi(after) - phi(before)
     # (potential-based shaping: nothing to farm, looping in and out earns nothing, and the best driving is unchanged;
@@ -81,12 +89,17 @@ class Lesson(NamedTuple):
     field: race_field.Field
     t0: jax.Array          # the field's decision count when this stretch started
     start: jax.Array       # (n_cars,) each car's progress then (metres driven this stretch = progress - start)
+    control: object = None  # race_control.Control (with race control; None without)
 
 
 class RaceSchool:
-    def __init__(self, field: race_field.RaceField, cfg: SchoolConfig = SchoolConfig()):
-        self.field, self.cfg = field, cfg
+    def __init__(self, field: race_field.RaceField, cfg: SchoolConfig = SchoolConfig(), control=None):
+        self.field, self.cfg, self.control = field, cfg, control
         self.n = field.n
+
+    @property
+    def obs_size(self) -> int:
+        return (self.control or self.field).obs_size
 
     def racing(self, f: race_field.Field) -> jax.Array:
         """(n_cars,) still in the race: not out, wrecked or finished."""
@@ -103,8 +116,17 @@ class RaceSchool:
         grid = F.grid(kg, track, designs, compounds)
         grid = grid._replace(plan=jax.random.randint(kp, (n,), 0, len(rc.COMPOUNDS)), cars=self.shuffle(kb, grid.cars))
         mid = self.midrace(km, grid, track)
-        f = jax.tree.map(lambda a, b: jnp.where(jax.random.uniform(kw) < c.grid_share, a, b), grid, mid)
-        return Lesson(f, f.t, f.cars.progress)
+        on_grid = jax.random.uniform(kw) < c.grid_share
+        f = jax.tree.map(lambda a, b: jnp.where(on_grid, a, b), grid, mid)
+        if self.control is None:
+            return Lesson(f, f.t, f.cars.progress)
+        ctl = self.control.init(f)
+        ko, ku = jax.random.split(jax.random.fold_in(key, 7))
+        nc = len(rc.COMPOUNDS)
+        other = (f.setup.compound + jax.random.randint(ko, (n,), 1, nc)) % nc  # its first stint's compound
+        two = ~on_grid & (jax.random.uniform(ku, (n,)) < c.two_used)
+        ctl = ctl._replace(used=ctl.used | (two[:, None] & (jax.nn.one_hot(other, nc) > 0)))
+        return Lesson(f, f.t, f.cars.progress, ctl)
 
     def shuffle(self, key, cars: race.State) -> race.State:
         """The cars swap grid slots at random (a trainer that drives the first few cars mustn't always start at the
@@ -191,7 +213,7 @@ class RaceSchool:
         s = jnp.zeros(n).at[order].set(spaced)
         d = jnp.maximum(F.box_s - s, 0.0)
         in_lane = s > -cfg.pit_entry
-        lat = jnp.where(in_lane, (cfg.pit_wall_lat + cfg.pit_outer) / 2, -5.0)  # -5: right of the pack (+-3)
+        lat = jnp.where(in_lane, F.pit_line(d, d < 60), -5.0)  # on the scripted line (ep16); -5: right of the pack
         cap = jnp.where(in_lane, cfg.pit_limit, c.start_speed)
         v = jax.random.uniform(k[3], (n,)) * jnp.minimum(cap, jnp.sqrt(2 * c.pit_decel * d))
         at = F.game.pit_at[track] + s
@@ -214,7 +236,11 @@ class RaceSchool:
         f = f._replace(box_call=f.box_call | call,
                        plan=jnp.where(call, jax.random.randint(kp, (self.n,), 0, len(rc.COMPOUNDS)), f.plan))
         phi = self.potential(s.field)  # before this decision's calls: a new call is charged, so it all adds up
-        f, reward = F.step(f, actions)
+        if self.control is None:
+            f, reward = F.step(f, actions)
+        else:
+            f, ctl, reward = self.control.step(f, s.control, actions)
+            s = s._replace(control=ctl)
         still = self.racing(f)
         over = f.done | ((f.t - s.t0) * F.cfg.dt >= c.stretch_s) | ~jnp.any(still)
         ended = racing & (~still | over)
@@ -237,7 +263,9 @@ class RaceSchool:
         return jnp.where(f.box_call & self.racing(f), phi, 0.0)
 
     def observe(self, s: Lesson) -> jax.Array:
-        return self.field.observe(s.field)
+        if self.control is None:
+            return self.field.observe(s.field)
+        return self.control.observe(s.field, s.control)
 
     def reset_if(self, s: Lesson, over, key) -> Lesson:
         """A new stretch where this one is over."""

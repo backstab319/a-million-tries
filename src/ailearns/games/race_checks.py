@@ -118,6 +118,11 @@ def road_test(d, spec) -> dict:
             **{f"g @ {k}": round(cornering_g(p, k), 2) for k in (100, 200, 250)}}
 
 
+def look_ahead(car):
+    """Metres ahead the test driver steers for (pure pursuit: further the faster it goes)."""
+    return jnp.maximum(12.0, 0.6 * car.vx)
+
+
 def test_driver(game, st, grip_g=1.4, brake_g=1.5, offset=0.0):
     """A cautious scripted test driver on a circuit (no AI): follows the centreline (or a line `offset` metres to its
     left, e.g. the pit lane) and slows for the corners ahead. `game` is a race.RaceGame, `st` its State; returns the
@@ -125,7 +130,7 @@ def test_driver(game, st, grip_g=1.4, brake_g=1.5, offset=0.0):
     car = st.car
     p = rc.derive(st.design, game.spec)
     # pure pursuit: steer for a point on the centreline further ahead the faster it goes
-    look = jnp.maximum(12.0, 0.6 * car.vx)
+    look = look_ahead(car)
     P, L = game.cfg.points, game.tracks.length[st.track]
     k = ((st.lap_pos + look) / L * P).astype(jnp.int32) % P
     h = game.tracks.heading[st.track, k]

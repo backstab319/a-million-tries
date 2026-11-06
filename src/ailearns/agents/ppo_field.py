@@ -99,6 +99,15 @@ def widen(params: dict, obs_size: int, init_log_std: float) -> dict:
     return p
 
 
+def widen_senses(params: dict, obs_size: int) -> dict:
+    """(ep16) a race driver's brain for more senses (race control's): zero weights on the new ones, appended after the
+    old, so it drives exactly as before until it learns to use them. Outputs and exploration unchanged."""
+    p = dict(params)
+    w = p["body.0.weight"]
+    p["body.0.weight"] = jnp.concatenate([w, jnp.zeros((w.shape[0], obs_size - w.shape[1]))], 1)
+    return p
+
+
 def make_update(cfg: FieldPPOConfig, school: race_school.RaceSchool, n_local: int, n_dev: int):
     """One PPO update: every field drives T decisions, then the learner learns from its own cars' steps."""
     T, K, n = cfg.n_steps, cfg.n_learn, cfg.n_cars

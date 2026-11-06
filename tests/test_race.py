@@ -168,3 +168,34 @@ def test_wall_windows_give_the_same_lasers():
     new = np.asarray(jax.jit(jax.vmap(g.lasers))(sts))
     old = np.asarray(jax.jit(jax.vmap(lambda s: _lasers_by_gather(g, s)))(sts))
     np.testing.assert_allclose(new, old, rtol=0, atol=1e-3)  # float rounding only (seen: 0.04 mm on 22 of 5,733)
+
+
+def test_warp_lasers_match_jax():
+    """(ep16 step 9g) the wall lasers' Warp kernel (race_warp, used on a GPU) against the JAX lasers, on cars all round
+    two laps, across the track, every heading; and under nested vmaps (it flattens them into one launch)."""
+    pytest.importorskip("warp")
+    cfg = race.RaceConfig(pit_lane=True)
+    g = race.RaceGame(race.make_tracks(range(2), cfg), cfg)
+    P = cfg.points
+    states = []
+    for track in range(2):
+        for k, i in enumerate(range(0, P, 9)):
+            st = g.init(jax.random.PRNGKey(k), design=rc.F1_LIKE[0], track=track, start=i)
+            side = jnp.stack([-jnp.sin(g.tracks.heading[track, i]), jnp.cos(g.tracks.heading[track, i])])
+            st = st._replace(car=st.car._replace(pos=st.car.pos + (k % 7 - 4.0) * 2 * side, yaw=st.car.yaw + k * 0.7))
+            states.append(st)
+    sts = jax.tree.map(lambda *x: jnp.stack(x), *states)
+    old = race.LASER_KERNEL
+    try:
+        race.LASER_KERNEL = "jax"
+        ref = np.asarray(jax.jit(jax.vmap(g.lasers))(sts))
+        race.LASER_KERNEL = "warp"
+        one = np.asarray(jax.jit(jax.vmap(g.lasers))(sts))
+        two = np.asarray(jax.jit(jax.vmap(jax.vmap(g.lasers)))(
+            jax.tree.map(lambda x: x.reshape((2, -1) + x.shape[1:]), sts))).reshape(one.shape)
+        single = np.asarray(jax.jit(g.lasers)(jax.tree.map(lambda x: x[5], sts)))
+    finally:
+        race.LASER_KERNEL = old
+    np.testing.assert_allclose(one, ref, rtol=0, atol=1e-3)  # float rounding only (seen: 0.03 mm, sin/cos)
+    np.testing.assert_allclose(two, one, rtol=0, atol=0)
+    np.testing.assert_allclose(single, ref[5], rtol=0, atol=1e-3)

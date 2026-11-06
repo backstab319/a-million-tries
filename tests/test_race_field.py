@@ -90,7 +90,7 @@ def test_rear_end_keeps_momentum_and_bounces_a_little(field):
     _, front, rear, _ = field.boxes(two_cars(field, 0.0))
     cars = two_cars(field, float(rear[0] + front[1]) - 0.2)  # overlapping by 20 cm
     every = jnp.ones(N, bool)
-    new, bump, _ = field.collide(cars, every, every)
+    new, bump, _, _ = field.collide(cars, every, every)
     assert np.allclose(momentum(field, new), momentum(field, cars), atol=1.0)
     closing = float(new.car.vx[1] - new.car.vx[0])
     assert -0.25 * 10 < closing < 0  # 10 m/s closing becomes a small opening: restitution 0.2
@@ -98,11 +98,50 @@ def test_rear_end_keeps_momentum_and_bounces_a_little(field):
     assert abs(float(new.car.r[0])) < 1e-3  # square hit: no spin
 
 
+def test_the_car_behind_is_to_blame_for_a_rear_end(field):
+    """(ep16 step 13d) the stewards' blame: the car driving into the other, not the one it hits."""
+    _, front, rear, _ = field.boxes(two_cars(field, 0.0))
+    cars = two_cars(field, float(rear[0] + front[1]) - 0.2)  # car 1 behind, 10 m/s faster
+    every = jnp.ones(N, bool)
+    *_, fault = field.collide(cars, every, every)
+    assert bool(fault[1]) and not bool(fault[0]) and not bool(fault[2:].any())
+    cars = two_cars(field, float(rear[0] + front[1]) - 0.05, v_back=0.4, v_front=0.0)  # a nudge into a stopped car
+    *_, fault = field.collide(cars, every, every, brake=jnp.zeros(N).at[0].set(1.0))
+    assert bool(fault[1]) and not bool(fault[0])  # held in its box: never to blame
+
+
+def test_a_nudging_car_causes_one_collision_not_one_a_touch():
+    """(ep16 step 13f) a car nudging the one ahead touches again and again; the stewards count one incident: its next
+    collision only after `incident_s` without contact."""
+    cfg = race.RaceConfig(time_limit=400.0)
+    field = race_field.RaceField(race.make_tracks(range(1), cfg), n_cars=N, laps=1, cfg=cfg, slipstream=False)  # contact on
+    f = field.grid(jax.random.PRNGKey(0), 0, designs())
+    _, front, rear, _ = field.boxes(f.cars)
+    at = 1000.0
+    ahead = field.place(jax.random.PRNGKey(1), 0, f.cars.design[0], at, 0.0)
+    behind = field.place(jax.random.PRNGKey(2), 0, f.cars.design[1], at - float(rear[0] + front[1]) + 0.05, 0.0)
+    ahead = ahead._replace(car=ahead.car._replace(vx=jnp.asarray(10.0)))
+    behind = behind._replace(car=behind.car._replace(vx=jnp.asarray(11.0)))  # 1 m/s into it
+    cars = jax.tree.map(lambda a, b, x: x.at[0].set(a).at[1].set(b), ahead, behind, f.cars)
+    f = f._replace(cars=cars)
+    coast = jnp.zeros((N, 2))
+    new, _ = field.step(f, coast)
+    assert bool(new.fault[1]) and not bool(new.fault[0]) and float(new.free_s[1]) == 0.0
+    again, _ = field.step(new._replace(cars=f.cars), coast)  # the same touch a decision later
+    assert not bool(again.fault[1])
+    later, _ = field.step(new._replace(cars=f.cars, free_s=jnp.full(N, field.incident_s)), coast)  # clear for 2 s
+    assert bool(later.fault[1])
+    # (step 13i) contact it keeps going counts again every `incident_s` (13h: two cars rubbed down the whole lane)
+    rubbing, _ = field.step(new._replace(cars=f.cars, rub_s=jnp.full(N, field.incident_s)), coast)
+    assert bool(rubbing.fault[1]) and float(rubbing.rub_s[1]) == 0.0
+    assert float(again.rub_s[1]) > 0.0  # one decision into the contact
+
+
 def test_a_tap_on_the_rear_corner_spins_the_car(field):
     _, front, rear, half_w = field.boxes(two_cars(field, 0.0))
     cars = two_cars(field, float(rear[0] + front[1]) - 0.15, side=float(half_w[0] + half_w[1]) * 0.8)
     every = jnp.ones(N, bool)
-    new, _, _ = field.collide(cars, every, every)
+    new, _, _, _ = field.collide(cars, every, every)
     # car 0 sits to the left: its right rear is shoved forward (nose turns left) and car 1's left front is held back
     # (its nose turns left too)
     assert float(new.car.r[0]) > 0.05 and float(new.car.r[1]) > 0.05
@@ -112,14 +151,45 @@ def test_an_out_car_does_not_move(field):
     _, front, rear, _ = field.boxes(two_cars(field, 0.0))
     cars = two_cars(field, float(rear[0] + front[1]) - 0.2, v_front=0.0)
     moving = jnp.ones(N, bool).at[0].set(False)
-    new, _, _ = field.collide(cars, jnp.ones(N, bool), moving)
+    new, _, _, _ = field.collide(cars, jnp.ones(N, bool), moving)
     assert np.allclose(np.asarray(new.car.pos[0]), np.asarray(cars.car.pos[0]))
     assert float(new.car.vx[0]) == 0.0 and -10 < float(new.car.vx[1]) < 0  # car 1 bounces off it (40 -> -8)
 
 
+
+def test_brakes_hold_a_stopped_car_against_a_push(field):
+    _, front, rear, _ = field.boxes(two_cars(field, 0.0))
+    every, braked = jnp.ones(N, bool), jnp.zeros(N).at[0].set(1.0)
+    cars = two_cars(field, float(rear[0] + front[1]) - 0.05, v_back=0.4, v_front=0.0)  # a nudge at walking pace
+    new, _, _, _ = field.collide(cars, every, every, brake=braked)
+    assert np.allclose(np.asarray(new.car.pos[0]), np.asarray(cars.car.pos[0]))
+    assert float(new.car.vx[0]) == 0.0 and float(new.car.vx[1]) < 0  # car 1 bounces off it, as off an out car
+    new, _, _, _ = field.collide(cars, every, every)  # brakes off: it rolls away
+    assert float(new.car.vx[0]) > 0.1
+    cars = two_cars(field, float(rear[0] + front[1]) - 0.2, v_back=10.0, v_front=0.0)  # a real hit: the brakes slip
+    new, _, _, _ = field.collide(cars, every, every, brake=braked)
+    assert float(new.car.vx[0]) > 4.0
+
+
+def test_a_braked_car_is_not_shoved_along_by_the_car_behind():
+    """Episode 15's pit-lane tangles: the car behind pushes at 25% throttle into a car stopped on its brakes."""
+    cfg = race.RaceConfig(time_limit=400.0)
+    fc = race_field.RaceField(race.make_tracks(range(1), cfg), n_cars=N, laps=1, cfg=cfg, slipstream=False)
+    f = fc.grid(jax.random.PRNGKey(0), 0, designs())
+    _, front, rear, _ = fc.boxes(f.cars)
+    c = f.cars.car
+    ahead = jnp.stack([jnp.cos(c.yaw[0]), jnp.sin(c.yaw[0])])
+    behind = c.pos[0] - (rear[0] + front[1] + 0.02) * ahead  # nose to tail, just apart
+    f = f._replace(cars=f.cars._replace(car=c._replace(pos=c.pos.at[1].set(behind), yaw=c.yaw.at[1].set(c.yaw[0]))))
+    acts = jnp.zeros((N, 2)).at[:, 1].set(-1.0).at[1, 1].set(0.25)
+    step = jax.jit(fc.step)
+    for _ in range(200):  # 10 s
+        f, _ = step(f, acts)
+    assert float(jnp.linalg.norm(f.cars.car.pos[0] - c.pos[0])) < 0.05
+
 def hit_parts(field, cars):
     every = jnp.ones(N, bool)
-    _, _, hit = field.collide(cars, every, every)
+    _, _, hit, _ = field.collide(cars, every, every)
     return np.asarray(hit), field.break_parts(jax.tree.map(lambda a: a[:N], field.grid(
         jax.random.PRNGKey(0), 0, designs()).damage), jnp.asarray(hit))
 
@@ -210,6 +280,40 @@ def test_drivers_see_the_cars_around_them(field):
     assert nb[0, 0, 0] == 0 and nb[0, 2, 0] == 1 and nb[0, 2, 1] < 0  # pole: nobody ahead, car 1 just behind
     assert nb[N - 1, 2, 0] == 0  # the last car: nobody behind
 
+
+
+def test_the_nearest_cars_as_the_old_argsort_picked_them(field):
+    """(ep16 step 9g) `neighbours` picks by repeated argmin now: the same cars, in the same order, as the argsort it
+    replaced, on random spreads round the lap (ties, cars out of range, cars out of the race included)."""
+    from ailearns.games.race_field import SLOTS
+
+    def old(f):
+        allc, there = field.on_circuit(f, None)
+        cars, n = f.cars, field.n
+        L = field.tracks.length[cars.track]
+        gap = (allc.lap_pos[None, :] - cars.lap_pos[:, None] + L[:, None] / 2) % L[:, None] - L[:, None] / 2
+        seen = (~jnp.eye(n, there.shape[0], dtype=bool)) & there[None, :] & (jnp.abs(gap) < field.sense_range)
+        out = []
+        for ahead in (True, False):
+            ok = seen & ((gap >= 0) if ahead else (gap < 0))
+            order = jnp.argsort(jnp.where(ok, jnp.abs(gap), jnp.inf), axis=1)[:, :SLOTS.count("ahead" if ahead else "behind")]
+            out.append(jnp.where(jnp.take_along_axis(ok, order, 1), order, -1))
+        return np.asarray(jnp.concatenate(out, 1))
+
+    f0 = field.grid(jax.random.PRNGKey(0), 0, designs())
+    L = float(field.tracks.length[0])
+    for k in range(20):
+        ka, kb, kc = jax.random.split(jax.random.PRNGKey(k), 3)
+        spread = 300.0 if k % 2 else L
+        pos = jnp.round(jax.random.uniform(ka, (N,)) * spread / 5.0) * 5.0  # 5 m steps: ties
+        f = f0._replace(cars=f0.cars._replace(lap_pos=pos), finished=jax.random.uniform(kb, (N,)) < 0.15,
+                        wrecked=jax.random.uniform(kc, (N,)) < 0.15)
+        nb = np.asarray(field.neighbours(f))
+        want = old(f)
+        assert ((nb[..., 0] == 1) == (want >= 0)).all(), k
+        gap = np.asarray(((pos[None, :] - pos[:, None] + L / 2) % L) - L / 2) / field.sense_range
+        picked = np.where(want >= 0, gap[np.arange(N)[:, None], np.maximum(want, 0)], 0.0)
+        assert np.allclose(nb[..., 1], picked, atol=1e-6), k
 
 def test_drivers_feel_what_is_broken(field):
     f = field.grid(jax.random.PRNGKey(0), 0, designs())
@@ -328,7 +432,7 @@ def test_the_pit_limiter_holds_80(pits):
 
 def test_a_stop_in_the_box_fits_new_tyres_and_a_nose(pits):
     f = pits.grid(jax.random.PRNGKey(0), 0, designs())
-    f = place(pits, f, 1, float(pits.box_s[1]), -10.5)
+    f = place(pits, f, 1, float(pits.box_s[1]), pits.cfg.box_lat)
     worn = f.cars.car._replace(wear=f.cars.car.wear.at[1].set(0.6))
     f = f._replace(cars=f.cars._replace(car=worn), plan=f.plan.at[1].set(0),
                    damage=f.damage._replace(wing_front=f.damage.wing_front.at[1].set(0.5),
@@ -347,12 +451,78 @@ def test_a_stop_in_the_box_fits_new_tyres_and_a_nose(pits):
     assert float(f.cars.car.vx[1]) > 3.0 and int(f.stops[1]) == 1  # away, and no second stop
 
 
+def test_the_box_is_in_the_working_lane(pits):
+    """(ep16) A car stopped level with its mark but in the fast lane isn't in its box; on the box's point it is."""
+    step = jax.jit(pits.step)
+    hold = jnp.tile(jnp.array([0.0, -1.0]), (N, 1))
+    for lat, stops in ((pits.cfg.fast_lat, 0), (pits.cfg.box_lat, 1)):
+        f = place(pits, pits.grid(jax.random.PRNGKey(0), 0, designs()), 1, float(pits.box_s[1]), lat)
+        f, _ = step(f, hold)
+        assert int(f.stops[1]) == stops
+
+
+def test_no_reverse_in_the_pit_lane(pits):
+    """(ep16, F1 B1.6.3b) Reverse does nothing in the pit lane; on the track it still works."""
+    step = jax.jit(pits.step)
+    back = jnp.tile(jnp.array([0.0, 0.5, 1.0]), (N, 1))
+    L = float(pits.tracks.length[0])
+    for s, lat, forward in ((-100.0, pits.cfg.fast_lat, True), (L / 2, 0.0, False)):
+        f = place(pits, pits.grid(jax.random.PRNGKey(0), 0, designs()), 0, s, lat)
+        for _ in range(20):
+            f, _ = step(f, back)
+        assert (float(f.cars.car.vx[0]) > 0.5) == forward
+
+
+def test_the_crew_pulls_back_a_car_that_overshot(pits):
+    """(ep16) A car stopped 6 m past its mark gets its stop, pulled back into its box at walking pace first."""
+    f = place(pits, pits.grid(jax.random.PRNGKey(0), 0, designs()), 1, float(pits.box_s[1]) + 6.0, pits.cfg.box_lat)
+    past = -float(pits.to_box(f.cars)[1]) - pits.box_half
+    assert past > 1.0
+    step = jax.jit(pits.step)
+    hold = jnp.tile(jnp.array([0.0, -1.0]), (N, 1))
+    f, _ = step(f, hold)
+    assert int(f.stops[1]) == 1
+    assert abs(float(f.service[1]) - (past / pits.pull_v + pits.tyre_s)) < 0.1
+    for _ in range(int(past / pits.pull_v / pits.cfg.dt) + 5):
+        f, _ = step(f, hold)
+    assert abs(float(pits.to_box(f.cars)[1])) <= pits.box_half + 0.01 and float(f.service[1]) > 0
+
+
+def test_the_crew_pushes_a_car_across_and_waves_on_one_too_far_past(pits):
+    """(ep16 step 14j) As F1 crews do: a car stopped 1.6 m off its mark across gets its stop (pushed over: the time
+    beyond 1 m added); one 25 m past its box (beyond the 20 m pull-back) has its call cleared: round again."""
+    step = jax.jit(pits.step)
+    hold = jnp.tile(jnp.array([0.0, -1.0]), (N, 1))
+    f = place(pits, pits.grid(jax.random.PRNGKey(0), 0, designs()), 1, float(pits.box_s[1]), pits.cfg.box_lat - 1.6)
+    f, _ = step(f._replace(box_call=f.box_call.at[1].set(True)), hold)
+    side = abs(float(f.cars.lat[1]) - pits.cfg.box_lat) - 1.0
+    assert int(f.stops[1]) == 1 and not bool(f.box_call[1])
+    assert abs(float(f.service[1]) - (side / pits.pull_v + pits.tyre_s)) < 0.1
+    f = place(pits, pits.grid(jax.random.PRNGKey(0), 0, designs()), 1, float(pits.box_s[1]) + 25.0, pits.cfg.box_lat)
+    f, _ = step(f._replace(box_call=f.box_call.at[1].set(True)), hold)
+    assert int(f.stops[1]) == 0 and not bool(f.box_call[1])
+
+
+def test_no_unsafe_release(pits):
+    """(ep16) The crew holds a serviced car while another comes down the fast lane just behind its box."""
+    step = jax.jit(pits.step)
+    hold = jnp.tile(jnp.array([0.0, -1.0]), (N, 1))
+    for coming, held in ((True, True), (False, False)):
+        f = place(pits, pits.grid(jax.random.PRNGKey(0), 0, designs()), 1, float(pits.box_s[1]), pits.cfg.box_lat)
+        f, _ = step(f, hold)
+        f = f._replace(service=f.service.at[1].set(pits.cfg.dt / 2))  # the work's about done
+        if coming:
+            f = place(pits, f, 0, float(pits.box_s[1]) - 20.0, pits.cfg.fast_lat, v=15.0)
+        f, _ = step(f, hold.at[0].set(jnp.array([0.0, 0.0])))
+        assert (float(f.service[1]) > 0) == held
+
+
 def test_the_team_pays_for_a_stop_it_called(pits):
     """A called-in car that stops on its mark is paid back `stop_pay_s` seconds at its own race pace; a stop nobody
     called earns nothing."""
     f = pits.grid(jax.random.PRNGKey(0), 0, designs())
     for k in (1, 2):
-        f = place(pits, f, k, float(pits.box_s[k]), -10.5)
+        f = place(pits, f, k, float(pits.box_s[k]), pits.cfg.box_lat)
     pace, t = 50.0, 1000
     f = f._replace(t=jnp.asarray(t), box_call=f.box_call.at[1].set(True),
                    cars=f.cars._replace(progress=jnp.full(N, pace * t * pits.cfg.dt)))
@@ -397,19 +567,65 @@ def test_marshals_recover_an_out_car():
     assert seen(f) == before - 1  # gone from car 1's senses (and from contact: solid excludes it)
 
 
-def test_a_dry_car_retires_and_leaves_the_circuit():
-    """(step 9l) An empty tank retires the car: it pulls off (a ghost at once), never finishes, ranks with the out cars."""
+def test_a_dry_car_retires_and_pulls_off():
+    """(ep16 step 3) An empty tank retires the car: it coasts to the run-off and stops there (before: a ghost at once),
+    never finishes, ranks with the out cars, and stays (an out car off the track isn't recovered during the race)."""
     cfg = race.RaceConfig(time_limit=400.0)
-    F = race_field.RaceField(race.make_tracks(range(1), cfg), n_cars=N, laps=1, cfg=cfg)
-    fuel = F.fuel_allowance(0, designs()).at[0].set(0.05)  # car 0: a few metres of fuel
+    F = race_field.RaceField(race.make_tracks(range(1), cfg), n_cars=N, laps=1, cfg=cfg, contact=False,
+                             slipstream=False)
+    fuel = F.fuel_allowance(0, designs()).at[0].set(0.15)  # car 0: a few seconds of fuel
     f = F.grid(jax.random.PRNGKey(0), 0, designs(), fuel=fuel)
-    go = jnp.zeros((N, 2)).at[:, 1].set(1.0)
     step = jax.jit(F.step)
-    for _ in range(int(3.0 / cfg.dt)):
-        f, _ = step(f, go)
-    assert bool(F.dry_out(f)[0]) and bool(F.gone(f)[0]) and not bool(F.gone(f)[1:].any())
-    at = np.asarray(f.cars.car.pos[0])
-    f, _ = step(f, go)
-    assert np.allclose(np.asarray(f.cars.car.pos[0]), at)  # retired: it doesn't move on
+    for _ in range(int(40.0 / cfg.dt)):
+        drive = jax.vmap(lambda st: scripted_driver(F.game, st))(f.cars)
+        was_dry = bool(F.dry_out(f)[0])
+        f, reward = step(f, drive)
+        assert not was_dry or float(reward[0]) == 0.0  # retired: no more reward
+    assert bool(F.dry_out(f)[0]) and bool(f.cars.crashed[0]) and bool(F.off_track(f.cars)[0])
+    assert not bool(F.gone(f)[0]) and float(f.out_s[0]) > 0
+    f = f._replace(out_s=f.out_s.at[0].set(F.recover_s * 10))
+    assert not bool(F.gone(f)[0])  # off the track: left there
     order, running = np.asarray(F.order(f)), ~np.asarray(f.cars.crashed | f.wrecked | F.dry_out(f))
     assert running.any() and (order[running] < order[0]).all()  # behind every car still racing: it's out
+
+
+def test_marshals_by_where_the_car_stopped(pits):
+    """(ep16 step 3) On the track the marshals take `recover_s`, in the pit lane the crew `recover_lane_s`; off the
+    track never."""
+    L = float(pits.tracks.length[0])
+    for s, lat, wait in ((L / 2, 0.0, pits.recover_s), (-100.0, pits.cfg.fast_lat, pits.recover_lane_s),
+                         (L / 2, 12.0, np.inf)):
+        f = place(pits, pits.grid(jax.random.PRNGKey(0), 0, designs()), 0, s, lat)
+        f = f._replace(cars=f.cars._replace(crashed=f.cars.crashed.at[0].set(True)))
+        for t, gone in ((min(wait, 1e4) - 1.0, False), (min(wait, 1e4) + 1.0, wait < np.inf)):
+            assert bool(pits.gone(f._replace(out_s=f.out_s.at[0].set(t)))[0]) == gone
+
+
+def test_warp_car_lasers_match_jax(field):
+    """(ep16 step 9g) the car lasers' Warp kernel (race_warp.body_lasers, used on a GPU) against the JAX ones: grids
+    jostled sideways, turned and one car finished (a ghost), and under nested vmaps."""
+    pytest.importorskip("warp")
+    fields = []
+    for k in range(6):
+        f = field.grid(jax.random.PRNGKey(k), k % 2, designs())
+        kk = jax.random.split(jax.random.PRNGKey(100 + k), 2)
+        car = f.cars.car._replace(pos=f.cars.car.pos + jax.random.normal(kk[0], f.cars.car.pos.shape) * 1.5,
+                                  yaw=f.cars.car.yaw + jax.random.normal(kk[1], f.cars.car.yaw.shape) * 0.6)
+        f = f._replace(cars=f.cars._replace(car=car), finished=f.finished.at[k % N].set(k > 2))
+        fields.append(f)
+    fs = jax.tree.map(lambda *x: jnp.stack(x), *fields)
+    old = race.LASER_KERNEL
+    try:
+        race.LASER_KERNEL = "jax"
+        ref = np.asarray(jax.jit(jax.vmap(field.car_lasers))(fs))
+        race.LASER_KERNEL = "warp"
+        one = np.asarray(jax.jit(jax.vmap(field.car_lasers))(fs))
+        two = np.asarray(jax.jit(jax.vmap(jax.vmap(field.car_lasers)))(
+            jax.tree.map(lambda x: x.reshape((2, 3) + x.shape[1:]), fs))).reshape(one.shape)
+        single = np.asarray(jax.jit(field.car_lasers)(fields[4]))
+    finally:
+        race.LASER_KERNEL = old
+    assert (ref < field.cfg.ray_range).mean() > 0.1  # (enough rays hitting a car to mean something)
+    np.testing.assert_allclose(one, ref, rtol=0, atol=1e-3)
+    np.testing.assert_allclose(two, one, rtol=0, atol=0)
+    np.testing.assert_allclose(single, ref[4], rtol=0, atol=1e-3)

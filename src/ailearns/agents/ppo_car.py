@@ -79,6 +79,27 @@ def forward(params: dict, obs: jax.Array):
     return mean, params["log_std"], value
 
 
+def forward16(params: dict, obs: jax.Array):
+    """forward() with the multiplies in 16-bit on the GPU's tensor cores, each sum kept in 32-bit; biases, tanh and
+    the outputs in 32-bit. (ep16 step 9g) Training only (es_field `brain16`): on a T4 the brains 2.9x faster, actions
+    within 0.0022 of forward()'s (mean 0.00035) on real race senses (scripts/brain_bench.py)."""
+    def mm(x, name):  # the weights from half() if it ran (converted once, not every decision), else converted here
+        w = params[name + ".t16"] if name + ".t16" in params else params[name].T.astype(jnp.float16)
+        return jnp.matmul(x.astype(jnp.float16), w, preferred_element_type=jnp.float32)
+    h = jnp.tanh(mm(obs, "body.0.weight") + params["body.0.bias"])
+    h = jnp.tanh(mm(h, "body.2.weight") + params["body.2.bias"])
+    mean = mm(h, "policy.weight") + params["policy.bias"]
+    value = (mm(h, "value.weight") + params["value.bias"])[:, 0]
+    return mean, params["log_std"], value
+
+
+def half(params: dict) -> dict:
+    """The brain plus its weights in 16-bit, transposed, for forward16: do it once before a loop of decisions (the
+    compiler didn't lift the conversion out of the loop: ~4% of a T4 generation)."""
+    return {**params, **{n + ".t16": params[n].T.astype(jnp.float16)
+                         for n in ("body.0.weight", "body.2.weight", "policy.weight", "value.weight")}}
+
+
 def activity(params: dict, obs: jax.Array):
     """The two hidden layers' firing (batch, hidden) each: the same numbers forward() computes."""
     h1 = jnp.tanh(obs @ params["body.0.weight"].T + params["body.0.bias"])
