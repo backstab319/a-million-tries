@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>Beat my AI · A Million Tries</title>
-<meta name="description" content="Race one lap against an AI that taught itself to drive, build a car under a $1M budget and race the AI engineer's, watch the finalists race, watch race day, or be the pit wall.">
+<meta name="description" content="Race one lap against an AI that taught itself to drive, build a car under a $1M budget and race the AI engineer's, watch the finalists race, watch race day, be the pit wall, or race under the Safety Car.">
 <style>
   html, body { margin: 0; height: 100%; background: #0d0f16; color: #e8eaf0; overflow: hidden;
     font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; touch-action: none; user-select: none; }
@@ -36,11 +36,12 @@
   <button data-mode="lap"><b>Race my AI</b><span>Episodes 4-5 · drive one lap yourself against the AI driver</span></button>
   <button data-mode="engineer"><b>Beat the engineer</b><span>Episode 14 · design a car under a $1M budget and race the AI engineer's car</span></button>
   <button data-mode="pitwall"><b>Be the pit wall</b><span>Episode 15 · the race runs live: you call car 1's pit stops against the AI pit wall</span></button>
+  <button data-mode="control"><b>Race control</b><span>Episode 16 · the race runs live with flags, the Safety Car and the stewards: be the pit wall, or watch</span></button>
   <button data-mode="raceday"><b>Watch race day</b><span>Episode 15 · the episode's final race, replayed: 8 cars, 25 laps, the AI pit wall v the rule</span></button>
   <button data-mode="watch"><b>Watch the final race</b><span>Episode 14 · the finalists race each other, each with its own AI driver</span></button>
 </div>
 <script type="module">
-  // the games share this page: each mode loads only its own files (?mode=lap|engineer|watch|raceday|pitwall skips the menu)
+  // the games share this page: each mode loads only its own files (?mode=lap|engineer|watch|raceday|pitwall|control skips the menu)
   const start = (mode) => {
     document.getElementById("menu").remove();
     if (mode === "lap") {
@@ -49,15 +50,15 @@
         <div class="touch left"><button data-k="left">◀</button><button data-k="right">▶</button></div>
         <div class="touch right"><button data-k="brake">■</button><button data-k="gas">▲</button></div>`);
       import("./app.js");
-    } else if (mode === "raceday" || mode === "pitwall") {
-      window.racedayMode = mode === "pitwall" ? "live" : "replay";
+    } else if (mode === "raceday" || mode === "pitwall" || mode === "control") {
+      window.racedayMode = mode === "pitwall" ? "live" : mode === "control" ? "control" : "replay";
       import("./raceday-app.js");
     }
     else { window.raceMode = mode; import("./race-app.js"); }
   };
   for (const b of document.querySelectorAll("#menu button")) b.onclick = () => start(b.dataset.mode);
   const mode = new URLSearchParams(location.search).get("mode");
-  if (["lap", "engineer", "watch", "raceday", "pitwall"].includes(mode)) start(mode);
+  if (["lap", "engineer", "watch", "raceday", "pitwall", "control"].includes(mode)) start(mode);
 </script>
 </body>
 </html>

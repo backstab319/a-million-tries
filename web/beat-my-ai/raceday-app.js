@@ -5,14 +5,21 @@
 //   window.racedayMode = "live": the race run here (field-engine.js, a port of the Python race, checked by
 //     field-check.mjs) on any of 8 test circuits. Be the pit wall for car 1 (the AI pit wall, race-pit-wall-ep15, runs
 //     cars 2-4, the rule cars 5-8), or just watch the AI pit wall (cars 1-4) take on the rule (cars 5-8).
+//   window.racedayMode = "control": (episode 16) the same, with race control (race-control.js: flags, the VSC, the
+//     Safety Car, red flags, the stewards) and episode 16's brains (field16-data.json: race-control-driver-ep16,
+//     race-pit-wall-ep16) on its new pit lane; breakdowns as the pit wall trained (0-2 a race, the player's pick).
 
 const C = { bg: "#0d0f16", panel: "#161923", edge: "#262b3a", tarmac: "#282c3a", grass: "#163626", wall: "#969eb2",
             text: "#e8eaf0", muted: "#787f94", green: "#4ade80", amber: "#fbbf24", red: "#f43f5e", blue: "#60a5fa" };
 const CARS = ["#4ade80", "#f43f5e", "#60a5fa", "#fbbf24", "#a78bfa", "#fb923c", "#2dd4bf", "#f472b6"];
 const TYRE = [C.red, C.amber, C.text];  // soft, medium, hard (TV's colours)
 const TYRES = ["soft", "medium", "hard"];
-const LIVE = window.racedayMode === "live";
-const AI_AVG = 4.08, RULE_AVG = 4.92;   // over 128 races on test circuits (scripts/strat_compare.py, devlog 9l)
+const EP16 = window.racedayMode === "control", LIVE = window.racedayMode === "live" || EP16;
+const DATA = EP16 ? "field16-data.json" : "field-data.json";
+// over 128 races on test circuits (scripts/strat_compare.py, ep15 devlog 9l); (ep16 14e) 256 races on the 64 test
+// circuits with race control and 2 breakdowns each
+const AI_AVG = EP16 ? 4.41 : 4.08, RULE_AVG = EP16 ? 4.59 : 4.92;
+const STATUS = ["", "VIRTUAL SAFETY CAR", "SAFETY CAR", "SAFETY CAR IN THIS LAP", "RED FLAG"];   // race-control.js's
 
 // ── page ──
 const css = document.createElement("style");
@@ -113,29 +120,32 @@ async function replaySource() {
 function blank(N) {
   const a = () => Array(N).fill(0);
   return { t: 0, list: [], order: a(), fin: a(), out: a(), wrecked: a(), walled: a(), dry: a(), pit: a(), gone: a(), comp: a(),
-           stops: a(), wear: a(), fuel: a(), prog: a(), speed: a(), calls: [], bumps: [] };
+           stops: a(), wear: a(), fuel: a(), prog: a(), speed: a(), calls: [], bumps: [], broke: [],
+           status: 0, flags: [], sc: null, pen: a(), dsq: a(), pitClosed: false, brokeDown: a() };
 }
 
 let fieldData = null, engine = null;
-async function liveSource({ circuit, player, startTyre, videoCars, rand = Math.random }) {
-  fieldData ??= await (await fetch("field-data.json")).json();
+async function liveSource({ circuit, player, startTyre, videoCars, incidents = 0, rand = Math.random }) {
+  fieldData ??= await (await fetch(DATA)).json();
   engine ??= await import("./field-engine.js");
   const d = fieldData, team = d.team.slice();
   // every car a random design, every race (as the 128-race comparison: in any one field some cars are simply faster;
   // in the video's field cars 1-4 are the slower ones), or the video race's 8 cars
   const designs = videoCars ? d.designs : d.designs.map(() => d.design.map((p) => p.low + rand() * (p.high - p.low)));
   const race = new engine.Race(d, circuit, {
-    rand, designs, player: player ? 0 : -1, human: () => wall.choice(),
+    rand, designs, player: player ? 0 : -1, human: () => wall.choice(), control: EP16, incidents,
     team: player ? team.map((t, i) => t && i !== 0) : team, start: (i) => (player && i === 0 ? startTyre : null) });
   const F = race.F, N = F.n, tr = race.tr, dt = F.cfg.dt;
   const centre = tr.center, normal = new Float64Array(2 * tr.P);
   for (let i = 0; i < tr.P; i++) { normal[2 * i] = -Math.sin(tr.heading[i]); normal[2 * i + 1] = Math.cos(tr.heading[i]); }
   const snap = () => race.f.cars.map((c) => [c.car.x, c.car.y, c.car.yaw]);
-  let prev = snap(), owed = 0, calls = [], bumps = [], flagT = null;
+  let prev = snap(), owed = 0, calls = [], bumps = [], broke = [], flagT = null;
+  const brokeDown = Array(N).fill(0);   // (ep16) the cars a breakdown took out
   const tyres = race.f.setup.map((s) => [s.compound]);   // each car's sets this race
   const src = {
     N, team: race.team, labels: race.team.map((t, i) => (player && i === 0 ? "YOU" : t ? "AI" : "RULE")), L: tr.length,
     laps: F.laps, seed: tr.seed, cfg: F.cfg, pitAt: tr.pitAt, centre, normal, end: F.cfg.time_limit, t: 0, live: true,
+    boxS: F.box_s, boxLat: F.boxLat, ctl: race.ctl, incidents,
     race, tyres, player, driver: d.names.driver, strategist: d.names.strategist,
     // (as the chequered flag works: once the winner is home the rest finish as they cross the line; a car that never
     // does, say stuck in a pit-lane tangle (the Python race has those too), is classified where it is. The race used
@@ -146,11 +156,12 @@ async function liveSource({ circuit, player, startTyre, videoCars, rand = Math.r
       owed += raceS;
       const t0 = performance.now();
       while (owed >= dt && !src.done) {
-        if (player && race.atLine(0) && !wall.answered) { wall.ask(src); owed = 0; break; }
+        if (player && (race.atLine(0) || race.scCall(0)) && !wall.answered) { wall.ask(src); owed = 0; break; }
         prev = snap();
         const stops = race.f.stops.slice(), out = race.step();
         wall.answered = false;
         calls.push(...out.call);
+        if (out.broke >= 0) { broke.push(out.broke); brokeDown[out.broke] = 1; }
         race.f.bump.forEach((b, c) => { if (b > 0) bumps.push(c); });
         race.f.stops.forEach((s, c) => { if (s > stops[c]) tyres[c].push(race.f.setup[c].compound); });
         owed -= dt;
@@ -160,7 +171,13 @@ async function liveSource({ circuit, player, startTyre, videoCars, rand = Math.r
       src.t = race.f.t * dt;
     },
     view() {
-      const f = race.f, v = blank(N), u = Math.min(owed / dt, 1), order = F.order(f);
+      const f = race.f, v = blank(N), u = Math.min(owed / dt, 1), ctl = race.ctl, c = race.c;
+      // (ep16) once it's over, the stewards' classification (penalties added, the disqualified last)
+      const order = ctl && src.done ? ctl.classify(f, c) : F.order(f);
+      if (ctl) {
+        v.status = c.status; v.flags = ctl.flags(f); v.pen = ctl.penaltyS(c); v.dsq = ctl.disqualified(f, c);
+        v.pitClosed = c.pit_closed; v.sc = c.sc_on ? { x: c.sc.car.x, y: c.sc.car.y, h: c.sc.car.yaw } : null;
+      }
       v.t = f.t * dt;
       f.cars.forEach((c, i) => {
         const [x0, y0, h0] = prev[i];
@@ -173,7 +190,7 @@ async function liveSource({ circuit, player, startTyre, videoCars, rand = Math.r
         v.comp[i] = f.setup[i].compound; v.stops[i] = f.stops[i]; v.wear[i] = c.car.wear.reduce((a, b) => a + b, 0) / 4;
         v.fuel[i] = 1 - c.car.fuel_used / f.setup[i].fuel; v.prog[i] = c.progress; v.speed[i] = Math.round(Math.hypot(c.car.vx, c.car.vy) * 3.6);
       });
-      v.calls = calls; v.bumps = bumps; calls = []; bumps = [];
+      v.calls = calls; v.bumps = bumps; v.broke = broke; v.brokeDown = brokeDown.slice(); calls = []; bumps = []; broke = [];
       return v;
     },
   };
@@ -207,9 +224,12 @@ const wall = {
       && (b < 0 || (order[k] - order[b]) * dir < 0)) b = k; return b; };
     const ahead = near(-1), behind = near(1), gap = (k) => Math.abs(f.cars[k].progress - c.progress);
     const worst = Math.max(...c.car.wear), laps = Math.max(0, s.laps - c.progress / s.L);
+    const sc = r.scCall(0), st = r.c?.status;
     wall.pending = true; paused = true;
-    askCard.innerHTML = `<h2>Car 1, lap ${lap} of ${s.laps}: box or stay out?</h2>
-      <p>Car 1 is ${r.decideM} m from the pit entry. <b>P${order[0] + 1}</b>${ahead >= 0 ? `, ${Math.round(gap(ahead))} m behind car ${ahead + 1}` : ""}${behind >= 0 ? `, ${Math.round(gap(behind))} m ahead of car ${behind + 1}` : ""}.</p>
+    askCard.innerHTML = `<h2>${sc ? `${STATUS[st][0] + STATUS[st].slice(1).toLowerCase()}! Lap ${lap}: box or stay out?` : `Car 1, lap ${lap} of ${s.laps}: box or stay out?`}</h2>
+      ${sc ? `<p>The field slows down behind it, so a stop loses less time against the others. Real teams often box now;
+      in testing the AI pit wall almost never did.</p>` : ""}
+      <p>Car 1 is ${sc ? `${Math.round(r.toEntry(c))} m` : `${r.decideM} m`} from the pit entry. <b>P${order[0] + 1}</b>${ahead >= 0 ? `, ${Math.round(gap(ahead))} m behind car ${ahead + 1}` : ""}${behind >= 0 ? `, ${Math.round(gap(behind))} m ahead of car ${behind + 1}` : ""}.</p>
       <p>On <b>${TYRES[f.setup[0].compound]}s</b>, worst tyre <b>${Math.round(worst * 100)}% worn</b> (they fail past ~90%) · fuel <b>${Math.round((1 - c.car.fuel_used / f.setup[0].fuel) * 100)}%</b> · <b>${laps.toFixed(1)} laps</b> to go · ${f.stops[0]} stop${f.stops[0] === 1 ? "" : "s"} so far</p>
       <div class="row"><button data-a="out">Stay out</button>${[0, 1, 2].map((k) => `<button data-a="${k}" style="color:${TYRE[k]}">Box for ${TYRES[k]}s</button>`).join("")}</div>
       <p style="font-size:13px">A stop costs about 20 s (the pit lane's 80 km/h limit plus the tyre change).</p>`;
@@ -264,7 +284,17 @@ function buildCircuit(s) {
   for (let q = 60; q >= 0; q--) lane.lineTo(...at(mid - cfg.pit_entry + (q / 60) * (cfg.pit_entry + cfg.pit_exit), cfg.pit_outer));
   lane.closePath();
   for (let q = 0; q <= 30; q++) { const p = at(mid - cfg.pit_wall_len + (q / 30) * 2 * cfg.pit_wall_len, cfg.pit_wall_lat); q ? pitWall.lineTo(...p) : pitWall.moveTo(...p); }
-  const boxes = CARS.map((_, b) => at(mid + (b - (s.N - 1) / 2) * 12, cfg.pit_outer + 1));
+  const boxes = CARS.map((_, b) => (s.boxS ? at(mid + s.boxS[b], s.boxLat) : at(mid + (b - (s.N - 1) / 2) * 12, cfg.pit_outer + 1)));
+  // (ep16) race control's marshalling sectors, each a stretch of the centreline (flagged ones drawn yellow)
+  const sectors = [];
+  if (s.ctl) {
+    const n = s.ctl.sectors({ length: L }), per = P / n;
+    for (let k = 0; k < n; k++) {
+      const p = new Path2D();
+      for (let i = Math.floor(k * per); i <= Math.ceil((k + 1) * per); i++) { const q = i % P; i > k * per ? p.lineTo(centre[2 * q], centre[2 * q + 1]) : p.moveTo(centre[2 * q], centre[2 * q + 1]); }
+      sectors.push(p);
+    }
+  }
   let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
   for (let i = 0; i < P; i++) {
     for (const lat of [cfg.width / 2 + cfg.grass, -(cfg.width / 2 + cfg.grass) + Math.min(0, cfg.pit_outer + cfg.width / 2)]) {
@@ -272,19 +302,28 @@ function buildCircuit(s) {
       x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y);
     }
   }
-  return { loop, edges, lane, pitWall, boxes, x0, x1, y0, y1, centre, cfg };
+  return { loop, edges, lane, pitWall, boxes, sectors, x0, x1, y0, y1, centre, cfg };
 }
 
 function view([rx, ry, rw, rh], cx, cy, s) {   // world -> this panel, s px per metre (CSS px)
   g.setTransform(dpr * s, 0, 0, -dpr * s, dpr * (rx + rw / 2 - cx * s), dpr * (ry + rh / 2 + cy * s));
 }
-function drawCircuit(s) {
-  const { loop, edges, lane, pitWall, boxes, centre, cfg } = geo;
+function drawCircuit(s, v) {
+  const { loop, edges, lane, pitWall, boxes, sectors, centre, cfg } = geo;
   g.lineJoin = "round"; g.lineCap = "round";
   g.strokeStyle = C.grass; g.lineWidth = cfg.width + 2 * cfg.grass; g.stroke(loop);
   g.fillStyle = C.tarmac; g.fill(lane);
   g.strokeStyle = C.amber; g.lineWidth = 1.5 / s; g.stroke(lane);   // outlined: on the map the lane is a few px wide
   g.strokeStyle = C.tarmac; g.lineWidth = cfg.width; g.stroke(loop);
+  // (ep16) yellow sectors: a band down the middle (a double yellow: wider); under the VSC / Safety Car / red flag
+  // the whole circuit is neutralised, so the whole circuit is
+  const neutral = v?.status > 0;
+  sectors.forEach((p, k) => {
+    const fl = neutral ? 1 : v?.flags[k] ?? 0;
+    if (!fl) return;
+    g.strokeStyle = v.status === 4 ? C.red : C.amber; g.globalAlpha = 0.55;
+    g.lineWidth = Math.max(cfg.width * (fl === 2 ? 0.7 : 0.4), (fl === 2 ? 5 : 3) / s); g.stroke(p); g.globalAlpha = 1;
+  });
   g.strokeStyle = C.wall; g.lineWidth = Math.max(0.3, 0.8 / s); g.stroke(edges);
   g.strokeStyle = C.wall; g.lineWidth = Math.max(0.5, 1.5 / s); g.stroke(pitWall);
   boxes.forEach(([x, y], b) => { g.fillStyle = CARS[b]; g.beginPath(); g.arc(x, y, Math.max(1, 2.5 / s), 0, 2 * Math.PI); g.fill(); });
@@ -357,13 +396,38 @@ function drawMap(now, v) {
   panel(r);
   g.save(); g.beginPath(); g.rect(r[0], r[1], r[2], r[3]); g.clip();
   view(r, (geo.x0 + geo.x1) / 2, (geo.y0 + geo.y1) / 2, s);
-  drawCircuit(s);
+  drawCircuit(s, v);
   for (const k of byOrder(v)) {
     if (v.gone[k.c]) continue;
     if (now - flash[k.c].bump < 400) { g.fillStyle = "#e8eaf055"; g.beginPath(); g.arc(k.x, k.y, 14 / s, 0, 2 * Math.PI); g.fill(); }
     drawCar(k.x, k.y, k.h, v.out[k.c] || v.fin[k.c] ? mix(CARS[k.c], 0.6) : CARS[k.c], s, Math.min(22, r[2] / 30));
   }
+  if (v.sc) drawCar(v.sc.x, v.sc.y, v.sc.h, SC_COLOR, s, Math.min(22, r[2] / 30));
   g.restore();
+  if (src.ctl) drawStatus(now, v, r);
+}
+
+// (ep16) race control's banner, top left of the map: the race's status, a yellow, the closed pit entry, a breakdown
+const SC_COLOR = "#ffffff";   // the Safety Car (no racing car is white)
+let statusWas = 0, greenAt = -1e9, brokeMsg = { c: -1, at: -1e9 };
+function drawStatus(now, v, r) {
+  if (statusWas > 0 && v.status === 0) greenAt = now;
+  statusWas = v.status;
+  for (const c of v.broke) brokeMsg = { c, at: now };
+  const lines = [];
+  if (v.status > 0) lines.push([STATUS[v.status], v.status === 4 ? C.red : C.amber]);
+  else if (now - greenAt < 3000) lines.push(["GREEN FLAG", C.green]);
+  else if (v.flags.includes(2)) lines.push(["DOUBLE YELLOW", C.amber]);
+  else if (v.flags.includes(1)) lines.push(["YELLOW FLAG", C.amber]);
+  if (v.pitClosed) lines.push(["PIT ENTRY CLOSED", C.red]);
+  if (now - brokeMsg.at < 5000) lines.push([`CAR ${brokeMsg.c + 1} HAS BROKEN DOWN`, C.text]);
+  const size = Math.max(13, Math.min(20, r[2] / 32));
+  lines.forEach(([t, col], i) => {
+    g.font = `800 ${size}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
+    const w = g.measureText(t).width + 16, y = r[1] + 10 + i * (size + 12);
+    g.fillStyle = `${C.bg}dd`; g.strokeStyle = col; g.lineWidth = 2; g.beginPath(); g.roundRect(r[0] + 10, y, w, size + 8, 8); g.fill(); g.stroke();
+    text(t, r[0] + 18, y + size + 1, size, col, "left", 800);
+  });
 }
 
 function drawBattle(v) {
@@ -393,16 +457,21 @@ function drawBattle(v) {
   panel(r);
   g.save(); g.beginPath(); g.rect(r[0], r[1], r[2], r[3]); g.clip();
   view(r, target.x, target.y, cam.zoom);
-  drawCircuit(cam.zoom);
+  drawCircuit(cam.zoom, v);
   for (const k of byOrder(v)) {
     if (v.gone[k.c]) continue;
     drawCar(k.x, k.y, k.h, v.out[k.c] || v.fin[k.c] ? mix(CARS[k.c], 0.6) : CARS[k.c], cam.zoom, 0);
   }
+  if (v.sc) drawCar(v.sc.x, v.sc.y, v.sc.h, SC_COLOR, cam.zoom, 0);
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   for (const k of v.list) {
     if (v.gone[k.c]) continue;
     const px = r[0] + r[2] / 2 + (k.x - target.x) * cam.zoom, py = r[1] + r[3] / 2 - (k.y - target.y) * cam.zoom;
     if (px > r[0] && px < r[0] + r[2] && py > r[1] && py < r[1] + r[3]) text(`${k.c + 1}`, px, py - 14, 14, CARS[k.c], "center");
+  }
+  if (v.sc) {
+    const px = r[0] + r[2] / 2 + (v.sc.x - target.x) * cam.zoom, py = r[1] + r[3] / 2 - (v.sc.y - target.y) * cam.zoom;
+    if (px > r[0] && px < r[0] + r[2] && py > r[1] && py < r[1] + r[3]) text("SC", px, py - 14, 14, SC_COLOR, "center");
   }
   g.restore();
   text(label, r[0] + 12, r[1] + 22, 15, C.text);
@@ -415,7 +484,7 @@ function drawTower(now, v) {
   panel(lay.tower);
   const lead = Math.max(...v.prog), fin = v.fin.some(Boolean);
   const lap = Math.min(Math.floor(lead / L) + 1, src.laps), tt = v.t;
-  text(src.player ? "YOUR PIT WALL" : "RACE DAY", x + 14, y + hd * 0.5, Math.min(30, hd * 0.42), C.text, "left", 800);
+  text(src.player ? "YOUR PIT WALL" : EP16 ? "RACE CONTROL" : "RACE DAY", x + 14, y + hd * 0.5, Math.min(30, hd * 0.42), C.text, "left", 800);
   text(fin ? "FINISHED" : `LAP ${Math.max(lap, 1)}/${src.laps}`, x + w - 14, y + hd * 0.5, Math.min(24, hd * 0.34), fin ? C.amber : C.text, "right");
   const sp = src.live && !paused ? ` · ${measured.x < speed * 0.9 ? `${speed}x (this device: ${measured.x.toFixed(0)}x)` : `${speed}x`}` : ` · ${speed}x`;
   text(`${Math.floor(tt / 60)}:${String(Math.floor(tt % 60)).padStart(2, "0")} · circuit ${src.seed} · ${(L / 1000).toFixed(1)} km${sp}`,
@@ -430,11 +499,13 @@ function drawTower(now, v) {
     const lb = src.labels[c];
     text(lb, x + w * 0.1 + 12 + fs * 3.3, ry + rh * 0.45, ss, lb === "YOU" ? C.amber : lb === "AI" ? C.green : C.muted);
     const gap = lead - v.prog[c], pit = v.pit[c];
-    const st = f ? "FINISHED" : v.wrecked[c] ? "WRECKED" : v.walled[c] ? "OUT" : v.dry[c] ? "NO FUEL"
+    const st = v.dsq[c] ? "DSQ" : f ? "FINISHED" : o && v.brokeDown[c] ? "BROKE DOWN" : v.wrecked[c] ? "WRECKED" : v.walled[c] ? "OUT" : v.dry[c] ? "NO FUEL"
       : now - flash[c].call < 2500 && !pit ? "BOX, BOX" : pit ? "IN PIT" : r === 0 ? "leader"
       : gap >= L ? `+${(gap / L).toFixed(1)} laps` : `+${Math.round(gap).toLocaleString("en")} m`;
-    const sc = f ? C.green : o ? C.red : pit || st === "BOX, BOX" ? C.amber : C.muted;
+    const sc = v.dsq[c] ? C.red : f ? C.green : o ? C.red : pit || st === "BOX, BOX" ? C.amber : C.muted;
     text(st, x + w * 0.1 + 12, ry + rh * 0.8, ss, sc, "left", 600);
+    if (v.pen[c] > 0) { g.font = `600 ${ss}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
+      text(`+${v.pen[c]} s`, x + w * 0.1 + 18 + g.measureText(st).width, ry + rh * 0.8, ss, C.red, "left", 700); }
     text(TYRES[v.comp[c]][0].toUpperCase(), x + w * 0.5, ry + rh * 0.6, fs * 1.2, TYRE[v.comp[c]], "center", 800);
     bar(x + w * 0.55, ry + rh * 0.3, w * 0.17, Math.max(5, rh * 0.13), 1 - v.wear[c], TYRE[v.comp[c]]);
     bar(x + w * 0.75, ry + rh * 0.3, w * 0.12, Math.max(5, rh * 0.13), v.fuel[c], v.fuel[c] > 0.1 ? C.blue : C.red);
@@ -451,7 +522,7 @@ function drawTower(now, v) {
 function showEnd() {
   const v = V, N = src.N, rows = [...Array(N).keys()].sort((a, b) => v.order[a] - v.order[b]);
   const avg = (lb) => { const p = rows.map((c, i) => [c, i + 1]).filter(([c]) => src.labels[c] === lb); return p.reduce((s, [, q]) => s + q, 0) / p.length; };
-  const st = (c) => (v.fin[c] ? "finished" : v.wrecked[c] ? "wrecked" : v.walled[c] ? "hit the wall" : v.dry[c] ? "out of fuel" : "running");
+  const st = (c) => (v.dsq[c] ? "disqualified" : v.fin[c] ? "finished" : v.out[c] && v.brokeDown[c] ? "broke down" : v.wrecked[c] ? "wrecked" : v.walled[c] ? "hit the wall" : v.dry[c] ? "out of fuel" : "running");
   const sets = (c) => (src.tyres ? src.tyres[c].map((k) => `<span style="color:${TYRE[k]}">${TYRES[k][0].toUpperCase()}</span>`).join(" → ") : "");
   const you = src.player ? rows.indexOf(0) + 1 : 0, ai = avg("AI"), rule = avg("RULE");
   const head = src.player ? (you < ai ? "You beat the AI pit wall" : you === Math.round(ai * 100) / 100 ? "Level with the AI pit wall" : "The AI pit wall wins this one")
@@ -459,10 +530,13 @@ function showEnd() {
   endBox.innerHTML = `<div class="wrap"><h1>${head}</h1>
     ${src.player ? `<p>You called car 1 home <b>P${you}</b>${v.fin[0] ? "" : ` (${st(0)})`}. The AI pit wall's cars averaged <b>P${ai.toFixed(2)}</b>, the rule's <b>P${rule.toFixed(2)}</b>.</p>`
       : `<p>Pit wall on cars 1-4: <b>the AI</b> (it learned when to stop and which tyre to fit). Cars 5-8: <b>the rule</b> (box when the worst tyre is 60% worn, fit hards).</p>`}
-    <table><tr><th>Pos</th><th>Car</th><th>Pit wall</th><th>Stops</th>${src.tyres ? "<th>Tyres</th>" : ""}<th></th></tr>
-    ${rows.map((c, i) => `<tr><td>${i + 1}</td><td style="color:${CARS[c]};font-weight:700">Car ${c + 1}</td><td>${src.labels[c] === "YOU" ? "<b>you</b>" : src.labels[c] === "AI" ? "AI" : "rule"}</td><td>${v.stops[c]}</td>${src.tyres ? `<td>${sets(c)}</td>` : ""}<td>${st(c)}</td></tr>`).join("")}</table>
+    <table><tr><th>Pos</th><th>Car</th><th>Pit wall</th><th>Stops</th>${src.tyres ? "<th>Tyres</th>" : ""}${src.ctl ? "<th>Penalty</th>" : ""}<th></th></tr>
+    ${rows.map((c, i) => `<tr><td>${i + 1}</td><td style="color:${CARS[c]};font-weight:700">Car ${c + 1}</td><td>${src.labels[c] === "YOU" ? "<b>you</b>" : src.labels[c] === "AI" ? "AI" : "rule"}</td><td>${v.stops[c]}</td>${src.tyres ? `<td>${sets(c)}</td>` : ""}${src.ctl ? `<td>${v.pen[c] ? `${v.pen[c]} s` : ""}</td>` : ""}<td>${st(c)}</td></tr>`).join("")}</table>
+    ${src.ctl ? `<p>Positions after the stewards: penalties added to race time, the disqualified (one tyre compound all race, or 5 offences: the black flag) last.</p>` : ""}
     ${src.player ? "" : `<p>This race: the AI's cars averaged <b>P${ai.toFixed(2)}</b>, the rule's <b>P${rule.toFixed(2)}</b>.</p>`}
-    <p>One race is noisy (a crash ahead of you, a puncture). Over 128 races on circuits it never trained on, the AI pit wall's cars averaged <b>P${AI_AVG}</b> and the rule's <b>P${RULE_AVG}</b>.${src.player ? " Can you beat P4.08 on average?" : ""}</p>
+    <p>One race is noisy (a crash ahead of you, a puncture${EP16 ? ", a Safety Car at the wrong moment" : ""}). ${EP16
+      ? `Over 256 races on 64 circuits it never trained on (2 breakdowns each), the AI pit wall's cars averaged <b>P${AI_AVG}</b> and the rule's <b>P${RULE_AVG}</b> (and cars 1-4 start with a handicap: the rule itself in those seats averages P4.57).`
+      : `Over 128 races on circuits it never trained on, the AI pit wall's cars averaged <b>P${AI_AVG}</b> and the rule's <b>P${RULE_AVG}</b>.`}${src.player ? ` Can you beat P${AI_AVG} on average?` : ""}</p>
     <p>Same AI driver in every car: ${src.driver}. AI pit wall: ${src.strategist}.${src.live ? " This race ran in your browser: the episode's simulator, ported to JavaScript." : ""}</p>
     ${src.live ? `<button class="main" id="again">${src.player ? "Race again" : "Another race"}</button>` : `<button id="again">Watch again</button>`}<button id="close">Back to the race</button></div>`;
   endBox.style.display = "block";
@@ -475,22 +549,31 @@ function showEnd() {
 }
 
 // ── live: pick a circuit and your starting tyre ──
-const setup = { circuit: 3, tyre: 1, videoCars: false };
+const VIDEO_CIRCUIT = EP16 ? 4 : 3;   // the circuit the video shows (ep16: its final race's circuit 100004)
+const setup = { circuit: VIDEO_CIRCUIT, tyre: 1, videoCars: false, incidents: 2 };
 async function showSetup() {
-  fieldData ??= await (await fetch("field-data.json")).json();
+  fieldData ??= await (await fetch(DATA)).json();
   // (circuit 100001, 5.3 km: 25 laps don't fit the race's 60-minute cap, in Python as here: nobody finishes)
   const ok = fieldData.circuits.map((c, k) => k).filter((k) => fieldData.circuits[k].length * 25 < 120000);
   const circuits = fieldData.circuits, step = (d) => { setup.circuit = ok[(ok.indexOf(setup.circuit) + d + ok.length) % ok.length]; drawMini(); };
   paused = true;
-  setupBox.innerHTML = `<div class="wrap"><h1>Be the pit wall</h1>
-    <p>Episode 15's race, run live in your browser: 8 cars, 25 laps, tyre wear, a fuel limit, contact and damage.
-    The same AI driver drives every car. <b>You</b> make car 1's strategy: its starting tyres, and once a lap, as it nears
+  setupBox.innerHTML = `<div class="wrap"><h1>${EP16 ? "Race control" : "Be the pit wall"}</h1>
+    ${EP16 ? `<p>Episode 16's race, run live in your browser: 8 cars, 25 laps, tyre wear, a fuel limit, contact and damage,
+    and <b>race control</b>: yellow flags, the Virtual Safety Car, the Safety Car, red flags and the stewards' penalties.
+    One AI driver drives every car; it learned to drive under the flags from demonstrations, and it still crashes:
+    in testing about 4 cars in 10 don't finish.</p>` : ""}
+    <p>${EP16 ? "" : `Episode 15's race, run live in your browser: 8 cars, 25 laps, tyre wear, a fuel limit, contact and damage.
+    The same AI driver drives every car.`} <b>You</b> make car 1's strategy: its starting tyres, and once a lap, as it nears
     the pits, <b>box or stay out</b> and which tyres to fit. <b>The AI pit wall</b> runs cars 2-4, <b>the rule</b> (box at
     60% worn, fit hards) cars 5-8. Grid slots are drawn at random.</p>
     <p><canvas id="mini"></canvas></p>
     <p><button id="prev">◀</button> <b id="cname"></b> <button id="next">▶</button></p>
     <p><label>Car 1 starts on</label><br>${[0, 1, 2].map((k) => `<button data-t="${k}" style="color:${TYRE[k]}">${TYRES[k]}s</button>`).join("")}</p>
-    <p><label>The cars</label><br><button data-v="0">new random cars</button><button data-v="1">the video's 8 cars</button></p>
+    ${EP16 ? `<p><label>Breakdowns</label><br>${[0, 1, 2].map((k) => `<button data-i="${k}">${k ? `${k} a race` : "none"}</button>`).join("")}</p>
+    <p style="font-size:14px">A breakdown: a random car stops dead on the track or its engine dies, some time between
+    minutes 2 and 40. On their own (none) the race has a Safety Car about one time in five; the AI pit wall trained
+    and was tested with 2 a race.</p>`
+    : `<p><label>The cars</label><br><button data-v="0">new random cars</button><button data-v="1">the video's 8 cars</button></p>`}
     <p style="font-size:14px">Every car is a different design (power, wings, tyres...), so in one race some cars are just
     faster. With new random cars each race, it evens out over a few races.</p>
     <p><button class="main" id="go">Start the race</button><button id="watch">Just watch: AI pit wall v the rule</button></p>
@@ -507,15 +590,17 @@ async function showSetup() {
     mg.strokeStyle = C.text; mg.lineWidth = 4; mg.lineJoin = "round"; mg.beginPath();
     for (let i = 0; i <= P; i++) { const k = i % P, px = 220 + (xy[2 * k] - (x0 + x1) / 2) * s, py = 160 - (xy[2 * k + 1] - (y0 + y1) / 2) * s; i ? mg.lineTo(px, py) : mg.moveTo(px, py); }
     mg.stroke();
-    document.getElementById("cname").textContent = `circuit ${c.seed} · ${(c.length / 1000).toFixed(1)} km${setup.circuit === 3 ? " (the video's)" : ""}`;
+    document.getElementById("cname").textContent = `circuit ${c.seed} · ${(c.length / 1000).toFixed(1)} km${setup.circuit === VIDEO_CIRCUIT ? " (the video's)" : ""}`;
     for (const b of setupBox.querySelectorAll("button[data-t]")) b.classList.toggle("pick", +b.dataset.t === setup.tyre);
     for (const b of setupBox.querySelectorAll("button[data-v]")) b.classList.toggle("pick", !!+b.dataset.v === setup.videoCars);
+    for (const b of setupBox.querySelectorAll("button[data-i]")) b.classList.toggle("pick", +b.dataset.i === setup.incidents);
   };
   drawMini();
   document.getElementById("prev").onclick = () => step(-1);
   document.getElementById("next").onclick = () => step(1);
   for (const b of setupBox.querySelectorAll("button[data-t]")) b.onclick = () => { setup.tyre = +b.dataset.t; drawMini(); };
   for (const b of setupBox.querySelectorAll("button[data-v]")) b.onclick = () => { setup.videoCars = !!+b.dataset.v; drawMini(); };
+  for (const b of setupBox.querySelectorAll("button[data-i]")) b.onclick = () => { setup.incidents = +b.dataset.i; drawMini(); };
   document.getElementById("go").onclick = () => startLive(true);
   document.getElementById("watch").onclick = () => startLive(false);
 }
@@ -523,7 +608,8 @@ const decodeF32 = (o) => { const b = Uint8Array.from(atob(o.b64), (c) => c.charC
 
 async function startLive(player) {
   setupBox.style.display = "none"; endBox.style.display = "none";
-  await begin(await liveSource({ circuit: setup.circuit, player, startTyre: setup.tyre, videoCars: setup.videoCars }));
+  await begin(await liveSource({ circuit: setup.circuit, player, startTyre: setup.tyre, videoCars: setup.videoCars && !EP16,
+                                 incidents: EP16 ? setup.incidents : 0 }));
   wallBar.style.display = player ? "flex" : "none";
   wall.box = false; wall.compound = 2; wall.answered = false; wall.pending = false;
   speed = player ? 10 : 20; btnSpeed.textContent = `${speed}x`;

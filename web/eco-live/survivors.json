@@ -1,0 +1,6 @@
+{
+ "count": 134,
+ "layout": "adult, birth, fat, alone, diet, w[344] (float32)",
+ "source": "runs/eco-jax-5/state.npz world 5, day 9000 (episode 17's last survivors)",
+ "model": "https://huggingface.co/amilliontries/ecosystem-survivors-ep17"
+}

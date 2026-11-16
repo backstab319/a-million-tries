@@ -6,7 +6,7 @@ colorTo: yellow
 sdk: static
 pinned: false
 license: mit
-short_description: Race an AI driver, beat the AI engineer, watch AI race day
+short_description: Race an AI, beat the AI engineer, AI race day + Safety Car
 ---
 
 # Beat my AI
@@ -82,3 +82,24 @@ and let it run).
 - The race ends 3 minutes after the winner takes the flag; everyone else is classified where they are.
 - It's heavy: about 7x real time on a laptop (a 25-lap race in ~6-7 minutes), faster on a desktop. "Just watch"
   runs the AI pit wall v the rule with nobody at the wall.
+
+## Race control (episode 16)
+
+Episode 16's race, live: the same contest (you, or nobody, on car 1's pit wall; **the AI pit wall** on cars 2-4,
+**the rule** on 5-8), now with **race control**: yellow and double yellow flags by marshalling sector, the Virtual
+Safety Car, the Safety Car (the white car), red flags, the closed pit entry and **the stewards** (5 s for a pass under
+yellow, the VSC or the Safety Car not given back, a sector faster than the neutralised minimum time, speeding under a
+double yellow or a collision caused in the pit lane; 10 s for entering a closed pit lane; disqualification for one tyre compound all
+race or five offences). The final order is the stewards'.
+
+- **Episode 16's brains:** the driver `race-control-driver-ep16` (D1-8:8: 130 senses, including the flags, the
+  Safety Car and "a stopped car ahead"; it learned to drive under the flags from demonstrations) and the pit wall
+  `race-pit-wall-ep16` (strat-ep16-1:91), on episode 16's two-lane pit lane.
+- **Breakdowns:** none, 1 or 2 a race (a random car stops dead on the track, or its engine dies), at a random moment
+  between minutes 2 and 40. Without them a Safety Car comes out about one race in five; the pit wall trained and was
+  tested with 2.
+- **When the VSC or the Safety Car comes out**, the AI pit wall gets a second call, and so do you.
+- **Honest about the driver:** it still crashes (in testing about 4 cars in 10 don't finish), the Safety Car waits for
+  its call in the pit lane's fast lane, and a car pinned in a contact can keep its speed: the gaps the video shows.
+- The number to beat: over 256 races on 64 circuits it never trained on (2 breakdowns each), the AI pit wall's cars
+  averaged **P4.41**, the rule's **P4.59**; cars 1-4 start with a handicap (the rule itself in those seats: P4.57).

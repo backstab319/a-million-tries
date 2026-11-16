@@ -29,3 +29,5 @@ logs/
 .playwright-mcp/
 # race day 3D replays (scripts/race_field_replay.py): ~36 MB a race, rebuilt from out/ep15/*-full.npz
 web/race/replays/ep15-*.json
+# ecosystem 3D replays (scripts/eco_replay.py): remade from runs/<run>/snap-<day>.npz
+web/eco/replays/

@@ -65,6 +65,7 @@ video used them (the model pages on Hugging Face name the tag their brains run w
 | 14, "My AI Designed a Race Car With No Front Wing" (the race car) | [`episode-14`](https://github.com/backstab319/a-million-tries/tree/episode-14) | a four-tyre race car on real-scale circuits (`games/race_car.py`: grip, downforce, a floor that stalls near the road, tyre heat and wear, fuel, hills and banking; `python -m ailearns.games.race_checks` road-tests it against a 911 and an F1 car); driver school (`agents/ppo_race.py`); the engineer, evolving 13 dials under a $1M price list (`agents/race_engineer.py`); the sweep, the final race and the physics audit (`scripts/race_*.py`); the cars the video raced (`episodes/14-designs-its-own-car/finalists/`). The 3D view stays private for now |
 | 15, "My AI Race Car Refused to Make a Pit Stop" (race day) | [`episode-15`](https://github.com/backstab319/a-million-tries/tree/episode-15) | eight cars on one circuit (`games/race_field.py`: box bodies that push where they hit, damage only through the physics, dirty air and the tow, soft/medium/hard tyres that fail when worn through, a fuel limit, a pit lane with a limiter, marshals); the race school (`games/race_school.py`, `agents/ppo_field.py`), imitation of a scripted pit driver (`agents/bc_field.py`), evolution on race results (`agents/es_field.py`), the pit-wall strategist (`agents/es_strategist.py`), full races and the strategist comparison (`scripts/race_full.py`, `scripts/strat_compare.py`). The 3D view stays private |
 | 16, "My AI Wouldn't Pit Under the Safety Car. So I Checked." (the Safety Car) | [`episode-16`](https://github.com/backstab319/a-million-tries/tree/episode-16) | race control (`games/race_control.py`: marshalling sectors, yellow flags, a Safety Car that leads the field, cars that break down and stop on track); the scripted experts and the driver that learned from them under race control (`agents/race_experts.py`, `agents/bc_control.py`); the pit wall widened to see race control (`agents/es_strategist.py --race-control`); the acceptance test (`scripts/race_accept.py`). The 3D view stays private |
+| 17, "I Built a World With No Rewards. 15 of 16 Died of Thirst." (the ecosystem) | [`episode-17`](https://github.com/backstab319/a-million-tries/tree/episode-17) | an open world with no rewards (`games/ecosystem.py`: soil, rain, lakes, grass, fruit trees, seasons; `games/ecosystem_life.py`: bodies, energy and water books, genes, brains that evolve only by who lives and breeds; `games/ecosystem_jax*.py`: the same world on a GPU, many at once). The 3D view stays private |
 
 ```
 git checkout episode-9
@@ -100,6 +101,12 @@ uv sync --group jax                                                           # 
 python -m ailearns.agents.bc_control runs/control --field '{"init_from": "runs/<ep15 driver>"}'   # learn from the experts
 python scripts/race_accept.py --drivers runs/control:last                     # whole races with race control
 python -m ailearns.agents.es_strategist runs/pitwall16 --init runs/pitwall:20 --driver runs/control:last     --race-control --incidents 2 --cap-s 4800                                 # the pit wall, with Safety Cars
+
+git checkout episode-17                                                       # the ecosystem: no rewards, just a world
+python scripts/eco_run.py --days 60 --n 300 --seed 0                          # one small world, on the CPU
+python scripts/eco_kills.py --seeds 0 1 2 --rain --thirst --out runs/eco      # three worlds, who eats and kills whom
+uv sync --group jax                                                           # the episode's run: 16 worlds, 25 years, GPU
+python scripts/eco_jax_run.py --engine jax --worlds 16 --days 9000 --rain --thirst --gut --cold --cold-breath     --cap 16384 --per-bucket 64 --snap-every 1800 --control-at 3600 --control-at 7200 --control-at 9000     --out runs/eco-jax-5                                                      # (on a T4: ~8.5 h)
 ```
 
 ## Licence

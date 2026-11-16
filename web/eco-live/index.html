@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A world with no rewards · A Million Tries</title>
+<link rel="icon" href="data:,">
+<meta name="description" content="Grow your own world of animals whose brains evolve with no reward: only who lives long enough to breed. The real sim from the episode, in your browser.">
+<style>
+  html, body { margin: 0; background: #0d0f16; color: #e8eaf0; font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #app { display: flex; gap: 14px; padding: 12px; box-sizing: border-box; min-height: 100vh; align-items: flex-start; }
+  #mapwrap { position: relative; flex: 1 1 auto; max-width: calc(100vh - 24px); }
+  #map { display: block; width: 100%; aspect-ratio: 1; border-radius: 14px; background: #161923; cursor: crosshair; touch-action: manipulation; }
+  #side { flex: 0 0 340px; display: flex; flex-direction: column; gap: 10px; }
+  @media (max-width: 820px) { #app { flex-direction: column; } #side { flex-basis: auto; width: 100%; } #mapwrap { max-width: none; width: 100%; } }
+  .card { background: #161923; border: 2px solid #262b3a; border-radius: 16px; padding: 12px 14px; }
+  h1 { font-size: 20px; margin: 0 0 2px; }
+  .muted { color: #787f94; }
+  .small { font-size: 13px; }
+  .label { color: #787f94; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; margin: 2px 0 6px; }
+  .big { font-size: 44px; font-weight: 800; line-height: 1; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; font-size: 14px; margin-top: 8px; }
+  .grid b { font-family: 'JetBrains Mono', ui-monospace, monospace; font-weight: 600; }
+  .row { display: flex; gap: 6px; flex-wrap: wrap; }
+  button { font: inherit; font-weight: 700; font-size: 14px; color: #e8eaf0; background: #0d0f16; border: 2px solid #262b3a;
+    border-radius: 10px; padding: 7px 11px; cursor: pointer; }
+  button:hover { border-color: #787f94; }
+  button.on { border-color: #4ade80; color: #4ade80; }
+  button.go { background: #4ade80; color: #0d0f16; border-color: #4ade80; }
+  #chart { width: 100%; height: 110px; display: block; }
+  #deaths { display: flex; height: 10px; border-radius: 5px; overflow: hidden; background: #0d0f16; margin: 6px 0 4px; }
+  #legend span { margin-right: 10px; white-space: nowrap; }
+  #legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; }
+  #intro { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(13,15,22,.82); border-radius: 14px; }
+  #intro[hidden] { display: none; }
+  #intro .card { max-width: 520px; margin: 16px; }
+  #intro p { color: #b6bccb; line-height: 1.45; margin: 8px 0 12px; }
+  #intro button { font-size: 16px; padding: 10px 14px; margin: 4px 0; width: 100%; text-align: left; }
+  #intro button small { display: block; font-weight: 500; color: #787f94; margin-top: 2px; }
+  #toast { position: absolute; left: 50%; top: 14px; transform: translateX(-50%); background: #161923; border: 2px solid #262b3a;
+    border-radius: 12px; padding: 8px 14px; font-weight: 700; pointer-events: none; opacity: 0; transition: opacity .4s; }
+  .bar { height: 8px; border-radius: 4px; background: #0d0f16; overflow: hidden; margin: 2px 0 6px; }
+  .bar > div { height: 100%; }
+  a { color: #4ade80; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="mapwrap">
+    <canvas id="map" width="900" height="900"></canvas>
+    <div id="toast"></div>
+    <div id="intro">
+      <div class="card">
+        <h1>A world with no rewards</h1>
+        <p>Animals with bodies that eat, drink, keep warm, breed and die, and brains that start random. Nothing ever
+          tells a brain what's good: a brain only gets passed on if its animal lives long enough to breed.
+          This is the real sim from the episode (rain, thirst, winter), running in your browser.</p>
+        <button data-start="random" class="go">Start from scratch<small>1,000 grass-eaters with random brains, midwinter, as in the episode</small></button>
+        <button data-start="survivors">Start with the survivors<small>the 134 animals of the one world (of 16) still alive after 25 years, dropped into new land</small></button>
+        <p class="small muted" style="margin-bottom:0">Click an animal to follow it. Watch the thirst: in the episode, 15 of 16 worlds died of it.</p>
+      </div>
+    </div>
+  </div>
+  <div id="side">
+    <div class="card">
+      <div class="label" id="when">Year 1 · day 0</div>
+      <div><span class="big" id="alive">0</span> <span class="muted">alive</span></div>
+      <div class="grid">
+        <span class="muted">born</span><b id="born">0</b>
+        <span class="muted">generation</span><b id="gen">0</b>
+        <span class="muted">average mass</span><b id="mass">0</b>
+        <span class="muted">diet</span><b id="diet">0</b>
+      </div>
+      <div class="label" style="margin-top:10px">How they died</div>
+      <div id="deaths"></div>
+      <div id="legend" class="small"></div>
+      <canvas id="chart" width="620" height="220"></canvas>
+      <div class="small muted" id="chartnote">alive (log scale); shaded: winter</div>
+    </div>
+    <div class="card">
+      <div class="row" style="margin-bottom:8px">
+        <button id="play">❚❚ Pause</button>
+        <button data-speed="1">1 day/s</button><button data-speed="5" class="on">5</button><button data-speed="30">30</button><button data-speed="1000">max</button>
+      </div>
+      <div class="label">Try</div>
+      <div class="row">
+        <button id="scramble" title="the episode's control experiment">Give everyone random brains</button>
+        <button id="addsurv">Add the survivors</button>
+        <button id="addrand">Add 200 random</button>
+        <button id="new">New world</button>
+      </div>
+    </div>
+    <div class="card" id="selcard" hidden>
+      <div class="label">Following <span id="seltitle"></span> <button id="unsel" style="float:right;padding:2px 8px;font-size:12px">✕</button></div>
+      <div class="small">thirst</div><div class="bar"><div id="selthirst"></div></div>
+      <div class="small">energy reserve</div><div class="bar"><div id="selres"></div></div>
+      <div class="grid small" id="selgrid"></div>
+      <div class="small muted" id="seldoing" style="margin-top:6px"></div>
+    </div>
+    <div class="small muted">From episode 17 of <a href="https://www.youtube.com/@amilliontries" target="_blank">A Million Tries</a>.
+      Code: <a href="https://github.com/backstab319/a-million-tries" target="_blank">GitHub</a> ·
+      survivors: <a href="https://huggingface.co/amilliontries/ecosystem-survivors-ep17" target="_blank">model</a>.
+      Animals are drawn bigger than life so you can see them.</div>
+  </div>
+</div>
+<script type="module" src="app.js"></script>
+</body>
+</html>

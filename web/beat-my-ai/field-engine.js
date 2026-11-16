@@ -541,7 +541,8 @@ export class Strategist {
 // ── the race (scripts/race_full.py --strategist): the driver in every car, the AI pit wall on `team` cars, the rule
 // on the rest; opts.player: a car the player calls instead, asking opts.human(f) as it crosses the decision line:
 // {pit, compound} (the rule never calls it); opts.control: with race control (data.control's settings; race-control.js),
-// its state in this.c ──
+// its state in this.c; (ep16 16j) opts.incidents: this many breakdowns, each at a random second in 120-2400 s
+// (es_strategist's incident school, as the pit wall trained: a race alone has a Safety Car about one time in five) ──
 export class Race {
   constructor(data, circuit, opts = {}) {
     this.F = new RaceField(data);
@@ -572,6 +573,26 @@ export class Race {
     this.prevSt = this.c?.status ?? RACING;   // (step 10e) race control's status a decision ago
     this.setFrom = f.cars.map((c) => c.progress);
     this.prev = f.cars.map((c) => this.toEntry(c));
+    const [lo, hi] = (data.incidents?.s ?? [120, 2400]).map((x) => Math.round(x / F.cfg.dt));
+    this.breakAt = Array.from({ length: opts.incidents ?? 0 }, () => lo + Math.floor(rand() * (hi - lo)));
+    this.rand = rand; this.clearM = data.incidents?.clear_m ?? 100;
+  }
+
+  // (16j) bc_control.breakdown: one car still racing on the track breaks down: dead where it is (only with nobody
+  // within clear_m behind: nobody avoids a car stopping dead from speed just ahead, and real cars don't), or its
+  // engine dies (it coasts off, out of fuel). -> the car, or -1
+  breakdown(clearM = this.clearM) {
+    const F = this.F, f = this.f, n = F.n, L = this.tr.length, rand = this.rand;
+    let ok = f.cars.map((c, i) => !(c.crashed || f.wrecked[i] || f.finished[i] || F.dryOut(f, i)) && !F.game.inPitLane(c));
+    const dead = rand() < 0.5;
+    if (dead) ok = ok.map((o, i) => o && !f.cars.some((c, j) => j !== i && ok[j] && mod(f.cars[i].lap_pos - c.lap_pos, L) < clearM));
+    const pick = ok.map((o, i) => (o ? i : -1)).filter((i) => i >= 0);
+    if (!pick.length) return -1;
+    const k = pick[Math.floor(rand() * pick.length)];
+    f.cars = f.cars.map((c, i) => (i !== k ? c : dead
+      ? { ...c, car: { ...c.car, vx: 0, vy: 0 }, crashed: true, done: true }
+      : { ...c, car: { ...c.car, fuel_used: f.setup[i].fuel } }));
+    return k;
   }
 
   // the pit wall's senses: es_strategist's 25, then (with race control) its 8 (a 25-sense brain reads the first 25)
@@ -593,10 +614,20 @@ export class Race {
       && this.toEntry(c) <= this.decideM;
   }
 
-  // one decision (0.05 s). Returns what happened: {line: cars at the decision line, call: cars called in}
+  // (16j) the VSC or the Safety Car was just deployed and car i can still make this lap's entry: the pit wall's
+  // second call (as step's `deployed`), so the player is asked too
+  scCall(i) {
+    const ctl = this.ctl, f = this.f, c = f.cars[i], st = this.c?.status;
+    return !!ctl && !f.done && (st === VSC || st === SC) && st !== this.prevSt && this.prevSt !== RED && this.racing(i)
+      && !f.box_call[i] && !this.F.game.inPitLane(c) && this.toEntry(c) >= ctl.reach_m;
+  }
+
+  // one decision (0.05 s). Returns what happened: {line: cars at the decision line, call: cars called in, broke: the
+  // car that broke down (-1: none)}
   step() {
+    if (this.f.done) return { line: [], call: [] };
+    const broke = this.breakAt?.includes(this.f.t) ? this.breakdown() : -1;
     const F = this.F, f = this.f, n = F.n;
-    if (f.done) return { line: [], call: [] };
     const racing = f.cars.map((_, i) => this.racing(i));
     const now = f.cars.map((c) => this.toEntry(c));
     const atLine = racing.map((_, i) => this.atLine(i));
@@ -643,7 +674,7 @@ export class Race {
     this.prev = now;
     this.f = nf;
     this.lastObs = obs; this.lastActs = acts;
-    return { line, call: call.map((c, i) => (c ? i : -1)).filter((i) => i >= 0) };
+    return { line, call: call.map((c, i) => (c ? i : -1)).filter((i) => i >= 0), broke };
   }
 }
 
