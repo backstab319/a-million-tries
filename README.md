@@ -68,6 +68,7 @@ video used them (the model pages on Hugging Face name the tag their brains run w
 | 15, "My AI Race Car Refused to Make a Pit Stop" (race day) | [`episode-15`](https://github.com/backstab319/a-million-tries/tree/episode-15) | eight cars on one circuit (`games/race_field.py`: box bodies that push where they hit, damage only through the physics, dirty air and the tow, soft/medium/hard tyres that fail when worn through, a fuel limit, a pit lane with a limiter, marshals); the race school (`games/race_school.py`, `agents/ppo_field.py`), imitation of a scripted pit driver (`agents/bc_field.py`), evolution on race results (`agents/es_field.py`), the pit-wall strategist (`agents/es_strategist.py`), full races and the strategist comparison (`scripts/race_full.py`, `scripts/strat_compare.py`). The 3D view stays private |
 | 16, "My AI Wouldn't Pit Under the Safety Car. So I Checked." (the Safety Car) | [`episode-16`](https://github.com/backstab319/a-million-tries/tree/episode-16) | race control (`games/race_control.py`: marshalling sectors, yellow flags, a Safety Car that leads the field, cars that break down and stop on track); the scripted experts and the driver that learned from them under race control (`agents/race_experts.py`, `agents/bc_control.py`); the pit wall widened to see race control (`agents/es_strategist.py --race-control`); the acceptance test (`scripts/race_accept.py`). The 3D view stays private |
 | 17, "I Built a World With No Rewards. 15 of 16 Died of Thirst." (the ecosystem) | [`episode-17`](https://github.com/backstab319/a-million-tries/tree/episode-17) | an open world with no rewards (`games/ecosystem.py`: soil, rain, lakes, grass, fruit trees, seasons; `games/ecosystem_life.py`: bodies, energy and water books, genes, brains that evolve only by who lives and breeds; `games/ecosystem_jax*.py`: the same world on a GPU, many at once). The 3D view stays private |
+| 18, "My AI Landed a Rocket From 70 km. Then I Caught It Cheating." (the rocket landing) | [`episode-18`](https://github.com/backstab319/a-million-tries/tree/episode-18) | a Falcon 9 first stage landing on a drone ship from 70 km (`games/rocket.py`: thinning air, drag through the sound barrier, an entry burn, heating, air load and a bending limit that break it up, grid fins, one engine that can't hover; `games/rocket_jax.py`: the same sim in JAX), PPO with a backward ladder (`agents/ppo_rocket.py`), the hand-written controllers it is measured against, and the neural-network view. The 3D scene and the sound stay private |
 
 ```
 git checkout episode-9
@@ -109,6 +110,16 @@ python scripts/eco_run.py --days 60 --n 300 --seed 0                          # 
 python scripts/eco_kills.py --seeds 0 1 2 --rain --thirst --out runs/eco      # three worlds, who eats and kills whom
 uv sync --group jax                                                           # the episode's run: 16 worlds, 25 years, GPU
 python scripts/eco_jax_run.py --engine jax --worlds 16 --days 9000 --rain --thirst --gut --cold --cold-breath     --cap 16384 --per-bucket 64 --snap-every 1800 --control-at 3600 --control-at 7200 --control-at 9000     --out runs/eco-jax-5                                                      # (on a T4: ~8.5 h)
+
+git checkout episode-18                                       # the rocket: land a booster from 70 km
+uv sync --group jax
+python scripts/rocket_classic.py 2000 7                       # the hand-written hoverslam on the land pad
+# Try 25, before the bending limit (a T4: ~36 min):
+python -m ailearns.agents.ppo_rocket --out runs/rocket-a --world entry+nobend --gamma 1.0 --level-start 0 --ent-coef 0.005 --seed 1 --steps 4e9
+# Try 29, relearning under the limit from Try 25 (from scratch it failed; the run collapses later, so screen every checkpoint):
+python -m ailearns.agents.ppo_rocket --out runs/rocket-b --world entry --init-from runs/rocket-a/checkpoints/u15258.pkl --gamma 1.0 --level-start 0 --ent-coef 0.005 --seed 2 --steps 4e9
+python scripts/rocket_eval.py runs/rocket-b/checkpoints/u01400.pkl 4000 5000 entry   # land rate on unseen flights
+python scripts/rocket_clip.py runs/rocket-b/checkpoints/u01400.pkl 7 --world entry --speed 4   # watch one in 2D
 ```
 
 ## Licence
