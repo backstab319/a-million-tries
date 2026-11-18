@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Land it yourself · A Million Tries</title>
+<link rel="icon" href="data:,">
+<meta name="description" content="Land a rocket booster on a drone ship from 70 km, next to the AI from episode 18 flying the same start. The real sim, in your browser.">
+<style>
+  html, body { margin: 0; background: #0d0f16; color: #e8eaf0; font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #app { max-width: 1100px; margin: 0 auto; padding: 10px; box-sizing: border-box; }
+  h1 { font-size: 20px; margin: 4px 0 2px; }
+  .muted { color: #787f94; } .small { font-size: 13px; }
+  #views { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 8px; position: relative; }
+  .side { display: flex; flex-direction: column; gap: 6px; }
+  canvas { width: 100%; aspect-ratio: 3 / 4; max-height: 52vh; display: block; border-radius: 14px; background: #161923; touch-action: none; }
+  .hud { background: #161923; border: 2px solid #262b3a; border-radius: 12px; padding: 8px 10px; font-size: 13px; }
+  .grid { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; }
+  .grid b, .bars span { font-family: 'JetBrains Mono', ui-monospace, monospace; font-weight: 600; }
+  .grid b { text-align: right; }
+  .bars { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; align-items: center; margin-top: 6px; }
+  .bars span { font-family: inherit; color: #787f94; font-size: 12px; }
+  .bar { height: 8px; background: #0d0f16; border-radius: 4px; overflow: hidden; }
+  .bar i { display: block; height: 100%; border-radius: 4px; }
+  .fuel i { background: #60a5fa; } .heat i { background: #fb923c; } .q i { background: #fbbf24; } .bend i { background: #a78bfa; }
+  #controls { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin-top: 10px; user-select: none; -webkit-user-select: none; }
+  button { font: inherit; font-weight: 700; font-size: 15px; color: #e8eaf0; background: #161923; border: 2px solid #262b3a;
+    border-radius: 12px; padding: 12px 6px; cursor: pointer; touch-action: none; }
+  button.on { border-color: #4ade80; color: #4ade80; }
+  #engine { grid-column: span 2; }
+  #warp { display: flex; gap: 6px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+  #warp button { padding: 6px 10px; font-size: 13px; }
+  .overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(13,15,22,.85); border-radius: 14px; z-index: 2; }
+  .overlay[hidden], #finbtns[hidden] { display: none !important; }
+  .card { background: #161923; border: 2px solid #262b3a; border-radius: 16px; padding: 14px 16px; max-width: 560px; margin: 12px; }
+  .card p { color: #b6bccb; line-height: 1.45; margin: 8px 0; font-size: 14px; }
+  .card button { width: 100%; text-align: left; margin: 5px 0; }
+  .card button small { display: block; font-weight: 500; color: #787f94; margin-top: 3px; font-size: 13px; }
+  .ok { color: #4ade80; } .bad { color: #f43f5e; }
+  #result .row { display: flex; gap: 8px; } #result .row button { text-align: center; }
+  .keys { color: #787f94; font-size: 13px; margin-top: 8px; line-height: 1.5; }
+  kbd { font-family: 'JetBrains Mono', monospace; background: #0d0f16; border: 1px solid #262b3a; border-radius: 5px; padding: 0 5px; color: #e8eaf0; }
+  @media (max-width: 640px) { .hud { font-size: 11px; padding: 6px; } h1 { font-size: 17px; } }
+</style>
+</head>
+<body>
+<div id="app">
+  <h1>Land it yourself</h1>
+  <div class="muted small">A Falcon 9 first stage, from 70 km to a drone ship at sea. You on the left, the AI from
+    <a href="https://www.youtube.com/@amilliontries" style="color:#60a5fa">episode 18</a> on the right, same start, same physics.</div>
+  <div id="views">
+    <div class="side"><canvas id="you"></canvas><div class="hud" id="hud-you"></div></div>
+    <div class="side"><canvas id="ai"></canvas><div class="hud" id="hud-ai"></div></div>
+    <div class="overlay" id="intro"><div class="card">
+      <b style="font-size:18px">Can you land it?</b>
+      <p>The engine can't hover: at its lowest throttle it still pushes harder than the booster weighs, so you light it
+        at the last moment and reach zero speed at the deck. You get <b>two lights</b>: one to slow down high up (the
+        entry burn, three engines), one to land (one engine). Light or stop the engine by holding the command through
+        its half-second start. Land under 3 m/s, under 1 m/s sideways, leaning less than 8°, legs on the 52 m deck.
+        Too much heat, air load or swinging across the airflow and it breaks up.</p>
+      <button id="go-takeover">Take over at 3 km<small>The AI flies the entry and the long fall; you fly the landing burn. Start here.</small></button>
+      <button id="go-full">From 70 km<small>The whole flight, as in the video. Very hard by hand.</small></button>
+      <div class="keys"><kbd>←</kbd> <kbd>→</kbd> engine angle (it leans the booster; the small thrusters move with
+        it) · <kbd>↑</kbd> <kbd>↓</kbd> throttle · <kbd>Space</kbd> engine on/off · <kbd>1</kbd> <kbd>2</kbd>
+        <kbd>3</kbd> speed 1×/4×/10×. The grid fins: an AI copilot flies them unless you untick it below (then
+        <kbd>A</kbd> <kbd>D</kbd>). On a phone: the buttons below.</div>
+    </div></div>
+    <div class="overlay" id="result" hidden><div class="card">
+      <b id="res-title" style="font-size:18px"></b>
+      <p><span class="ok">You</span>: <span id="res-you"></span></p>
+      <p><span style="color:#60a5fa">AI</span>: <span id="res-ai"></span></p>
+      <p class="small muted">The AI lands 98% of flights from 70 km it has never seen (4,000 flights in the
+        simulator). Here it flies live in your browser.</p>
+      <div class="row"><button id="again">Same start again</button><button id="new">New start</button><button id="menu">Menu</button></div>
+    </div></div>
+  </div>
+  <div id="controls">
+    <button data-hold="left">◀ engine</button>
+    <button data-hold="right">engine ▶</button>
+    <button id="engine">Engine: OFF</button>
+    <div style="display:grid;grid-template-rows:1fr 1fr;gap:4px"><button data-hold="up" style="padding:4px">▲</button><button data-hold="down" style="padding:4px">▼</button></div>
+  </div>
+  <div id="finbtns" class="row" hidden style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">
+    <button data-hold="finL">◀ grid fins</button><button data-hold="finR">grid fins ▶</button></div>
+  <div id="warp"><label class="small"><input type="checkbox" id="copilot" checked> AI copilot flies the grid fins</label>
+    <span class="muted small">· throttle <b id="thr">74%</b> · speed</span>
+    <button data-warp="1">1×</button><button data-warp="4">4×</button><button data-warp="10">10×</button></div>
+  <p class="small muted">The real simulator from the episode, ported line for line from Python and checked against it.
+    Code: <a style="color:#60a5fa" href="https://github.com/backstab319/a-million-tries/tree/episode-18">a-million-tries @ episode-18</a> ·
+    the AI: <a style="color:#60a5fa" href="https://huggingface.co/amilliontries/rocket-booster-ep18">rocket-booster-ep18</a></p>
+</div>
+<script type="module" src="app.js"></script>
+</body>
+</html>
