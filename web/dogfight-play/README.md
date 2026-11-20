@@ -15,7 +15,7 @@ From episode 21 of **A Million Tries** ("I Taught an AI to Dogfight. Fighting It
 guns only. You fly blue; red is the video's AI (self-play run 3), which learned to fight by fighting itself. In the
 episode it beat its own previous version 57% to 14%.
 
-Controls (keyboard): S or ↓ pull (up to 9 g), W or ↑ push, A D or ← → roll, Shift / Ctrl throttle (the top quarter
+Controls (keyboard): S or ↓ pull (up to 9 g), W or ↑ push, A D or ← → roll, E / Q throttle (the top quarter
 is afterburner), Space fire (511 rounds), P pause. Put the yellow circle on the red jet and fire: it marks where your
 shells will be when they reach its range. A fight ends when a jet is shot down or flies into the ground, or after
 two minutes.

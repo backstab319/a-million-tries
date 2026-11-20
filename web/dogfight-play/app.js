@@ -15,6 +15,9 @@ const DT = cfg.dt;
 // ── controls: the real jet's fly-by-wire stick (a g command and a roll rate), throttle, trigger ────────────────
 const keys = new Set();
 addEventListener("keydown", (e) => {
+  // (owner, 11-20) Ctrl was the throttle, and Ctrl+S with the pull key opened the browser's "Save page" over and over:
+  // no modifier keys in the controls, and while flying none of their combinations reach the browser
+  if (running && (e.ctrlKey || e.metaKey || e.altKey)) { e.preventDefault(); return; }
   keys.add(e.code);
   if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code)) e.preventDefault();
   if (e.code === "Enter" && !running) start();
@@ -28,8 +31,8 @@ function playerAction(sec) {
   const p = held("KeyS", "ArrowDown"), u = held("KeyW", "ArrowUp");
   pull = p ? Math.min(1, pull + sec * 1.2) : Math.max(0, pull - sec * 4);
   push = u ? Math.min(1, push + sec * 1.5) : Math.max(0, push - sec * 4);
-  if (held("ShiftLeft", "ShiftRight", "KeyE")) throttle = Math.min(1, throttle + sec * 0.8);
-  if (held("ControlLeft", "ControlRight", "KeyQ")) throttle = Math.max(-1, throttle - sec * 0.8);
+  if (held("KeyE", "KeyR")) throttle = Math.min(1, throttle + sec * 0.8);
+  if (held("KeyQ", "KeyF")) throttle = Math.max(-1, throttle - sec * 0.8);
   const roll = (held("KeyD", "ArrowRight") ? 1 : 0) - (held("KeyA", "ArrowLeft") ? 1 : 0);
   const g = push > 0 ? -push : 1 / cfg.g_max + pull * (1 - 1 / cfg.g_max);   // hands off: 1 g
   return [g, roll, throttle, held("Space") ? 1 : -1];
