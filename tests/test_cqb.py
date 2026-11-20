@@ -1002,6 +1002,9 @@ def test_buildings_cache_and_parallel(tmp_path, monkeypatch):
     for i in (0, 37, 127):
         one = cqb._building_arrays(i, CFG)
         for k in cqb.Buildings._fields:
+            if k not in one:                         # home-layout-only fields (low_lo, win_lo, ...) stay unset
+                assert getattr(par, k) is None, k
+                continue
             want = np.asarray(one[k])
             got = np.asarray(getattr(par, k))[i]
             assert np.allclose(got, want.astype(got.dtype)) if got.dtype.kind == "f" else np.array_equal(got, want), k

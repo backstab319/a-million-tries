@@ -71,6 +71,7 @@ video used them (the model pages on Hugging Face name the tag their brains run w
 | 16, "My AI Wouldn't Pit Under the Safety Car. So I Checked." (the Safety Car) | [`episode-16`](https://github.com/backstab319/a-million-tries/tree/episode-16) | race control (`games/race_control.py`: marshalling sectors, yellow flags, a Safety Car that leads the field, cars that break down and stop on track); the scripted experts and the driver that learned from them under race control (`agents/race_experts.py`, `agents/bc_control.py`); the pit wall widened to see race control (`agents/es_strategist.py --race-control`); the acceptance test (`scripts/race_accept.py`). The 3D view stays private |
 | 17, "I Built a World With No Rewards. 15 of 16 Died of Thirst." (the ecosystem) | [`episode-17`](https://github.com/backstab319/a-million-tries/tree/episode-17) | an open world with no rewards (`games/ecosystem.py`: soil, rain, lakes, grass, fruit trees, seasons; `games/ecosystem_life.py`: bodies, energy and water books, genes, brains that evolve only by who lives and breeds; `games/ecosystem_jax*.py`: the same world on a GPU, many at once). The 3D view stays private |
 | 18, "My AI Landed a Rocket From 70 km. Then I Caught It Cheating." (the rocket landing) | [`episode-18`](https://github.com/backstab319/a-million-tries/tree/episode-18) | a Falcon 9 first stage landing on a drone ship from 70 km (`games/rocket.py`: thinning air, drag through the sound barrier, an entry burn, heating, air load and a bending limit that break it up, grid fins, one engine that can't hover; `games/rocket_jax.py`: the same sim in JAX), PPO with a backward ladder (`agents/ppo_rocket.py`), the hand-written controllers it is measured against, and the neural-network view; `web/rocket`: the browser game, the same sim in JS checked against Python. The 3D scene and the sound stay private |
+| 21, "I Taught an AI to Dogfight. Fighting Itself Made It Worse." (the dogfight) | [`episode-21`](https://github.com/backstab319/a-million-tries/tree/episode-21) | two F-16s, guns only (`games/dogfight.py`: a 3-D point-mass flight model from public F-16 figures, checked against published turn rates, corner speed and top speed; the M61 cannon with drag and spread), PPO for the chase against a scripted target and for self-play with a league of past selves (`agents/ppo_dogfight.py`), `scripts/dogfight_replay.py` (scores brain v script or brain v brain, records fights), `scripts/dogfight_tactics.py` (energy, overshoots, zooms). The 3D replay page and the sound stay private |
 
 ```
 git checkout episode-9
@@ -122,6 +123,15 @@ python -m ailearns.agents.ppo_rocket --out runs/rocket-a --world entry+nobend --
 python -m ailearns.agents.ppo_rocket --out runs/rocket-b --world entry --init-from runs/rocket-a/checkpoints/u15258.pkl --gamma 1.0 --level-start 0 --ent-coef 0.005 --seed 2 --steps 4e9
 python scripts/rocket_eval.py runs/rocket-b/checkpoints/u01400.pkl 4000 5000 entry   # land rate on unseen flights
 python scripts/rocket_clip.py runs/rocket-b/checkpoints/u01400.pkl 7 --world entry --speed 4   # watch one in 2D
+
+git checkout episode-21                                       # the dogfight: two F-16s, guns only
+uv sync --group jax
+pytest tests/test_dogfight.py                                 # the flight model against the published F-16 numbers
+# the chase pilot, against a scripted target, from "right behind it" to anywhere within 4 km (a T4: ~1 h):
+python -m ailearns.agents.ppo_dogfight --out runs/dogfight-chase --steps 2e9 --envs 16384 --minibatch 65536 --log-std-init -1.6
+# self-play from it, exploration reset (the fix), planning further ahead, a floor under the noise (a T4: ~3 h):
+python -m ailearns.agents.ppo_dogfight --out runs/dogfight-self --mode self --init-from runs/dogfight-chase/checkpoints/u00700.pkl     --reset-std --log-std-init -1.6 --gamma 0.998 --min-std 0.05 --level-start 1 --steps 6e9 --envs 16384 --minibatch 65536
+python scripts/dogfight_replay.py runs/dogfight-self/checkpoints/u01000.pkl --vs runs/dogfight-chase/checkpoints/u00700.pkl     --level 1 --fights 512 --seed 4242                        # brain v brain: won / lost / draw
 ```
 
 ## Licence
